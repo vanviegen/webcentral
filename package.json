@@ -9,9 +9,9 @@
   "author": "Frank van Viegen",
   "license": "ISC",
   "dependencies": {
-    "express": "^4.16.3",
-    "express-http-proxy": "^1.2.0",
     "get-port": "^4.0.0",
-    "greenlock-express": "^2.4.6"
+    "greenlock": "^2.4.2",
+    "http-proxy": "^1.17.0",
+    "redirect-https": "^1.1.6"
   }
 }

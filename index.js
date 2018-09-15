@@ -1,7 +1,7 @@
 'use strict';
 
 const fs = require('fs');
-const proxy = require('express-http-proxy');
+const proxy = require('http-proxy');
 const Project = require('./project');
 
 const baseDir = process.argv[2] || __dirname;
@@ -25,9 +25,8 @@ function getProjectDir(domain) {
 	}
 	if (!project) return;
 
-	project = fs.realpathSync(baseDir+'/'+project);
-
 	try	{
+		project = fs.realpathSync(baseDir+'/'+project);
 		if (fs.lstatSync(project).isDirectory()) return project;
 	} catch(e) {}
 }
@@ -48,7 +47,9 @@ function handleRequest(req, rsp) {
 	}
 	let projectDir = getProjectDir(req.headers.host);
 	if (!projectDir) {
-		res.status(404).end('No such project')
+		rsp.writeHead(404, {'Content-Type': 'text/plain'});
+		rsp.write('node-central no such project');
+		rsp.end();
 		return;
 	}
 
@@ -56,7 +57,7 @@ function handleRequest(req, rsp) {
 }
  
 
-require('greenlock-express').create({
+const greenlock = require('greenlock').create({
 	// Let's Encrypt v2 is ACME draft 11
 	version: 'draft-11',
  
@@ -67,9 +68,11 @@ require('greenlock-express').create({
 	email: config.email,
 	agreeTos: config.agreeTos,
 	approveDomains,
-	app: require('express')().use(handleRequest),
 	communityMember: false,
 	telemetry: false,
 	debug: false,
- 
-}).listen(80, 443);
+});
+
+require('http').createServer(greenlock.middleware(require('redirect-https')())).listen(80);
+require('https').createServer(greenlock.tlsOptions, handleRequest).listen(443);
+

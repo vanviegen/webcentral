@@ -1,7 +1,7 @@
-const expressHttpProxy = require('express-http-proxy');
 const childProcess = require('child_process');
 const getPort = require('get-port');
 const net = require('net');
+const httpProxy = require('http-proxy');
 
 function portReachable(port) {
 	return new Promise(function(resolve) {
@@ -32,46 +32,56 @@ module.exports = class Project {
 	}
 	constructor(dir) {
 		this.dir = dir;
+		this.project = dir.split('/').pop();
 		this.queue = [];
-		this.handleError = this.handleError.bind(this);
+		this.lastUse = new Date().getTime();
 		getPort().then(port => {
 			this.port = port;
 			this.init();
 		});
+		this.unusedInterval = setInterval(() => {
+			let unused = new Date().getTime() - this.lastUse;
+			if (unused > 10*60*1000) {
+				console.log(this.project, 'stopping due to inactivity');
+				this.stop();
+			}
+		}, 60*1000);
 	}
 
 	init() {
-		console.log(this.dir, 'on port', this.port);
+		console.log(this.project, 'starting on port', this.port);
 		this.startTime = new Date().getTime();
-		this.proxy = expressHttpProxy("localhost:"+this.port);
 
-		this.interval = setInterval(async () => {
+		this.proxy = httpProxy.createProxyServer({target: {host: 'localhost', port: this.port}});
+		this.proxy.on('error', this.handleError.bind(this));
+
+		this.reachableInterval = setInterval(async () => {
 			if ((await portReachable(this.port)) && this.queue) {
-				console.log('reachable', this.port);
-				clearTimeout(this.interval);
-				this.interval = null;
+				console.log(this.project, "reachable on port", this.port, "after", (new Date().getTime() - this.startTime)+"ms");
+				clearTimeout(this.reachableInterval);
+				this.reachableInterval = null;
 				let queue = this.queue;
 				this.queue = null;
 				for(let {req,rsp} of queue) {
 					this.handle(req,rsp);
 				}
 			}
-		}, 100);
+		}, 50);
 
 		this.process = childProcess.spawn("firejail", ["--noprofile", "--private="+this.dir, "npm", "start"], {
 			env: {PORT: this.port, PATH: "/bin:/usr/bin:/usr/local/bin"},
 		});
 
-		this.process.stdout.on('data', (data) => {
-			console.log(this.dir, data.toString());
-		});
+		const logPrefix = this.project+": ";
+		function log(data) {
+			console.log(logPrefix + data.toString().replace(/\n/g, "\n"+logPrefix));
+		}
 
-		this.process.stderr.on('data', (data) => {
-			console.log(this.dir, data.toString());
-		});
+		this.process.stdout.on('data', log);
+		this.process.stderr.on('data', log);
 
 		const processError = (code) => {
-			console.log("process exit", this.dir, code);
+			console.log(this.project, "process exited with code", code);
 			this.process = null;
 			this.stop();
 		};
@@ -86,7 +96,8 @@ module.exports = class Project {
 		if (all[this.dir]===this) {
 			delete all[this.dir];
 		}
-		if (this.interval) clearTimeout(this.interval);
+		clearTimeout(this.unusedInterval);
+		clearTimeout(this.reachableInterval);
 		let process = this.process;
 		if (process) {
 			process.kill();
@@ -96,7 +107,7 @@ module.exports = class Project {
 		}
 		if (this.queue) {
 			for(let {req,rsp} of this.queue) {
-				this.handleError(req,rsp);
+				this.handleError("flushing queue on stop", req, rsp);
 			}
 		}
 	}
@@ -106,12 +117,15 @@ module.exports = class Project {
 			this.queue.push({req,rsp});
 			return;
 		}
-		this.proxy(req, rsp, this.handleError);
+		this.lastUse = new Date().getTime();
+		this.proxy.web(req, rsp);
 	}
 
-	handleError(req,rsp) {
-		console.log('handleError');
+	handleError(err,req,rsp) {
+		console.log(this.project, 'handling error', err);
 		this.stop();
-		rsp.status(500).end("node-central upstream didn't respond");
+		rsp.writeHead(500, {'Content-Type': 'text/plain'});
+		rsp.write('node-central upstream error: '+err);
+		rsp.end();
 	}
 }
