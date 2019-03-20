@@ -46,7 +46,7 @@ module.exports = class Project {
 			let unused = new Date().getTime() - this.lastUse;
 			if (unused > 10*60*1000) {
 				console.log(this.project, 'stopping due to inactivity');
-				this.stop();
+				this.stop(true);
 			}
 		}, 60*1000);
 
@@ -59,7 +59,7 @@ module.exports = class Project {
 			if (this.changes) return;
 			this.changes = true;
 			console.log(this.project, 'stopping due to ', type+'@'+path.join(dir,file));
-			this.stop();
+			this.stop(true);
 		}));
 		fs.readdirSync(dir)
 			.filter(name => name[0]!=='.' && ['data', 'log', 'logs', 'node_modules'].indexOf(name) < 0)
@@ -82,8 +82,8 @@ module.exports = class Project {
 				this.reachableInterval = null;
 				let queue = this.queue;
 				this.queue = null;
-				for(let {req,rsp} of queue) {
-					this.handle(req,rsp);
+				for(let opts of queue) {
+					this.handle(opts);
 				}
 			}
 		}, 50);
@@ -120,7 +120,7 @@ module.exports = class Project {
 		this.process.on('error', processError);
 	}
 
-	stop() {
+	stop(moveQueue) {
 		if (this.stopped) return;
 		this.stopped = true;
 		if (all[this.dir]===this) {
@@ -131,9 +131,16 @@ module.exports = class Project {
 		for(let watcher of this.watchers) watcher.close();
 
 		if (this.queue && this.queue.length) {
-			const replacement = Project.get(this.dir);
-			for(let {req,rsp} of this.queue) {
-				replacement.handle(req,rsp);
+			if (moveQueue) {
+				const replacement = Project.get(this.dir);
+				for(let opts of this.queue) {
+					replacement.handle(opts);
+				}
+			} else {
+				for(let opts of this.queue) {
+					if (opts.socket) opts.socket.close();
+					else this.handleError("cannot start application", opts.req, opts.rsp);
+				}
 			}
 			this.queue = null;
 		}
@@ -147,13 +154,14 @@ module.exports = class Project {
 		}
 	}
 
-	handle(req,rsp) {
+	handle(opts) {
 		if (this.queue) {
-			this.queue.push({req,rsp});
+			this.queue.push(opts);
 			return;
 		}
 		this.lastUse = new Date().getTime();
-		this.proxy.web(req, rsp);
+		if (opts.socket) this.proxy.ws(opts.req, opts.socket, opts.head);
+		else this.proxy.web(opts.req, opts.rsp);
 	}
 
 	handleError(err,req,rsp) {

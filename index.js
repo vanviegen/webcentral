@@ -1,7 +1,6 @@
 'use strict';
 
 const fs = require('fs');
-const proxy = require('http-proxy');
 const Project = require('./project');
 
 const baseDir = process.argv[2] || __dirname;
@@ -53,7 +52,16 @@ function handleRequest(req, rsp) {
 		return;
 	}
 
-	Project.get(projectDir).handle(req, rsp);
+	Project.get(projectDir).handle({req, rsp});
+}
+
+function handleWebSocket(req, socket, head) {
+	let projectDir = getProjectDir(req.headers.host);
+	if (!projectDir) {
+		socket.close();
+		return;
+	}
+	Project.get(projectDir).handle({req, socket, head});
 }
  
 
@@ -74,5 +82,10 @@ const greenlock = require('greenlock').create({
 });
 
 require('http').createServer(greenlock.middleware(require('redirect-https')())).listen(80);
-require('https').createServer(greenlock.tlsOptions, handleRequest).listen(443);
+const server = require('https').createServer(greenlock.tlsOptions)
+server.on('request', handleRequest);
+server.on('upgrade', handleWebSocket);
+server.listen(443);
+
+
 
