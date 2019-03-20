@@ -15,7 +15,7 @@ if (!config.email || !config.email.match(/@/)) throw new Error(configFile+": 'em
 
 function getProjectDir(domain) {
 	// check for domains you want to receive certificates for
-	if (domain===config.domain) {
+	if (!domain || domain===config.domain) {
 		var project = '_index';
 	} else {
 		let m = domain.match(/^([a-z0-9\-]+)\.(.*)$/,'');

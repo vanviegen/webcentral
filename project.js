@@ -2,6 +2,8 @@ const childProcess = require('child_process');
 const getPort = require('get-port');
 const net = require('net');
 const httpProxy = require('http-proxy');
+const fs = require('fs');
+const path = require('path');
 
 function portReachable(port) {
 	return new Promise(function(resolve) {
@@ -35,6 +37,7 @@ module.exports = class Project {
 		this.project = dir.split('/').pop();
 		this.queue = [];
 		this.lastUse = new Date().getTime();
+		this.watchers = [];
 		getPort().then(port => {
 			this.port = port;
 			this.init();
@@ -46,6 +49,23 @@ module.exports = class Project {
 				this.stop();
 			}
 		}, 60*1000);
+
+		this.watch(dir);
+	}
+
+	watch(dir) {
+		this.watchers.push(fs.watch(dir, (type, file) => {
+			if (file[0]==='.' || file.endsWith('.log')) return;
+			if (this.changes) return;
+			this.changes = true;
+			console.log(this.project, 'stopping due to ', type+'@'+path.join(dir,file));
+			this.stop();
+		}));
+		fs.readdirSync(dir)
+			.filter(name => name[0]!=='.' && ['data', 'log', 'logs', 'node_modules'].indexOf(name) < 0)
+			.map(name => path.join(dir, name))
+			.filter(file => fs.lstatSync(file).isDirectory())
+			.forEach(file => this.watch(file));
 	}
 
 	init() {
@@ -98,17 +118,22 @@ module.exports = class Project {
 		}
 		clearTimeout(this.unusedInterval);
 		clearTimeout(this.reachableInterval);
+		for(let watcher of this.watchers) watcher.close();
+
+		if (this.queue && this.queue.length) {
+			const replacement = Project.get(this.dir);
+			for(let {req,rsp} of this.queue) {
+				replacement.handle(req,rsp);
+			}
+			this.queue = null;
+		}
+
 		let process = this.process;
 		if (process) {
 			process.kill();
 			setTimeout(() => {
 				if (process === this.process) process.kill(9);
 			}, 2000);
-		}
-		if (this.queue) {
-			for(let {req,rsp} of this.queue) {
-				this.handleError("flushing queue on stop", req, rsp);
-			}
 		}
 	}
 
