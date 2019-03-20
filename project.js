@@ -88,7 +88,17 @@ module.exports = class Project {
 			}
 		}, 50);
 
-		this.process = childProcess.spawn("firejail", ["--noprofile", "--private="+this.dir, "npm", "start"], {
+		this.process = childProcess.spawn("firejail", [
+			"--noprofile",
+			"--private="+this.dir,
+			"--private-dev",
+			"--private-etc=group,hostname,localtime,nsswitch.conf,passwd,resolv.conf",
+			"--private-tmp",
+			"--seccomp",
+			"--shell=none",
+			"npm",
+			"start"
+		], {
 			env: {PORT: this.port, PATH: "/bin:/usr/bin:/usr/local/bin"},
 		});
 
