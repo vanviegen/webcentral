@@ -1,33 +1,80 @@
 'use strict';
 
 const fs = require('fs');
+const path = require('path');
+const glob = require('tiny-glob/sync');
+
 const Project = require('./project');
 
-const baseDir = process.argv[2] || __dirname;
-const configFile = baseDir+"/_config.json";
-const config = JSON.parse(fs.readFileSync(configFile));
+const isRoot = process.getuid()==0;
+let configDir = isRoot ? "/var/lib/node-central/" : canonDir(process.env.HOME+"/.node-central");
+let projectDir = isRoot ? "/home/*/public-node-projects/" : canonDir(process.env.HOME+"/public-node-projects");
+let email = process.env.EMAIL;
 
-if (!config || typeof config !== 'object') throw new Error(configFile+": invalid JSON object");
-if (config.agreeTos!==true) throw new Error(configFile+": 'agreeTos' must be true");
-if (!config.domain || !config.domain.match(/^[a-z0-9\-]+\.[a-z0-9\-.]+$/)) throw new Error(configFile+": 'domain' should contain a valid domain");
-if (!config.email || !config.email.match(/@/)) throw new Error(configFile+": 'email' should contain a valid email address");
+let argv = process.argv.slice(2);
+for(let i=0; i<argv.length; i++) {
+	let [key,val] = argv[i].split('=');
+	if (val==null && argv[i+1] && argv[i+1][0]!=='-') val = argv[++i];
+	if (key=="--config") configDir = canonDir(val);
+	else if (key=="--projects") projectDir = canonDir(val);
+	else if (key=="--email") email = val;
+	else help("invalid option: "+key);
+}
+
+if (!email || !email.match(/@/)) {
+	help("an email address should be specified");
+}
+
+console.log("starting", {config: configDir, projects: projectDir, email});
+
+function help(msg) {
+	if (msg) console.error("Error: "+msg+"\n");
+	console.log("usage: "+process.argv[0]+" --email domainAdmin@example.com [--datadir /var/lib/node-central] [--projectdir '/home/*/public-node-projects']");
+	process.exit(1);
+}
+
+function canonDir(dir) {
+	let dir = fs.realpathSync(dir);
+	if (dir[dir.length-1]!=='/') dir += '/';
+	return dir;
+}
+
+// Create data directory, if it doesn't exist
+try {
+	fs.mkdirSync(configDir);
+} catch(e) {}
+
+
+// Load bindings
+let bindingsFile = configDir+"/bindings.json";
+let bindings = {};
+try {
+	bindings = JSON.parse(fs.readFileSync(bindingsFile));
+} catch(e) {}
+
+
 
 function getProjectDir(domain) {
-	// check for domains you want to receive certificates for
-	if (!domain || domain===config.domain) {
-		var project = '_index';
-	} else {
-		let m = domain.match(/^([a-z0-9\-]+)\.(.*)$/,'');
-		if (m && m[2]===config.domain) {
-			project = m[1];
-		}
-	}
-	if (!project) return;
+	if (!domain.match(/^[a-zA-Z.-]+$/)) return;
 
-	try	{
-		project = fs.realpathSync(baseDir+'/'+project);
-		if (fs.lstatSync(project).isDirectory()) return project;
-	} catch(e) {}
+	let candidates = glob(projectDir+domain+"/package.json", {
+		cwd: "/",
+		absolute: true,
+		filesOnly: true,
+		flush: true,
+	}).map(s => path.dirname(s));
+
+	if (!candidates.length) return;
+
+	let binding = bindings[domain];
+	if (binding && candidates.indexOf(binding)>=0) {
+		return binding;
+	}
+
+	binding = candidates[0];
+	bindings[domain] = binding;
+	fs.writeFile(bindingsFile, JSON.stringify(bindings), 'utf8', function(){});
+	return binding;
 }
 
 function approveDomains(opts, certs, cb) {
@@ -72,9 +119,9 @@ const greenlock = require('greenlock').create({
 	// Note: If at first you don't succeed, switch to staging to debug,
 	// https://acme-staging-v02.api.letsencrypt.org/directory
 	server: 'https://acme-v02.api.letsencrypt.org/directory',
-	configDir: baseDir+'/_acme/',
-	email: config.email,
-	agreeTos: config.agreeTos,
+	configDir: configDir+'acme/',
+	email: email,
+	agreeTos: true,
 	approveDomains,
 	communityMember: false,
 	telemetry: false,

@@ -3,8 +3,7 @@
   "version": "0.1.1",
   "description": "Host a directory of Node apps each on a subdomain, running them on-demand in separate sandboxes.",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "postinstall": "node ./conf/quickfix.js"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "Frank van Viegen",
   "license": "ISC",
@@ -12,6 +11,8 @@
     "get-port": "^4.0.0",
     "greenlock": "^2.4.2",
     "http-proxy": "^1.17.0",
-    "redirect-https": "^1.1.6"
+    "redirect-https": "^1.1.6",
+    "rotating-file-stream": "^1.4.0",
+    "tiny-glob": "^0.2.6"
   }
 }

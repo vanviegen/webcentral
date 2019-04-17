@@ -4,6 +4,7 @@ const net = require('net');
 const httpProxy = require('http-proxy');
 const fs = require('fs');
 const path = require('path');
+const rfs = require('rotating-file-stream');
 
 function portReachable(port) {
 	return new Promise(function(resolve) {
@@ -38,6 +39,10 @@ module.exports = class Project {
 		this.queue = [];
 		this.lastUse = new Date().getTime();
 		this.watchers = [];
+		try {
+			fs.mkdirSync(dir+"/log");
+		} catch(e) {}
+		this.logFd = rfs("node-central.log", {maxFiles: 14, interval: "1d", compress: "gzip", path: dir+"/log"});
 		getPort().then(port => {
 			this.port = port;
 			this.init();
@@ -45,7 +50,7 @@ module.exports = class Project {
 		this.unusedInterval = setInterval(() => {
 			let unused = new Date().getTime() - this.lastUse;
 			if (unused > 10*60*1000) {
-				console.log(this.project, 'stopping due to inactivity');
+				this.log("stopping due to inactivity");
 				this.stop(true);
 			}
 		}, 60*1000);
@@ -58,7 +63,7 @@ module.exports = class Project {
 			if (file[0]==='.' || file.endsWith('.log')) return;
 			if (this.changes) return;
 			this.changes = true;
-			console.log(this.project, 'stopping due to ', type+'@'+path.join(dir,file));
+			this.log('stopping due to '+type+'@'+path.join(dir,file));
 			this.stop(true);
 		}));
 		fs.readdirSync(dir)
@@ -68,8 +73,17 @@ module.exports = class Project {
 			.forEach(file => this.watch(file));
 	}
 
+	log(msg, data) {
+		msg = new Date().toJSON() + " " + msg;
+		if (data) {
+			msg += ": ";
+			msg = msg + data.toString().replace(/\n$/,'').replace(/\n/g, "\n"+msg);
+		}
+		this.logFd.write(msg+"\n");
+	}
+
 	init() {
-		console.log(this.project, 'starting on port', this.port);
+		this.log("starting on port "+this.port);
 		this.startTime = new Date().getTime();
 
 		this.proxy = httpProxy.createProxyServer({target: {host: 'localhost', port: this.port}});
@@ -77,7 +91,7 @@ module.exports = class Project {
 
 		this.reachableInterval = setInterval(async () => {
 			if ((await portReachable(this.port)) && this.queue) {
-				console.log(this.project, "reachable on port", this.port, "after", (new Date().getTime() - this.startTime)+"ms");
+				this.log("reachable on port "+this.port+" after "+(new Date().getTime() - this.startTime)+"ms");
 				clearTimeout(this.reachableInterval);
 				this.reachableInterval = null;
 				let queue = this.queue;
@@ -87,6 +101,16 @@ module.exports = class Project {
 				}
 			}
 		}, 50);
+
+		let opts = {
+			env: {PORT: this.port, PATH: "/bin:/usr/bin:/usr/local/bin"},
+		};
+
+		if (process.getuid()==0) { // running as root -- process should run as owner of project directory
+			let stat = fs.statSync(this.dir);
+			opts.uid = stat.uid;
+			opts.gid = stat.gid;
+		}
 
 		this.process = childProcess.spawn("firejail", [
 			"--noprofile",
@@ -98,20 +122,13 @@ module.exports = class Project {
 			"--shell=none",
 			"npm",
 			"start"
-		], {
-			env: {PORT: this.port, PATH: "/bin:/usr/bin:/usr/local/bin"},
-		});
+		], opts);
 
-		const logPrefix = this.project+": ";
-		function log(data) {
-			console.log(logPrefix + data.toString().replace(/\n/g, "\n"+logPrefix));
-		}
-
-		this.process.stdout.on('data', log);
-		this.process.stderr.on('data', log);
+		this.process.stdout.on('data', data => this.log("out", data));
+		this.process.stderr.on('data', data => this.log("err", data));
 
 		const processError = (code) => {
-			console.log(this.project, "process exited with code", code);
+			this.log("process exited with code "+code);
 			this.process = null;
 			this.stop();
 		};
@@ -165,7 +182,7 @@ module.exports = class Project {
 	}
 
 	handleError(err,req,rsp) {
-		console.log(this.project, 'handling error', err);
+		this.log('handling error: '+err);
 		this.stop();
 		rsp.writeHead(500, {'Content-Type': 'text/plain'});
 		rsp.write('node-central upstream error: '+err);
