@@ -104,6 +104,7 @@ module.exports = class Project {
 
 		let opts = {
 			env: {PORT: this.port, PATH: "/bin:/usr/bin:/usr/local/bin"},
+			cwd: "/etc/init", // HACK! This directory doesn't exist within jail, causing chdir to home directory.
 		};
 
 		if (process.getuid()==0) { // running as root -- process should run as owner of project directory
