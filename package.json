@@ -1,6 +1,6 @@
 {
   "name": "node-central",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "description": "Host a directory of Node apps each on a subdomain, running them on-demand in separate sandboxes.",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"

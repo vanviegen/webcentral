@@ -9,7 +9,9 @@ const Project = require('./project');
 const isRoot = process.getuid()==0;
 let configDir = isRoot ? "/var/lib/node-central/" : canonDir(process.env.HOME+"/.node-central");
 let projectDir = isRoot ? "/home/*/public-node-projects/" : canonDir(process.env.HOME+"/public-node-projects");
-let email = process.env.EMAIL;
+let email = process.env.EMAIL || '';
+let httpPort = 80;
+let httpsPort = 443;
 
 let argv = process.argv.slice(2);
 for(let i=0; i<argv.length; i++) {
@@ -18,6 +20,8 @@ for(let i=0; i<argv.length; i++) {
 	if (key=="--config") configDir = canonDir(val);
 	else if (key=="--projects") projectDir = canonDir(val);
 	else if (key=="--email") email = val;
+	else if (key=="--http") httpPort = 0|val;
+	else if (key=="--https") httpsPort = 0|val;
 	else help("invalid option: "+key);
 }
 
@@ -25,7 +29,12 @@ if (!email || !email.match(/@/)) {
 	help("an email address should be specified");
 }
 
-console.log("starting", {config: configDir, projects: projectDir, email});
+if (!httpPort && !httpsPort) {
+	help("at least one of http or https should be set");
+}
+
+console.log(process.argv[1]+" --config="+configDir+" --projects="+projectDir+" --email="+email+ " --http="+httpPort+" --https="+httpsPort);
+
 
 function help(msg) {
 	if (msg) console.error("Error: "+msg+"\n");
@@ -128,11 +137,11 @@ const greenlock = require('greenlock').create({
 	debug: false,
 });
 
-require('http').createServer(greenlock.middleware(require('redirect-https')())).listen(80);
-const server = require('https').createServer(greenlock.tlsOptions)
+if (httpPort && httpsPort) {
+	require('http').createServer(greenlock.middleware(require('redirect-https')({port:httpsPort}))).listen(httpPort);
+}
+const server = httpsPort ? require('https').createServer(greenlock.tlsOptions) : require('http').createServer();
 server.on('request', handleRequest);
 server.on('upgrade', handleWebSocket);
-server.listen(443);
-
-
+server.listen(httpsPort || httpPort);
 
