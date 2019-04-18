@@ -67,6 +67,7 @@ Create a file named `/etc/systemd/system/node-central.service` containing:
 ```ini
 [Service]
 ExecStart=/usr/bin/nodejs /path/to/node-central/index.js --email your-email-address
+Restart=always
 
 [Install]
 WantedBy=multi-user.target
