@@ -122,11 +122,7 @@ function handleWebSocket(req, socket, head) {
  
 
 const greenlock = require('greenlock').create({
-	// Let's Encrypt v2 is ACME draft 11
 	version: 'draft-11',
- 
-	// Note: If at first you don't succeed, switch to staging to debug,
-	// https://acme-staging-v02.api.letsencrypt.org/directory
 	server: 'https://acme-v02.api.letsencrypt.org/directory',
 	configDir: configDir+'acme/',
 	email: email,
@@ -135,6 +131,7 @@ const greenlock = require('greenlock').create({
 	communityMember: false,
 	telemetry: false,
 	debug: false,
+	store: require('greenlock-store-fs'),
 });
 
 if (httpPort && httpsPort) {
