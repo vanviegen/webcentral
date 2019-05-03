@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const glob = require('tiny-glob/sync');
+const glob = require('glob').sync;
 
 const Project = require('./project');
 
