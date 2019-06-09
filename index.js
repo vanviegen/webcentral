@@ -64,7 +64,7 @@ try {
 
 
 function getProjectDir(domain) {
-	if (typeof domain !== "string" || !domain.match(/^[a-zA-Z.-]+$/)) return;
+	if (typeof domain !== "string" || !domain.match(/^[a-zA-Z.0-9-]+$/)) return;
 
 	let candidates = glob(projectDir+domain+"/package.json", {
 		cwd: "/",
