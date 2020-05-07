@@ -12,6 +12,8 @@ let projectDir = isRoot ? "/home/*/public-node-projects/" : canonDir(process.env
 let email = process.env.EMAIL || '';
 let httpPort = 80;
 let httpsPort = 443;
+let redirectHttp = null;
+let firejail = true;
 
 let argv = process.argv.slice(2);
 for(let i=0; i<argv.length; i++) {
@@ -22,6 +24,8 @@ for(let i=0; i<argv.length; i++) {
 	else if (key=="--email") email = val;
 	else if (key=="--http") httpPort = 0|val;
 	else if (key=="--https") httpsPort = 0|val;
+	else if (key=="--redirect-http") redirectHttp = (val==="true" || val==="yes");
+	else if (key=="--firejail") firejail = (val==="true" || val==="yes");
 	else help("invalid option: "+key);
 }
 
@@ -33,8 +37,15 @@ if (!httpPort && !httpsPort) {
 	help("at least one of http or https should be set");
 }
 
-console.log(process.argv[1]+" --config="+configDir+" --projects="+projectDir+" --email="+email+ " --http="+httpPort+" --https="+httpsPort);
+if (httpPort && httpsPort) {
+	if (redirectHttp==null) redirectHttp = true;
+} else {
+	redirectHttp = false;
+}
 
+console.log(process.argv[1]+" --config="+configDir+" --projects="+projectDir+" --email="+email+ " --http="+httpPort+" --https="+httpsPort+" --redirect-http="+(redirectHttp?"true":"false")+" --firejail="+(firejail?"true":"false"));
+
+Project.firejail = firejail;
 
 function help(msg) {
 	if (msg) console.error("Error: "+msg+"\n");
@@ -43,7 +54,7 @@ function help(msg) {
 }
 
 function canonDir(dir) {
-	let dir = fs.realpathSync(dir);
+	dir = path.resolve(dir);
 	if (dir[dir.length-1]!=='/') dir += '/';
 	return dir;
 }
@@ -64,7 +75,7 @@ try {
 
 
 function getProjectDir(domain) {
-	if (typeof domain !== "string" || !domain.match(/^[a-zA-Z.0-9-]+$/)) return;
+	if (typeof domain !== "string" || !domain.match(/^[a-zA-Z.0-9-:]+$/)) return;
 
 	let candidates = glob(projectDir+domain+"/package.json", {
 		cwd: "/",
@@ -134,11 +145,22 @@ const greenlock = require('greenlock').create({
 	store: require('greenlock-store-fs'),
 });
 
-if (httpPort && httpsPort) {
-	require('http').createServer(greenlock.middleware(require('redirect-https')({port:httpsPort}))).listen(httpPort);
+
+if (httpsPort) {
+	configureServer(require('https').createServer(greenlock.tlsOptions), httpsPort);
 }
-const server = httpsPort ? require('https').createServer(greenlock.tlsOptions) : require('http').createServer();
-server.on('request', handleRequest);
-server.on('upgrade', handleWebSocket);
-server.listen(httpsPort || httpPort);
+
+if (httpPort) {
+	if (httpsPort && redirectHttp) {
+		require('http').createServer(greenlock.middleware(require('redirect-https')({port:httpsPort}))).listen(httpPort);
+	} else {
+		configureServer(require('http').createServer(), httpPort);
+	}
+}
+
+function configureServer(server, port) {
+	server.on('request', handleRequest);
+	server.on('upgrade', handleWebSocket);
+	server.listen(port);
+}
 

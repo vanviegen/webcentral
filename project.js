@@ -4,7 +4,9 @@ const net = require('net');
 const httpProxy = require('http-proxy');
 const fs = require('fs');
 const path = require('path');
-const rfs = require('rotating-file-stream');
+
+const Logger = require('./logger');
+
 
 function portReachable(port) {
 	return new Promise(function(resolve) {
@@ -39,10 +41,15 @@ module.exports = class Project {
 		this.queue = [];
 		this.lastUse = new Date().getTime();
 		this.watchers = [];
-		try {
-			fs.mkdirSync(dir+"/log");
-		} catch(e) {}
-		this.logFd = rfs("node-central.log", {maxFiles: 14, interval: "1d", compress: "gzip", path: dir+"/log"});
+
+		if (process.getuid()==0) { // running as root -- process should run as owner of project directory
+			let stat = fs.statSync(this.dir);
+			this.uid = stat.uid;
+			this.gid = stat.gid;
+		}
+
+		this.logger = new Logger({path: this.dir+"/log", base: "node-central_", uid: this.uid, gid: this.gid, deleteAfterDays: 21});
+		
 		getPort().then(port => {
 			this.port = port;
 			this.init();
@@ -50,7 +57,7 @@ module.exports = class Project {
 		this.unusedInterval = setInterval(() => {
 			let unused = new Date().getTime() - this.lastUse;
 			if (unused > 10*60*1000) {
-				this.log("stopping due to inactivity");
+				this.logger.write("stopping due to inactivity");
 				this.stop(true);
 			}
 		}, 60*1000);
@@ -63,7 +70,7 @@ module.exports = class Project {
 			if (file[0]==='.' || file.endsWith('.log')) return;
 			if (this.changes) return;
 			this.changes = true;
-			this.log('stopping due to '+type+'@'+path.join(dir,file));
+			this.logger.write('stopping due to '+type+'@'+path.join(dir,file));
 			this.stop(true);
 		}));
 		fs.readdirSync(dir)
@@ -73,17 +80,8 @@ module.exports = class Project {
 			.forEach(file => this.watch(file));
 	}
 
-	log(msg, data) {
-		msg = new Date().toJSON() + " " + msg;
-		if (data) {
-			msg += ": ";
-			msg = msg + data.toString().replace(/\n$/,'').replace(/\n/g, "\n"+msg);
-		}
-		this.logFd.write(msg+"\n");
-	}
-
 	init() {
-		this.log("starting on port "+this.port);
+		this.logger.write("starting on port "+this.port);
 		this.startTime = new Date().getTime();
 
 		this.proxy = httpProxy.createProxyServer({target: {host: 'localhost', port: this.port}});
@@ -91,7 +89,7 @@ module.exports = class Project {
 
 		this.reachableInterval = setInterval(async () => {
 			if ((await portReachable(this.port)) && this.queue) {
-				this.log("reachable on port "+this.port+" after "+(new Date().getTime() - this.startTime)+"ms");
+				this.logger.write("reachable on port "+this.port+" after "+(new Date().getTime() - this.startTime)+"ms");
 				clearTimeout(this.reachableInterval);
 				this.reachableInterval = null;
 				let queue = this.queue;
@@ -103,33 +101,39 @@ module.exports = class Project {
 		}, 50);
 
 		let opts = {
-			env: {PORT: this.port, PATH: "/bin:/usr/bin:/usr/local/bin"},
-			cwd: "/etc/init", // HACK! This directory doesn't exist within jail, causing chdir to home directory.
+			env: {
+				PORT: this.port,
+				PATH: process.env.PATH,
+			},
+			cwd: this.dir,
 		};
 
-		if (process.getuid()==0) { // running as root -- process should run as owner of project directory
-			let stat = fs.statSync(this.dir);
-			opts.uid = stat.uid;
-			opts.gid = stat.gid;
+		if (this.uid) {
+			opts.uid = this.uid;
+			opts.gid = this.gid;
 		}
 
-		this.process = childProcess.spawn("firejail", [
-			"--noprofile",
-			"--private="+this.dir,
-			"--private-dev",
-			"--private-etc=group,hostname,localtime,nsswitch.conf,passwd,resolv.conf",
-			"--private-tmp",
-			"--seccomp",
-			"--shell=none",
-			"npm",
-			"start"
-		], opts);
+		if (Project.firejail) {
+			this.process = childProcess.spawn("firejail", [
+				"--noprofile",
+				"--private="+this.dir,
+				"--private-dev",
+				"--private-etc=group,hostname,localtime,nsswitch.conf,passwd,resolv.conf",
+				"--private-tmp",
+				"--seccomp",
+				"--shell=none",
+				"npm",
+				"start"
+			], opts);
+		} else {
+			this.process = childProcess.spawn("npm", ["start"], opts);
+		}
 
-		this.process.stdout.on('data', data => this.log("out", data));
-		this.process.stderr.on('data', data => this.log("err", data));
+		this.process.stdout.on('data', data => this.logger.write("out", data));
+		this.process.stderr.on('data', data => this.logger.write("err", data));
 
 		const processError = (code) => {
-			this.log("process exited with code "+code);
+			this.logger.write("process exited with code "+code);
 			this.process = null;
 			this.stop();
 		};
@@ -183,10 +187,12 @@ module.exports = class Project {
 	}
 
 	handleError(err,req,rsp) {
-		this.log('handling error: '+err);
+		this.logger.write('handling error: '+err);
 		this.stop();
 		rsp.writeHead(500, {'Content-Type': 'text/plain'});
 		rsp.write('node-central upstream error: '+err);
 		rsp.end();
 	}
 }
+
+

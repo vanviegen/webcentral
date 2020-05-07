@@ -13,7 +13,6 @@
     "greenlock-store-fs": "3",
     "http-proxy": "^1.17.0",
     "redirect-https": "^1.1.6",
-    "rotating-file-stream": "^1.4.0",
     "glob": "^7.1.3"
   }
 }

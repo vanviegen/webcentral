@@ -22,7 +22,7 @@ This is mostly useful to get (many) small web apps or experiments up-and-running
 Installation should be something along the lines of:
 
 ```sh
-sudo apt install nodejs firejail
+sudo apt install nodejs npm git firejail
 git clone https://github.com/vanviegen/node-central.git
 cd node-central
 npm install
@@ -52,7 +52,9 @@ The above does require the $EMAIL environment variable to be set, for use with L
 | `--projects=DIR` | Search for projects in DIR, where `DIR` can be a `glob` expression. Projects need to be directories (containing a `package.json` file), named exactly like the domain the are serving. Defaults to `/home/*/public-node-projects` when run as root, or to `$HOME/public-node-projects` otherwise. |
 | `--config=DIR` | Directory where domain to directory mappings and LetsEncrypt config are stored. Defaults to `/var/lib/node-central` when run as root, or to `$HOME/.node-central` otherwise.
 | `--https=PORT` | Run the HTTPS server on TCP port `PORT`. Defaults to 443. Set to 0 to disable HTTPS. |
-| `--http=PORT` | Run the HTTP server on TCP port `PORT`. Defaults to 80. Set to 0 to disable HTTP. The HTTP server will only redirect to HTTPS, unless HTTPS is disabled. |
+| `--http=PORT` | Run the HTTP server on TCP port `PORT`. Defaults to 80. Set to 0 to disable HTTP. |
+| `--redirect-http=BOOL` | When `true` (as it is by default) and both `http` and `https` are not 0, incoming HTTP requests will be redirected to HTTPS. When set to `false`, requests are handled on both HTTP and HTTPS. |
+| `--firejail=BOOL` | Set to `false` to disable the use of Firejail containing Node processes. This is bad for security and may cause process leaks. Defaults to `true`. |
 
 
 ## Log files
@@ -75,11 +77,17 @@ WantedBy=multi-user.target
 
 You do of course need to modify the node-central path and email address.
 
-To start the service without rebooting:
+To start the service:
 
 ```sh
 sudo systemctl daemon-reload
 sudo systemctl start node-central
+```
+
+To have the service starts after reboots:
+
+```sh
+sudo systemctl enable node-central
 ```
 
 Make sure no other servers are already running on port 80 or 443. To see any non-project-specific problems:
