@@ -4,6 +4,7 @@ const net = require('net');
 const httpProxy = require('http-proxy');
 const fs = require('fs');
 const path = require('path');
+const nodeStatic = require('node-static');
 
 const Logger = require('./logger');
 
@@ -50,10 +51,6 @@ module.exports = class Project {
 
 		this.logger = new Logger({path: this.dir+"/log", base: "node-central_", uid: this.uid, gid: this.gid, deleteAfterDays: 21});
 		
-		getPort().then(port => {
-			this.port = port;
-			this.init();
-		});
 		this.unusedInterval = setInterval(() => {
 			let unused = new Date().getTime() - this.lastUse;
 			if (unused > 10*60*1000) {
@@ -63,6 +60,60 @@ module.exports = class Project {
 		}, 60*1000);
 
 		this.watch(dir);
+
+		if (fs.existsSync(dir+"package.json")) {
+			this.command = ["npm", "start"];
+			this.host = "localhost";
+			getPort().then(port => {
+				this.port = port;
+				this.createProxy({target: {host: 'localhost', port}});
+				this.runCommand();
+			});
+		} else if (fs.existsSync(dir+"node-central.json")) {
+			let config = {};
+			try {
+				config = JSON.parse(fs.readFileSync(dir+"node-central.json"));
+			} catch(e) {
+				this.logger.write("node-central.json error: "+e);
+			}
+
+			if (config.redirect) {
+				this.redirect = config.redirect;
+				this.logger.write("starting redirect to "+this.redirect);
+				this.handle = this.handleRedirect;
+			} else if (config.proxy) {
+				this.logger.write("starting proxy for "+config.proxy);
+				this.createProxy({target: config.proxy, changeOrigin: true, autoRewrite: true});
+			} else {
+				let target = {
+					host: config.host || 'localhost',
+					port: config.port || 8080,
+				};
+				this.logger.write("starting forward to http://"+target.host+":"+target.port);
+				this.createProxy({target});
+			}
+			this.started();
+		} else {
+			this.logger.write("starting static file server");
+			this.staticServer = new nodeStatic.Server(dir);
+			this.handle = this.handleStatic;
+			this.started();
+		}
+	}
+
+	handleStatic({req, rsp}) {
+		this.staticServer.serve(req, rsp, (err,result) => {
+			if (err) {
+				this.logger.write(`Static ${req.method} ${req.url}: ${err.message}`);
+				rsp.writeHead(err.status, err.headers);
+				rsp.end();
+			}
+		});
+	}
+
+	handleRedirect({req,rsp}) {
+		rsp.writeHead (301, {'Location': this.redirect + req.url});
+		rsp.end();
 	}
 
 	watch(dir) {
@@ -80,23 +131,21 @@ module.exports = class Project {
 			.forEach(file => this.watch(file));
 	}
 
-	init() {
+	createProxy(opts) {
+		this.proxy = httpProxy.createProxyServer(opts);
+		this.proxy.on('error', this.handleError.bind(this));
+	}
+
+	runCommand() {
 		this.logger.write("starting on port "+this.port);
 		this.startTime = new Date().getTime();
-
-		this.proxy = httpProxy.createProxyServer({target: {host: 'localhost', port: this.port}});
-		this.proxy.on('error', this.handleError.bind(this));
 
 		this.reachableInterval = setInterval(async () => {
 			if ((await portReachable(this.port)) && this.queue) {
 				this.logger.write("reachable on port "+this.port+" after "+(new Date().getTime() - this.startTime)+"ms");
 				clearTimeout(this.reachableInterval);
 				this.reachableInterval = null;
-				let queue = this.queue;
-				this.queue = null;
-				for(let opts of queue) {
-					this.handle(opts);
-				}
+				this.started();
 			}
 		}, 50);
 
@@ -121,12 +170,10 @@ module.exports = class Project {
 				"--private-etc=group,hostname,localtime,nsswitch.conf,passwd,resolv.conf",
 				"--private-tmp",
 				"--seccomp",
-				"--shell=none",
-				"npm",
-				"start"
-			], opts);
+				"--shell=none"
+			].concat(this.command), opts);
 		} else {
-			this.process = childProcess.spawn("npm", ["start"], opts);
+			this.process = childProcess.spawn(this.command[0], this.command.slice(1), opts);
 		}
 
 		this.process.stdout.on('data', data => this.logger.write("out", data));
@@ -140,6 +187,15 @@ module.exports = class Project {
 
 		this.process.on('close', processError);
 		this.process.on('error', processError);
+	}
+
+	started() {
+		let queue = this.queue;
+		this.queue = null;
+		this.logger.write("ready to serve");
+		for(let opts of queue) {
+			this.handle(opts);
+		}
 	}
 
 	stop(moveQueue) {
@@ -173,6 +229,10 @@ module.exports = class Project {
 			setTimeout(() => {
 				if (process === this.process) process.kill(9);
 			}, 2000);
+		}
+
+		if (this.proxy) {
+			this.proxy.close();
 		}
 	}
 
