@@ -23,8 +23,12 @@ function portReachable(port) {
 		socket.on('timeout', onError);
 
 		socket.connect(port, 'localhost', function(){
-			socket.end();
-			resolve(true);
+			socket.write("HEAD / HTTP/1.1\nHost: example.com\n\n");
+			socket.on('data', function(data) {
+				// any response is good enough for us!
+				socket.end();
+				resolve(true);
+			});
 		});
 	});
 }
@@ -61,29 +65,42 @@ module.exports = class Project {
 
 		this.watch(dir);
 
+		let config;
 		if (fs.existsSync(dir+"package.json")) {
-			this.command = ["npm", "start"];
-			this.host = "localhost";
-			getPort().then(port => {
-				this.port = port;
-				this.createProxy({target: {host: 'localhost', port}});
-				this.runCommand();
-			});
+			config = {
+				command: ["npm", "start"],
+			};
 		} else if (fs.existsSync(dir+"node-central.json")) {
-			let config = {};
+			config = {};
 			try {
 				config = JSON.parse(fs.readFileSync(dir+"node-central.json"));
 			} catch(e) {
 				this.logger.write("node-central.json error: "+e);
 			}
+		}
 
-			if (config.redirect) {
+		if (config) {
+			if (config.command) {
+				this.command = typeof config.command === 'string' ? ['/bin/sh', '-c', config.command] : config.command;
+				this.host = "localhost";
+				this.docker = config.docker;
+				getPort().then(port => {
+					this.port = port;
+					this.createProxy({target: {host: 'localhost', port}});
+					this.runCommand();
+				});
+				return; // started() will be called by runCommand()
+			} else if (config.redirect) {
 				this.redirect = config.redirect;
 				this.logger.write("starting redirect to "+this.redirect);
 				this.handle = this.handleRedirect;
 			} else if (config.proxy) {
 				this.logger.write("starting proxy for "+config.proxy);
 				this.createProxy({target: config.proxy, changeOrigin: true, autoRewrite: true});
+			} else if (config.command) {
+				this.command = typeof config.command == 'string' ? ['/bin/sh', '-c', this.command] : config.command;
+				this.host = "localhost";
+
 			} else {
 				let target = {
 					host: config.host || 'localhost',
@@ -92,13 +109,12 @@ module.exports = class Project {
 				this.logger.write("starting forward to http://"+target.host+":"+target.port);
 				this.createProxy({target});
 			}
-			this.started();
 		} else {
 			this.logger.write("starting static file server");
 			this.staticServer = new nodeStatic.Server(dir);
 			this.handle = this.handleStatic;
-			this.started();
 		}
+		this.started();
 	}
 
 	handleStatic({req, rsp}) {
@@ -149,21 +165,47 @@ module.exports = class Project {
 			}
 		}, 50);
 
-		let opts = {
-			env: {
-				PORT: this.port,
-				PATH: process.env.PATH,
-			},
-			cwd: this.dir,
-		};
+		let docker = this.docker;
+		if (docker) {
+			if (docker instanceof Array || typeof docker === 'string') docker = {base: "alpine", packages: docker};
+			if (!docker.base) docker.base = "alpine";
+			let run = typeof docker.run === 'string' ? [docker.run] : (docker.run || []);
+			if (docker.packages) {
+				let packages = typeof docker.packages === 'string' ? docker.packages : docker.packages.join(' ');
+				run.unshift(`if command -v apk &> /dev/null ; then apk update && apk add --no-cache ${packages} ; else apt-get update && apt-get install --no-install-recommends --yes ${packages}; fi`);
+			}
+			run = run.map(s => "RUN "+(typeof s === 'string' ? s : JSON.stringify(s)));
 
-		if (this.uid) {
-			opts.uid = this.uid;
-			opts.gid = this.gid;
-		}
+			let dockerfile = [
+				`FROM ${docker.base}`,
+				`WORKDIR /app`
+			].concat(run).join("\n");
+			this.logger.write('build', dockerfile);
 
-		if (Project.firejail) {
-			this.process = childProcess.spawn("firejail", [
+			let builder = childProcess.spawn("docker", ["build", "-q", "-"], this.getProcessOpts());
+			let tag = "";
+			builder.stdout.on('data', data => tag += data);
+			builder.stderr.on('data', data => this.logger.write("build err", data));
+
+			const buildError = (code) => {
+				this.logger.write("build exited", code);
+				if (code) {
+					this.stop();
+				} else {
+					this.startProcess("docker", "run", "--rm", "-i", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:8000`, tag.trim());
+				}
+			};
+
+			builder.on('close', buildError);
+			builder.on('error', buildError);
+
+			builder.stdin.on('error', function(){});
+			builder.stdin.write(dockerfile);
+			builder.stdin.end();
+			
+		} else if (Project.firejail) {
+			this.startProcess(
+				"firejail",
 				"--noprofile",
 				"--private="+this.dir,
 				"--private-dev",
@@ -171,10 +213,37 @@ module.exports = class Project {
 				"--private-tmp",
 				"--seccomp",
 				"--shell=none"
-			].concat(this.command), opts);
+			);
 		} else {
-			this.process = childProcess.spawn(this.command[0], this.command.slice(1), opts);
+			this.startProcess();
 		}
+	}
+
+	getProcessOpts() {
+		let opts = {
+			env: {
+				PORT: this.port,
+				PATH: process.env.PATH,
+			},
+			cwd: this.dir,
+		};
+		if (this.uid) {
+			opts.uid = this.uid;
+			opts.gid = this.gid;
+		}
+		return opts;
+	}
+
+	startProcess(...args) {
+		if (this.stopped) return;
+
+		if (this.command) {
+			if (typeof this.command === 'string') this.command = ['/bin/sh', '-c', this.command];
+			args = args.concat(this.command);
+		}
+		this.logger.write("start process "+JSON.stringify(args));
+
+		this.process = childProcess.spawn(args[0], args.slice(1), this.getProcessOpts());
 
 		this.process.stdout.on('data', data => this.logger.write("out", data));
 		this.process.stderr.on('data', data => this.logger.write("err", data));

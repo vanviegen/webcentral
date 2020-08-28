@@ -80,7 +80,6 @@ function getProjectDir(domain) {
 	if (cachedProjectDirs.hasOwnProperty(domain)) return cachedProjectDirs[domain];
 	let result = realGetProjectDir(domain);
 	if (result) {
-		console.log('cache',domain,result);
 		// Cache for 10s.
 		cachedProjectDirs[domain] = result;
 		setTimeout(function() {
@@ -91,6 +90,7 @@ function getProjectDir(domain) {
 }
 
 function realGetProjectDir(domain) {
+	domain = domain.replace(/:\d+$/, '');
 	if (typeof domain !== "string" || !domain.match(/^[a-zA-Z.0-9-:]+$/)) return;
 
 	let candidates = glob(projectDir+domain+"/", {cwd: "/", absolute: true});

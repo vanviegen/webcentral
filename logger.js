@@ -16,7 +16,10 @@ class Logger {
 
 	write(topic, msg) {
 		if (msg) msg = `[${topic}] ${(msg+'').trim()}`;
-		else msg = (topic+'').trim();
+		else {
+			msg = (topic+'').trim();
+			topic = '';
+		}
 
 		if (!msg) return;
 
@@ -26,7 +29,7 @@ class Logger {
 			this.open(date);
 		}
 
-		let prefix = "\n" + " ".repeat(9 + (msg ? topic.length+3 : 0))
+		let prefix = "\n" + " ".repeat(9 + (topic.length ? topic.length+3 : 0))
 		
 		fs.write(this.fd, `${time} ${msg.replace(/\n/g, prefix)}\n`, () => {});
 	}
