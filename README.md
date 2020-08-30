@@ -1,29 +1,34 @@
-# node-central
+# Webcentral
 
-Node-central makes it easy to run (many) Node.js applications (and other web projects) on a single server.
+Host multiple sandboxed started-on-demand web applications on a single machine. Create a DNS (sub)domain for your application, put it in a directory with the domain as its name, and it's good to go! This is especially convenient when used with a wildcard DNS record, for quickly throwing things online.
 
 ## Features
 
-- Starts Node.s applications on-demand (~ 1s) and stops them after 5m of inactivity.
-- Restarts applications when any files are changed, without downtime.
-- Runs applications in a restricted environment (firejail), adding some security.
-- Automatically sets up HTTPS using LetsEncrypt, and redirects HTTP traffic to HTTPS.
-- Supports WebSocket passthrough.
-- Can run projects on behalf of multiple users, when started as root. Runs project as the user. The first user to claim a domain will get to keep it.
-- Writes project console output to rotating log files in the project directory.
-- Trivially easy static file serving, as well as proxying, forwarding or redirecting to other web sites.
+- Based on directory names that should match the domain of an incoming request, Webcentral will:
+	- Start a Node.js application on-demand, within a Firejail sandbox.
+	- Run a web service within a trivially easy to configure Docker environment on-demand.
+	- Host static files.
+	- Proxy requests to some (remote) service, optionally masquerading the original domain.
+	- Browser redirect requests.
+- Restart applications without downtime when files are changed, for easy updates.
+- Shut down applications after some period of inactivity.
+- Automatically set up HTTPS using LetsEncrypt, and redirects HTTP requests to HTTPS.
+- Passthrough WebSocket traffic.
+- Run projects on behalf of multiple users, when started as root. Applications run with the user's permissions. The first user to claim a domain will get to keep it.
+- Write application stdout and stderr to rotating log files in the project directory.
 
-This is mostly useful to get (many) small web applications or experiments up-and-running quickly, safe-ish and on their own (wildcard) subdomains.
-
+**Caveats:**
+- This is a single process Node.js application. Though it should be relatively fast, don't expect miracles. Scaling up Webcentral should not be that difficult though.
+- Although Firejail and Docker will add a layer of security compared to running random code without a sandbox, the way we're using these from Webcentral has not been scrutinized all that well. Also, Webcentral itself may add additional attack surface. In other words: don't rely on this too much for security.
 
 ## Installation
 
 Installation should be something along the lines of:
 
 ```sh
-sudo apt install nodejs npm git firejail
-git clone https://github.com/vanviegen/node-central.git
-cd node-central
+sudo apt install nodejs npm git firejail docker.io
+git clone https://github.com/vanviegen/webcentral.git
+cd webcentral
 npm install
 ```
 
@@ -31,29 +36,76 @@ npm install
 
 `node index.js --email you@example.com`
 
-This will start the node-central server, dispatching to node projects in the `public-node-projects` directory in your home directory. If the above command was run as root, the `public-node-project` directories of all users will be searched, and projects will be run as their owning users.
+This will start the Webcentral server, dispatching to node projects in the `public-webcentral-domains` directory in your home directory. If the above command was run as root, the `public-node-project` directories of all users will be searched, and projects will be run as their owning users.
 
-The `public-node-projects` directories should contain subdirectories that have the name of the (sub)domains they are claiming. For instance: `/home/frank/public-node-projects/example.com/`. Based on the contents, a project can be treated in various ways:
+The `public-webcentral-domains` directories should contain subdirectories that have the name of the (sub)domains they are claiming. For instance: `/home/frank/public-webcentral-domains/example.com/`. Based on the contents, a project can be treated in various ways:
 
-1. If the project has a `/package.json` file, it will be run as a Node.js project.
+### Project types
+
+1. If the project has a `/package.json` file, it will be run as a **Node.js project**.
   - `npm start` within the project directory should bring up an HTTP server on port `process.env.PORT`. This shouldn't take too long, as the HTTP client will be kept waiting.
   - If WebSocket is used, it should be made available over the same port.
-  - Only limited access to the host system is provided. (See the node-central source code and firejail documentation for details -- sorry.)
-2. If the project has a `/node-central.json` file, requests will be delegated to a service listen in that file.
-forward, proxy or redirect, indicated by the presence of a `node-central.json` file. The file should consist of a valid JSON object that can have either of the following keys:
-  - `port` (and optionally `host`): Requests will be forwarded to another web service, without modifying the `Host:` header. Example: `{"port": 8080, "host": "localhost"}`
-  - `proxy`: Requests will be proxied to another web service, modifying `Host:` such that the target doesn't notice it is being proxied. Example: `{"proxy": "https://www.google.com"}`
-  - `redirect`: Requests will return a 301 redirect to another web service. Example: `{"proxy": "https://new-app-name.example.com"}`
-3. In other cases, the project directory will be served statically as just a bunch of files.
+  - Only limited access to the host system is provided. (See the Webcentral source code and Firejail documentation for details -- sorry.) The jail can be disabled using the `--firejail=false` flag. Or, for more flexibility, Docker can be used to setup the Node.js environment. Please ready on...
+2. Otherwise, if the project has a `/webcentral.toml` file, requests will be delegated to a service listen in that file.
+  - **Application.** When the TOML file has a top-level `command` property, this command will be run from within a Firejail or Docker sandbox. The command is expected to set up an HTTP service on port 8000.
+    - Firejail is the default option. It allows read-only access to system directories of the host system, such as `/bin` and `/usr`, but doesn't expose files like those in your home directory.
+    - Docker is selected by creating a `[docker]` section in the TOML file. No files of the host system will be exposed. Instead, a separate Linux distribution is created for the application. Generally, this will consume more memory and take a bit longer to start than when using Firejail. By default the container will run a pristine Alpine linux image, but options in the `[docker]` section of the TOML file can be used to change that:
+      - `base` sets the Docker base image to start with.
+      - `runs` is an array of commands used to build the Docker image. Each command can either be a string, which will be executed as a shell command, or an array of strings, which will be executed without involving a shell.
+      - `packages` is an array of packages to install on the base system. This only works on base systems that offer either `apt-get` (Debian/Ubuntu) or `apk` (Alpine) as a means to install them. This is just a shortcut for prepending `runs` commands.
+    
+    Example `webcentral.toml` using PHP from the host system:
+    ```toml
+    command = "php -S 0.0.0.0:8000 -file test.php"
+    ```
+    And using PHP from a Docker image:
+    ```toml
+    command = "php -S 0.0.0.0:8000 -file test.php"
+    [docker]
+    base = "alpine" # This is the default
+    packages = ["php7"]
+    ```
+  - **Forward.** Otherwise, when the TOML file has a top-level `port` property, requests will be forwarded to this port, without modifying the `Host:` header. The `host` property can specify a host name or ip address to use -- it defaults to localhost.
+    ```toml
+    port = 3000
+    host = 192.168.10.20
+    ```
+  - **Proxy.** (Experimental) Otherwise, when `webcentral.toml` has a top-level `proxy` property containing a URL, requests will be proxied to that URL. This is similar to forwarding, except that proxying is not visible to the target host as headers such as `Host:` are rewritten.
+    ```toml
+    proxy = "https://www.google.com"
+    ```
+  - **Redirect.** Otherwise, when a `redirect` property is present, all requests will receive an HTTP 301 redirect to the URL given in that property, concatenated with the path and query string of the request.
+    ```toml
+    redirect = "https://new-service-name.example.com"
+    ```
+3. In other cases, the project directory will be **served statically** as just a bunch of files.
 
+### Reloading
+Node.js and Docker applications will be automatically shut down when...
+1. The service has been inactive for 5 minutes. This period can be overridden or disabled using the `timeout` property in the `[reload]` section of the `webcentral.toml`. It indicates the time in seconds. Zero disables inactivity shutdown.
+2. When any of the files in the application directory change. By default, the following file patterns are excluded from this:
+   - `data` (A file or directory with this name in the root of the project directory.)
+   - `log`
+   - `logs`
+   - `node_modules`
+   - `**/*.log` (A file or directory with a name ending in *.log* in the root directory or any subdirectory.)
+   - `**/.*` (Hidden files.)
+   This behaviour can be overriden using the `include` and `exclude` properties in the `[reload]` section of `webcentral.toml`. Both can be string arrays containing patterns like the above. Exclusion always overrules inclusion. When `include` is not set, everything will be included by default. Even when `include` is manually set, `webcentral.toml` will always be added to it automatically, to make sure errors can be corrected. Similarly, `exclude` will always have `log` appended to it, because it makes little sense to reload for each log message written by Webcentral.
+   ```toml
+   command = ["./start.sh", "--production"]
+   [reload]
+   timeout = 0 # disable timeout
+   include = ["src", "config.yaml"] # Reload when anything in the src directory or the config file changes.
+   exclude = ["src/build", "**/*.bak"] # But ignore the src/build directory and .bak files
+   ```
 
 ## Options
 
 | Option | Description |
 | --- | --- |
-| `--email=EMAIL` | Set the email address used for LetsEncrypt to `EMAIL`. Defaults to the $EMAIL environment variable. |
-| `--projects=DIR` | Search for projects in DIR, where `DIR` can be a `glob` expression. Projects need to be directories (containing a `package.json` file), named exactly like the domain the are serving. Defaults to `/home/*/public-node-projects` when run as root, or to `$HOME/public-node-projects` otherwise. |
-| `--config=DIR` | Directory where domain to directory mappings and LetsEncrypt config are stored. Defaults to `/var/lib/node-central` when run as root, or to `$HOME/.node-central` otherwise.
+| `--email=EMAIL` | Set the email address used for LetsEncrypt to `EMAIL`. Defaults to the $EMAIL environment variable. An email address is required, unless `--https=0`. |
+| `--projects=DIR` | Search for projects in DIR, where `DIR` can be a `glob` expression. Projects need to be directories (containing a `package.json` file), named exactly like the domain the are serving. Defaults to `/home/*/public-webcentral-domains` when run as root, or to `$HOME/public-webcentral-domains` otherwise. |
+| `--config=DIR` | Directory where domain to directory mappings and LetsEncrypt config are stored. Defaults to `/var/lib/webcentral` when run as root, or to `$HOME/.webcentral` otherwise.
 | `--https=PORT` | Run the HTTPS server on TCP port `PORT`. Defaults to 443. Set to 0 to disable HTTPS. |
 | `--http=PORT` | Run the HTTP server on TCP port `PORT`. Defaults to 80. Set to 0 to disable HTTP. |
 | `--redirect-http=BOOL` | When `true` (as it is by default) and both `http` and `https` are not 0, incoming HTTP requests will be redirected to HTTPS. When set to `false`, requests are handled on both HTTP and HTTPS. |
@@ -63,16 +115,16 @@ forward, proxy or redirect, indicated by the presence of a `node-central.json` f
 
 ## Log files
 
-Output of (and about) client projects is written to `log/node-central.log` in the project directory. Log files are rotated and compressed daily, and deleted after two weeks. This is currently not configurable (except by trivially modifying the source code).
+Output of (and about) client projects is written to `log/webcentral_<DATE>.log` in the project directory. Log files are automatically deleted after three weeks. This is currently not configurable (except by trivially modifying the source code).
 
 
 ## Starting from systemd
 
-Create a file named `/etc/systemd/system/node-central.service` containing:
+Create a file named `/etc/systemd/system/webcentral.service` containing:
 
 ```ini
 [Service]
-ExecStart=/usr/bin/nodejs /PATH/TO/node-central/index.js --email YOUR-EMAIL-ADDRESS
+ExecStart=/usr/bin/nodejs /PATH/TO/webcentral/index.js --email YOUR-EMAIL-ADDRESS
 Restart=always
 
 [Install]
@@ -83,18 +135,18 @@ To start the service:
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl start node-central
+sudo systemctl start webcentral
 ```
 
 To have the service starts after reboots:
 
 ```sh
-sudo systemctl enable node-central
+sudo systemctl enable webcentral
 ```
 
 Make sure no other servers are already running on port 80 or 443. To see any non-project-specific problems:
 
 ```sh
-sudo systemctl status node-central -n 20
+sudo systemctl status webcentral -n 20
 ```
 

@@ -1,14 +1,14 @@
 'use strict';
 
 const fs = require('fs');
-const path = require('path');
 const glob = require('glob').sync;
+const path = require('path');
 
 const Project = require('./project');
 
 const isRoot = process.getuid()==0;
-let configDir = isRoot ? "/var/lib/node-central/" : canonDir(process.env.HOME+"/.node-central");
-let projectDir = isRoot ? "/home/*/public-node-projects/" : canonDir(process.env.HOME+"/public-node-projects");
+let configDir = isRoot ? "/var/lib/webcentral/" : canonDir(process.env.HOME+"/.webcentral");
+let projectDir = isRoot ? "/home/*/public-webcentral-domains/" : canonDir(process.env.HOME+"/public-webcentral-domains");
 let email = process.env.EMAIL || '';
 let httpPort = 80;
 let httpsPort = 443;
@@ -39,7 +39,7 @@ if (httpPort && httpsPort) {
 
 console.log(process.argv[1]+" --config="+configDir+" --projects="+projectDir+" --email="+email+ " --http="+httpPort+" --https="+httpsPort+" --redirect-http="+(redirectHttp?"true":"false")+" --optional-www="+(optionalWww?"true":"false")+" --firejail="+(firejail?"true":"false"));
 
-if (!email || !email.match(/@/)) {
+if (httpsPort && (!email || !email.match(/@/))) {
 	help("an email address should be specified");
 }
 
@@ -132,7 +132,7 @@ function handleRequest(req, rsp) {
 	let projectDir = getProjectDir(req.headers.host);
 	if (!projectDir) {
 		rsp.writeHead(404, {'Content-Type': 'text/plain'});
-		rsp.write('node-central no such project');
+		rsp.write('webcentral no such project');
 		rsp.end();
 		return;
 	}
@@ -163,18 +163,31 @@ const greenlock = require('greenlock').create({
 	store: require('greenlock-store-fs'),
 });
 
-
+let servers = [];
 if (httpsPort) {
-	configureServer(require('https').createServer(greenlock.tlsOptions), httpsPort);
+	let server = require('https').createServer(greenlock.tlsOptions);
+	servers.push(server);
+	configureServer(server, httpsPort);
 }
 
 if (httpPort) {
 	if (httpsPort && redirectHttp) {
-		require('http').createServer(greenlock.middleware(require('redirect-https')({port:httpsPort}))).listen(httpPort);
+		let server = require('http').createServer(greenlock.middleware(require('redirect-https')({port:httpsPort})))
+		server.listen(httpPort);
+		servers.push(server)
 	} else {
-		configureServer(require('http').createServer(), httpPort);
+		let server = require('http').createServer();
+		configureServer(server, httpPort);
+		servers.push(server);
 	}
 }
+process.on('SIGTERM', () => {
+	console.log('SIGTERM received');
+	for(let server of servers) {
+		server.close();
+	}
+	Project.stopAll();
+});
 
 function configureServer(server, port) {
 	server.on('request', handleRequest);

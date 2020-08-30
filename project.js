@@ -1,10 +1,12 @@
+'use strict';
+
 const childProcess = require('child_process');
-const getPort = require('get-port');
-const net = require('net');
-const httpProxy = require('http-proxy');
 const fs = require('fs');
-const path = require('path');
+const getPort = require('get-port');
+const httpProxy = require('http-proxy');
+const net = require('net');
 const nodeStatic = require('node-static');
+const toml = require('toml');
 
 const Logger = require('./logger');
 
@@ -33,6 +35,19 @@ function portReachable(port) {
 	});
 }
 
+function wildcardsToRegExp(wildcards) {
+	if (!wildcards) return;
+	return new RegExp('^(' + wildcards.map(function(wildcard) {
+		return wildcard.replace(/\*\*\/|[-[\]{}()+*?.,\\^$|#\s]/g, function(match) {
+			if (match==='**/') return '(.*/)?';
+			if (match==='*') return '[^/]*';
+			if (match==='?') return '[^/]';
+			return '\\'+match;
+		});
+	}).join('|') + ')$');
+}
+
+
 const all = {};
 
 module.exports = class Project {
@@ -40,6 +55,13 @@ module.exports = class Project {
 	static get(dir) {
 		return all[dir] = all[dir] || new Project(dir);
 	}
+
+	static stopAll() {
+		for(let dir in all) {
+			all[dir].stop();
+		}
+	}
+	
 	constructor(dir) {
 		this.dir = dir;
 		this.project = dir.split('/').pop();
@@ -53,30 +75,47 @@ module.exports = class Project {
 			this.gid = stat.gid;
 		}
 
-		this.logger = new Logger({path: this.dir+"/log", base: "node-central_", uid: this.uid, gid: this.gid, deleteAfterDays: 21});
+		this.logger = new Logger({path: this.dir+"/log", base: "webcentral_", uid: this.uid, gid: this.gid, deleteAfterDays: 21});
 		
-		this.unusedInterval = setInterval(() => {
-			let unused = new Date().getTime() - this.lastUse;
-			if (unused > 10*60*1000) {
-				this.logger.write("stopping due to inactivity");
-				this.stop(true);
-			}
-		}, 60*1000);
-
-		this.watch(dir);
-
 		let config;
 		if (fs.existsSync(dir+"package.json")) {
 			config = {
 				command: ["npm", "start"],
 			};
-		} else if (fs.existsSync(dir+"node-central.json")) {
+		} else if (fs.existsSync(dir+"webcentral.toml")) {
 			config = {};
 			try {
-				config = JSON.parse(fs.readFileSync(dir+"node-central.json"));
+				config = toml.parse(fs.readFileSync(dir+"webcentral.toml"));
 			} catch(e) {
-				this.logger.write("node-central.json error: "+e);
+				this.logger.write("webcentral.toml error: "+e);
 			}
+		}
+
+		this.reload = (config && config.reload) || {};
+		if (this.reload.timeout==null) this.reload.timeout = 10*60;
+	
+		if (this.reload.exclude) {
+			if (typeof this.reload.exclude === 'string') this.reload.exclude = [this.reload.exclude];
+			this.reload.exclude.push('log');
+		} else {
+			this.reload.exclude = ["data", "log", "logs", "node_modules", "**/*.log", "**/.*"];
+		}
+		if (this.reload.include) {
+			if (typeof this.reload.include === 'string') this.reload.include = [this.reload.include];
+			this.reload.include.push('webcentral.yaml');
+		}
+		this.reload.include = wildcardsToRegExp(this.reload.include);
+		this.reload.exclude = wildcardsToRegExp(this.reload.exclude);
+		this.watch('', false);
+			
+		if (this.reload.timeout) {
+			this.unusedInterval = setInterval(() => {
+				let unused = new Date().getTime() - this.lastUse;
+				if (unused > this.reload.timeout*1000) {
+					this.logger.write("stopping due to inactivity");
+					this.stop(true);
+				}
+			}, this.reload.timeout*1000 / 10);
 		}
 
 		if (config) {
@@ -132,19 +171,27 @@ module.exports = class Project {
 		rsp.end();
 	}
 
-	watch(dir) {
-		this.watchers.push(fs.watch(dir, (type, file) => {
-			if (file[0]==='.' || file.endsWith('.log')) return;
+	watch(base, included) {
+		this.watchers.push(fs.watch(this.dir+'/'+base, (type, file) => {
 			if (this.changes) return;
+			let path = base+file;
+			if (this.reload.exclude && path.match(this.reload.exclude)) return;
+			if (!included && this.reload.include && !path.match(this.reload.include)) return;
 			this.changes = true;
-			this.logger.write('stopping due to '+type+'@'+path.join(dir,file));
+			this.logger.write(`stopping due to ${type} for ${path}`);
 			this.stop(true);
 		}));
-		fs.readdirSync(dir)
-			.filter(name => name[0]!=='.' && ['data', 'log', 'logs', 'node_modules'].indexOf(name) < 0)
-			.map(name => path.join(dir, name))
-			.filter(file => fs.lstatSync(file).isDirectory())
-			.forEach(file => this.watch(file));
+		for(let file of fs.readdirSync(this.dir+'/'+base)) {
+			let path = base+file;
+			if (this.reload.exclude && path.match(this.reload.exclude)) continue;
+			try {
+				if (!fs.lstatSync(this.dir+'/'+path).isDirectory()) continue;
+			} catch(e) {
+				this.logger.write(`file disappeared: ${path}`);
+				continue;
+			}
+			this.watch(path+'/', included || !this.reload.include || path.match(this.reload.include));
+		}
 	}
 
 	createProxy(opts) {
@@ -167,7 +214,6 @@ module.exports = class Project {
 
 		let docker = this.docker;
 		if (docker) {
-			if (docker instanceof Array || typeof docker === 'string') docker = {base: "alpine", packages: docker};
 			if (!docker.base) docker.base = "alpine";
 			let run = typeof docker.run === 'string' ? [docker.run] : (docker.run || []);
 			if (docker.packages) {
@@ -182,9 +228,19 @@ module.exports = class Project {
 			].concat(run).join("\n");
 			this.logger.write('build', dockerfile);
 
-			let builder = childProcess.spawn("docker", ["build", "-q", "-"], this.getProcessOpts());
-			let tag = "";
-			builder.stdout.on('data', data => tag += data);
+			let user = '';
+			if (this.uid) {
+				// We can't do a setuid/setgid, because that doesn't load supplementary groups like 'docker', causing
+				// permission denied when connecting to the docker socket. Instead, we'll build as root, and then ask
+				// 'docker run' to set the user for us.
+				user = `--user=${this.uid}:${this.gid}`;
+				delete this.uid;
+				delete this.gid;
+			}
+
+			let builder = this.process = childProcess.spawn("docker", ["build", "-q", "-"], this.getProcessOpts());
+			let imageHash = "";
+			builder.stdout.on('data', data => imageHash += data);
 			builder.stderr.on('data', data => this.logger.write("build err", data));
 
 			const buildError = (code) => {
@@ -192,7 +248,10 @@ module.exports = class Project {
 				if (code) {
 					this.stop();
 				} else {
-					this.startProcess("docker", "run", "--rm", "-i", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:8000`, tag.trim());
+					let args = ["docker", "run", "--rm", "-i", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:8000`];
+					if (user) args.push(user);
+					args.push(imageHash.trim());
+					this.startProcess(...args);
 				}
 			};
 
@@ -261,7 +320,6 @@ module.exports = class Project {
 	started() {
 		let queue = this.queue;
 		this.queue = null;
-		this.logger.write("ready to serve");
 		for(let opts of queue) {
 			this.handle(opts);
 		}
@@ -319,7 +377,7 @@ module.exports = class Project {
 		this.logger.write('handling error: '+err);
 		this.stop();
 		rsp.writeHead(500, {'Content-Type': 'text/plain'});
-		rsp.write('node-central upstream error: '+err);
+		rsp.write('webcentral upstream error: '+err);
 		rsp.end();
 	}
 }
