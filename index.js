@@ -132,7 +132,7 @@ function handleRequest(req, rsp) {
 	let projectDir = getProjectDir(req.headers.host);
 	if (!projectDir) {
 		rsp.writeHead(404, {'Content-Type': 'text/plain'});
-		rsp.write('webcentral no such project');
+		rsp.write(`Webcentral: no project can be found for ${req.headers.host}`);
 		rsp.end();
 		return;
 	}

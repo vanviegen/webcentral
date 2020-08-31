@@ -5,7 +5,7 @@ const fs = require('fs');
 const getPort = require('get-port');
 const httpProxy = require('http-proxy');
 const net = require('net');
-const nodeStatic = require('node-static');
+const serveStatic = require('serve-static');
 const toml = require('toml');
 
 const Logger = require('./logger');
@@ -150,19 +150,17 @@ module.exports = class Project {
 			}
 		} else {
 			this.logger.write("starting static file server");
-			this.staticServer = new nodeStatic.Server(dir);
+			this.staticServer = serveStatic(dir, {extensions: ['html']});
 			this.handle = this.handleStatic;
 		}
 		this.started();
 	}
 
 	handleStatic({req, rsp}) {
-		this.staticServer.serve(req, rsp, (err,result) => {
-			if (err) {
-				this.logger.write(`Static ${req.method} ${req.url}: ${err.message}`);
-				rsp.writeHead(err.status, err.headers);
-				rsp.end();
-			}
+		this.staticServer(req, rsp, () => {
+			this.logger.write(`static ${req.method} ${req.url} failed`);
+			rsp.writeHead(404, "No such file");
+			rsp.end("No such file");
 		});
 	}
 
