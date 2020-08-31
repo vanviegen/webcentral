@@ -6,7 +6,7 @@ const getPort = require('get-port');
 const httpProxy = require('http-proxy');
 const net = require('net');
 const serveStatic = require('serve-static');
-const toml = require('toml');
+const ini = require('ini');
 
 const Logger = require('./logger');
 
@@ -82,12 +82,12 @@ module.exports = class Project {
 			config = {
 				command: ["npm", "start"],
 			};
-		} else if (fs.existsSync(dir+"webcentral.toml")) {
+		} else if (fs.existsSync(dir+"webcentral.ini")) {
 			config = {};
 			try {
-				config = toml.parse(fs.readFileSync(dir+"webcentral.toml"));
+				config = ini.parse(fs.readFileSync(dir+"webcentral.ini").toString());
 			} catch(e) {
-				this.logger.write("webcentral.toml error: "+e);
+				this.logger.write("webcentral.ini error: "+e);
 			}
 		}
 
@@ -213,17 +213,17 @@ module.exports = class Project {
 		let docker = this.docker;
 		if (docker) {
 			if (!docker.base) docker.base = "alpine";
-			let run = typeof docker.run === 'string' ? [docker.run] : (docker.run || []);
+			let commands = typeof docker.commands === 'string' ? [docker.commands] : (docker.commands || []);
 			if (docker.packages) {
 				let packages = typeof docker.packages === 'string' ? docker.packages : docker.packages.join(' ');
-				run.unshift(`if command -v apk &> /dev/null ; then apk update && apk add --no-cache ${packages} ; else apt-get update && apt-get install --no-install-recommends --yes ${packages}; fi`);
+				commands.unshift(`if command -v apk > /dev/null ; then apk update && apk add --no-cache ${packages} ; else apt-get update && apt-get install --no-install-recommends --yes ${packages}; fi`);
 			}
-			run = run.map(s => "RUN "+(typeof s === 'string' ? s : JSON.stringify(s)));
+			commands = commands.map(s => "RUN "+(typeof s === 'string' ? s : JSON.stringify(s)));
 
 			let dockerfile = [
 				`FROM ${docker.base}`,
 				`WORKDIR /app`
-			].concat(run).join("\n");
+			].concat(commands).join("\n");
 			this.logger.write('build', dockerfile);
 
 			let user = '';
@@ -246,7 +246,7 @@ module.exports = class Project {
 				if (code) {
 					this.stop();
 				} else {
-					let args = ["docker", "run", "--rm", "-i", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:8000`];
+					let args = ["docker", "run", "--rm", "--env", "PORT=8000", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:8000`];
 					if (user) args.push(user);
 					args.push(imageHash.trim());
 					this.startProcess(...args);
@@ -266,9 +266,11 @@ module.exports = class Project {
 				"--noprofile",
 				"--private="+this.dir,
 				"--private-dev",
-				"--private-etc=group,hostname,localtime,nsswitch.conf,passwd,resolv.conf",
+				"--private-etc=group,hostname,localtime,nsswitch.conf,passwd,resolv.conf,alternatives",
 				"--private-tmp",
 				"--seccomp",
+				"--caps.drop=all",
+				"--disable-mnt",
 				"--shell=none"
 			);
 		} else {

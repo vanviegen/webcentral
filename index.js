@@ -8,7 +8,7 @@ const Project = require('./project');
 
 const isRoot = process.getuid()==0;
 let configDir = isRoot ? "/var/lib/webcentral/" : canonDir(process.env.HOME+"/.webcentral");
-let projectDir = isRoot ? "/home/*/public-webcentral-domains/" : canonDir(process.env.HOME+"/public-webcentral-domains");
+let projectDir = isRoot ? "/home/*/webcentral-projects/" : canonDir(process.env.HOME+"/webcentral-projects");
 let email = process.env.EMAIL || '';
 let httpPort = 80;
 let httpsPort = 443;

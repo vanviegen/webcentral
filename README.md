@@ -36,9 +36,9 @@ npm install
 
 `node index.js --email you@example.com`
 
-This will start the Webcentral server, dispatching to node projects in the `public-webcentral-domains` directory in your home directory. If the above command was run as root, the `public-node-project` directories of all users will be searched, and projects will be run as their owning users.
+This will start the Webcentral server, dispatching to node projects in the `webcentral-projects` directory in your home directory. If the above command was run as root, the `public-node-project` directories of all users will be searched, and projects will be run as their owning users.
 
-The `public-webcentral-domains` directories should contain subdirectories that have the name of the (sub)domains they are claiming. For instance: `/home/frank/public-webcentral-domains/example.com/`. Based on the contents, a project can be treated in various ways:
+The `webcentral-projects` directories should contain subdirectories that have the name of the (sub)domains they are claiming. For instance: `/home/frank/webcentral-projects/example.com/`. Based on the contents, a project can be treated in various ways:
 
 ### Project types
 
@@ -46,43 +46,45 @@ The `public-webcentral-domains` directories should contain subdirectories that h
   - `npm start` within the project directory should bring up an HTTP server on port `process.env.PORT`. This shouldn't take too long, as the HTTP client will be kept waiting.
   - If WebSocket is used, it should be made available over the same port.
   - Only limited access to the host system is provided. (See the Webcentral source code and Firejail documentation for details -- sorry.) The jail can be disabled using the `--firejail=false` flag. Or, for more flexibility, Docker can be used to setup the Node.js environment. Please ready on...
-2. Otherwise, if the project has a `/webcentral.toml` file, requests will be delegated to a service listen in that file.
-  - **Application.** When the TOML file has a top-level `command` property, this command will be run from within a Firejail or Docker sandbox. The command is expected to set up an HTTP service on port 8000.
+2. Otherwise, if the project has a `/webcentral.ini` file, requests will be delegated to a service listen in that file.
+  - **Application.** When the .ini-file has a top-level `command` property, this command will be run from within a Firejail or Docker sandbox. The command is expected to set up an HTTP service on port 8000.
     - Firejail is the default option. It allows read-only access to system directories of the host system, such as `/bin` and `/usr`, but doesn't expose files like those in your home directory.
-    - Docker is selected by creating a `[docker]` section in the TOML file. No files of the host system will be exposed. Instead, a separate Linux distribution is created for the application. Generally, this will consume more memory and take a bit longer to start than when using Firejail. By default the container will run a pristine Alpine linux image, but options in the `[docker]` section of the TOML file can be used to change that:
+    - Docker is selected by creating a `[docker]` section in the .ini-file. No files of the host system will be exposed. Instead, a separate Linux distribution is created for the application. Generally, this will consume more memory and take a bit longer to start than when using Firejail. By default the container will run a pristine Alpine linux image, but options in the `[docker]` section of the .ini-file can be used to change that:
       - `base` sets the Docker base image to start with.
-      - `runs` is an array of commands used to build the Docker image. Each command can either be a string, which will be executed as a shell command, or an array of strings, which will be executed without involving a shell.
-      - `packages` is an array of packages to install on the base system. This only works on base systems that offer either `apt-get` (Debian/Ubuntu) or `apk` (Alpine) as a means to install them. This is just a shortcut for prepending `runs` commands.
+      - `commands` is an array of commands used to build the Docker image. Each command can either be a string, which will be executed as a shell command, or an array of strings, which will be executed without involving a shell.
+      - `packages` is an array of packages to install on the base system. This only works on base systems that offer either `apt-get` (Debian/Ubuntu) or `apk` (Alpine) as a means to install them. This is just a shortcut for prepending `commands`.
     
-    Example `webcentral.toml` using PHP from the host system:
-    ```toml
-    command = "php -S 0.0.0.0:8000 -file test.php"
+    Example `webcentral.ini` using PHP from the host system:
+    ```ini
+    command = php -S 0.0.0.0:$PORT -file test.php
     ```
     And using PHP from a Docker image:
-    ```toml
-    command = "php -S 0.0.0.0:8000 -file test.php"
+    ```ini
+    command = php -S 0.0.0.0:$PORT -file entrypoint.php
     [docker]
-    base = "alpine" # This is the default
-    packages = ["php7"]
+    base = debian
+    packages[] = php
+    packages[] = composer
+    commands[] = composer install
     ```
-  - **Forward.** Otherwise, when the TOML file has a top-level `port` property, requests will be forwarded to this port, without modifying the `Host:` header. The `host` property can specify a host name or ip address to use -- it defaults to localhost.
-    ```toml
+  - **Forward.** Otherwise, when the .ini-file has a top-level `port` property, requests will be forwarded to this port, without modifying the `Host:` header. The `host` property can specify a host name or ip address to use -- it defaults to localhost.
+    ```ini
     port = 3000
     host = 192.168.10.20
     ```
-  - **Proxy.** (Experimental) Otherwise, when `webcentral.toml` has a top-level `proxy` property containing a URL, requests will be proxied to that URL. This is similar to forwarding, except that proxying is not visible to the target host as headers such as `Host:` are rewritten.
-    ```toml
-    proxy = "https://www.google.com"
+  - **Proxy.** (Experimental) Otherwise, when `webcentral.ini` has a top-level `proxy` property containing a URL, requests will be proxied to that URL. This is similar to forwarding, except that proxying is not visible to the target host as headers such as `Host:` are rewritten.
+    ```ini
+    proxy = https://www.google.com
     ```
   - **Redirect.** Otherwise, when a `redirect` property is present, all requests will receive an HTTP 301 redirect to the URL given in that property, concatenated with the path and query string of the request.
-    ```toml
-    redirect = "https://new-service-name.example.com"
+    ```ini
+    redirect = https://new-service-name.example.com
     ```
 3. In other cases, the project directory will be **served statically** as just a bunch of files.
 
 ### Reloading
 Node.js and Docker applications will be automatically shut down when...
-1. The service has been inactive for 5 minutes. This period can be overridden or disabled using the `timeout` property in the `[reload]` section of the `webcentral.toml`. It indicates the time in seconds. Zero disables inactivity shutdown.
+1. The service has been inactive for 5 minutes. This period can be overridden or disabled using the `timeout` property in the `[reload]` section of the `webcentral.ini`. It indicates the time in seconds. Zero disables inactivity shutdown.
 2. When any of the files in the application directory change. By default, the following file patterns are excluded from this:
    - `data` (A file or directory with this name in the root of the project directory.)
    - `log`
@@ -90,13 +92,15 @@ Node.js and Docker applications will be automatically shut down when...
    - `node_modules`
    - `**/*.log` (A file or directory with a name ending in *.log* in the root directory or any subdirectory.)
    - `**/.*` (Hidden files.)
-   This behaviour can be overriden using the `include` and `exclude` properties in the `[reload]` section of `webcentral.toml`. Both can be string arrays containing patterns like the above. Exclusion always overrules inclusion. When `include` is not set, everything will be included by default. Even when `include` is manually set, `webcentral.toml` will always be added to it automatically, to make sure errors can be corrected. Similarly, `exclude` will always have `log` appended to it, because it makes little sense to reload for each log message written by Webcentral.
-   ```toml
-   command = ["./start.sh", "--production"]
+   This behaviour can be overriden using the `include` and `exclude` properties in the `[reload]` section of `webcentral.ini`. Both can be string arrays containing patterns like the above. Exclusion always overrules inclusion. When `include` is not set, everything will be included by default. Even when `include` is manually set, `webcentral.ini` will always be added to it automatically, to make sure errors can be corrected. Similarly, `exclude` will always have `log` appended to it, because it makes little sense to reload for each log message written by Webcentral.
+   ```ini
+   command = ./start.sh --production
    [reload]
-   timeout = 0 # disable timeout
-   include = ["src", "config.yaml"] # Reload when anything in the src directory or the config file changes.
-   exclude = ["src/build", "**/*.bak"] # But ignore the src/build directory and .bak files
+   timeout = 0 ; Disable inactivity shutdown
+   include[] = src ; Reload for changes in src/ directory
+   include[] = config.yaml ; And for changes to this file
+   exclude[] = src/build ; But ignore the build directory
+   exclude[] = **/*.bak ; And ignore any .bak file
    ```
 
 ## Options
@@ -104,7 +108,7 @@ Node.js and Docker applications will be automatically shut down when...
 | Option | Description |
 | --- | --- |
 | `--email=EMAIL` | Set the email address used for LetsEncrypt to `EMAIL`. Defaults to the $EMAIL environment variable. An email address is required, unless `--https=0`. |
-| `--projects=DIR` | Search for projects in DIR, where `DIR` can be a `glob` expression. Projects need to be directories (containing a `package.json` file), named exactly like the domain the are serving. Defaults to `/home/*/public-webcentral-domains` when run as root, or to `$HOME/public-webcentral-domains` otherwise. |
+| `--projects=DIR` | Search for projects in DIR, where `DIR` can be a `glob` expression. Projects need to be directories (containing a `package.json` file), named exactly like the domain the are serving. Defaults to `/home/*/webcentral-projects` when run as root, or to `$HOME/webcentral-projects` otherwise. |
 | `--config=DIR` | Directory where domain to directory mappings and LetsEncrypt config are stored. Defaults to `/var/lib/webcentral` when run as root, or to `$HOME/.webcentral` otherwise.
 | `--https=PORT` | Run the HTTPS server on TCP port `PORT`. Defaults to 443. Set to 0 to disable HTTPS. |
 | `--http=PORT` | Run the HTTP server on TCP port `PORT`. Defaults to 80. Set to 0 to disable HTTP. |
