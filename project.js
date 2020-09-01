@@ -248,7 +248,7 @@ module.exports = class Project {
 				if (code) {
 					this.stop();
 				} else {
-					this.startProcess("docker", "run", "--rm", "--env", "PORT=8000", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:8000`, user, imageHash.trim());
+					this.startProcess("docker", "run", "--rm", "--env", "PORT=8000", "--env", "HOME=/tmp", "--mount", "type=bind,src=/etc/passwd,dst=/etc/passwd", "--mount", "type=bind,ro,src=/etc/group,dst=/etc/group", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:8000`, user, imageHash.trim());
 				}
 			};
 
