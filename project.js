@@ -20,12 +20,12 @@ function portReachable(port) {
 			resolve(false);
 		}
 
-		socket.setTimeout(250);
+		socket.setTimeout(1000);
 		socket.on('error', onError);
 		socket.on('timeout', onError);
 
 		socket.connect(port, 'localhost', function(){
-			socket.write("HEAD / HTTP/1.1\nHost: example.com\n\n");
+			socket.write("HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n");
 			socket.on('data', function(data) {
 				// any response is good enough for us!
 				socket.end();
@@ -208,7 +208,7 @@ module.exports = class Project {
 				this.reachableInterval = null;
 				this.started();
 			}
-		}, 50);
+		}, 200);
 
 		let docker = this.docker;
 		if (docker) {
@@ -326,6 +326,7 @@ module.exports = class Project {
 
 	stop(moveQueue) {
 		if (this.stopped) return;
+		this.logger.write("stopping");
 		this.stopped = true;
 		if (all[this.dir]===this) {
 			delete all[this.dir];
