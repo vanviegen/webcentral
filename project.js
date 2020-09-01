@@ -226,7 +226,7 @@ module.exports = class Project {
 			].concat(commands).join("\n");
 			this.logger.write('build', dockerfile);
 
-			let user = '';
+			let user;
 			if (this.uid) {
 				// We can't do a setuid/setgid, because that doesn't load supplementary groups like 'docker', causing
 				// permission denied when connecting to the docker socket. Instead, we'll build as root, and then ask
@@ -234,6 +234,8 @@ module.exports = class Project {
 				user = `--user=${this.uid}:${this.gid}`;
 				delete this.uid;
 				delete this.gid;
+			} else {
+				user = `--user=${process.getuid()}:${process.getgid()}`;
 			}
 
 			let builder = this.process = childProcess.spawn("docker", ["build", "-q", "-"], this.getProcessOpts());
@@ -246,10 +248,7 @@ module.exports = class Project {
 				if (code) {
 					this.stop();
 				} else {
-					let args = ["docker", "run", "--rm", "--env", "PORT=8000", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:8000`];
-					if (user) args.push(user);
-					args.push(imageHash.trim());
-					this.startProcess(...args);
+					this.startProcess("docker", "run", "--rm", "--env", "PORT=8000", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:8000`, user, imageHash.trim());
 				}
 			};
 
