@@ -78,17 +78,17 @@ module.exports = class Project {
 		this.logger = new Logger({path: this.dir+"/log", base: "webcentral_", uid: this.uid, gid: this.gid, deleteAfterDays: 21});
 		
 		let config;
-		if (fs.existsSync(dir+"package.json")) {
-			config = {
-				command: ["npm", "start"],
-			};
-		} else if (fs.existsSync(dir+"webcentral.ini")) {
+		if (fs.existsSync(dir+"webcentral.ini")) {
 			config = {};
 			try {
 				config = ini.parse(fs.readFileSync(dir+"webcentral.ini").toString());
 			} catch(e) {
 				this.logger.write("webcentral.ini error: "+e);
 			}
+		} else if (fs.existsSync(dir+"package.json")) {
+			config = {
+				command: ["npm", "start"],
+			};
 		}
 
 		this.reload = (config && config.reload) || {};
