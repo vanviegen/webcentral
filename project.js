@@ -108,7 +108,7 @@ module.exports = class Project {
 		this.reload.exclude = wildcardsToRegExp(this.reload.exclude);
 		this.watch('', false);
 			
-		if (this.reload.timeout) {
+		if (this.reload.timeout > 0) {
 			this.unusedInterval = setInterval(() => {
 				let unused = new Date().getTime() - this.lastUse;
 				if (unused > this.reload.timeout*1000) {
