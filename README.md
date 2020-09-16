@@ -80,7 +80,7 @@ The `webcentral-projects` directories should contain subdirectories that have th
     ```ini
     redirect = https://new-service-name.example.com
     ```
-3. In other cases, the project directory will be **served statically** as just a bunch of files.
+3. In other cases, everything under `public/` in the project directory will be **served statically** as just a bunch of files.
 
 ### Reloading
 Node.js and Docker applications will be automatically shut down when...

@@ -150,7 +150,7 @@ module.exports = class Project {
 			}
 		} else {
 			this.logger.write("starting static file server");
-			this.staticServer = serveStatic(dir, {extensions: ['html']});
+			this.staticServer = serveStatic(dir+'/public', {extensions: ['html']});
 			this.handle = this.handleStatic;
 		}
 		this.started();
