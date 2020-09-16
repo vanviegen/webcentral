@@ -10,7 +10,7 @@
   "dependencies": {
     "get-port": "^4.0.0",
     "glob": "^7.1.3",
-    "greenlock": "^2.7.17",
+    "greenlock": "^2.8.8",
     "greenlock-store-fs": "3",
     "http-proxy": "^1.18.1",
     "ini": "^1.3.5",
