@@ -8,6 +8,7 @@ const net = require('net');
 const serveStatic = require('serve-static');
 const ini = require('ini');
 
+const index = require('./index');
 const Logger = require('./logger');
 
 
@@ -77,9 +78,8 @@ module.exports = class Project {
 
 		this.logger = new Logger({path: this.dir+"/log", base: "webcentral_", uid: this.uid, gid: this.gid, deleteAfterDays: 21});
 		
-		let config;
+		let config = {};
 		if (fs.existsSync(dir+"webcentral.ini")) {
-			config = {};
 			try {
 				config = ini.parse(fs.readFileSync(dir+"webcentral.ini").toString());
 			} catch(e) {
@@ -91,7 +91,7 @@ module.exports = class Project {
 			};
 		}
 
-		this.reload = (config && config.reload) || {};
+		this.reload = config.reload || {};
 		if (this.reload.timeout==null) this.reload.timeout = 10*60;
 	
 		if (this.reload.exclude) {
@@ -118,55 +118,45 @@ module.exports = class Project {
 			}, this.reload.timeout*1000 / 10);
 		}
 
-		if (config) {
-			if (config.command) {
-				this.command = typeof config.command === 'string' ? ['/bin/sh', '-c', config.command] : config.command;
-				this.host = "localhost";
-				this.docker = config.docker;
-				getPort().then(port => {
-					this.port = port;
-					this.createProxy({target: {host: 'localhost', port}});
-					this.runCommand();
-				});
-				return; // started() will be called by runCommand()
-			} else if (config.redirect) {
-				this.redirect = config.redirect;
-				this.logger.write("starting redirect to "+this.redirect);
-				this.handle = this.handleRedirect;
-			} else if (config.proxy) {
-				this.logger.write("starting proxy for "+config.proxy);
-				this.createProxy({target: config.proxy, changeOrigin: true, autoRewrite: true});
-			} else if (config.command) {
-				this.command = typeof config.command == 'string' ? ['/bin/sh', '-c', this.command] : config.command;
-				this.host = "localhost";
-
-			} else {
-				let target = {
-					host: config.host || 'localhost',
-					port: config.port || 8080,
-				};
-				this.logger.write("starting forward to http://"+target.host+":"+target.port);
-				this.createProxy({target});
+		this.rewritePairs = [];
+		if (config.rewrite) { // an object containing [regexp] => [replacement] pairs
+			for(let regexp in config.rewrite) {
+				this.rewritePairs.push([new RegExp('^(?:'+regexp+')$'), config.rewrite[regexp]]);
 			}
+		}
+		if (config.command) {
+			this.command = typeof config.command === 'string' ? ['/bin/sh', '-c', config.command] : config.command;
+			this.host = "localhost";
+			this.docker = config.docker;
+			getPort().then(port => {
+				this.port = port;
+				this.createProxy({target: {host: 'localhost', port}});
+				this.runCommand();
+			});
+			this.handler = this.handleProxy;
+			return; // started() will be called by runCommand()
+		} else if (config.redirect) {
+			this.redirect = config.redirect;
+			this.logger.write("starting redirect to "+this.redirect);
+			this.handler = this.handleRedirect;
+		} else if (config.proxy) {
+			this.logger.write("starting proxy for "+config.proxy);
+			this.createProxy({target: config.proxy, changeOrigin: true, autoRewrite: true});
+			this.handler = this.handleProxy;
+		} else if (config.port) {
+			let target = {
+				host: config.host || 'localhost',
+				port: config.port,
+			};
+			this.logger.write("starting forward to http://"+target.host+":"+target.port);
+			this.createProxy({target});
+			this.handler = this.handleProxy;
 		} else {
 			this.logger.write("starting static file server");
 			this.staticServer = serveStatic(dir+'/public', {extensions: ['html']});
-			this.handle = this.handleStatic;
+			this.handler = this.handleStatic;
 		}
 		this.started();
-	}
-
-	handleStatic({req, rsp}) {
-		this.staticServer(req, rsp, () => {
-			this.logger.write(`static ${req.method} ${req.url} failed`);
-			rsp.writeHead(404, "No such file");
-			rsp.end("No such file");
-		});
-	}
-
-	handleRedirect({req,rsp}) {
-		rsp.writeHead (301, {'Location': this.redirect + req.url});
-		rsp.end();
 	}
 
 	watch(base, included) {
@@ -363,21 +353,58 @@ module.exports = class Project {
 		}
 	}
 
+	handleProxy(opts) {
+		if (opts.socket) {
+			this.proxy.ws(opts.req, opts.socket, opts.head);
+		} else {
+			this.proxy.web(opts.req, opts.rsp);
+		}
+	}
+
+	handleStatic({req, rsp}) {
+		this.staticServer(req, rsp, () => {
+			this.logger.write(`static ${req.method} ${req.url} failed`);
+			rsp.writeHead(404, "No such file");
+			rsp.end("No such file");
+		});
+	}
+
+	handleRedirect({req,rsp}) {
+		rsp.writeHead (301, {'Location': this.redirect + req.url});
+		rsp.end();
+	}
+
 	handle(opts) {
+		this.lastUse = new Date().getTime();
 		if (this.queue) {
 			this.queue.push(opts);
 			return;
 		}
-		this.lastUse = new Date().getTime();
-		if (opts.socket) this.proxy.ws(opts.req, opts.socket, opts.head);
-		else this.proxy.web(opts.req, opts.rsp);
+		let req = opts.req;
+		for(let [regexp,replacement] of this.rewritePairs) {
+			let url = req.url;
+			if (url.search(regexp)>=0) {
+				req.url = url.replace(regexp, replacement);
+				this.logger.write(`rewrote ${url} to ${req.url} due to ${regexp}`);
+				let match = req.url.match(/^webcentral:\/\/(.*?)(\/.*)$/);
+				if (match) {
+					// Hand the request over to a different webcentral project
+					req.headers.host = match[1];
+					req.url = match[2];
+					return index.handleRequest(req, opts.rsp);
+				}
+				break; // stop replacing after a match
+			}
+		}
+
+		this.handler(opts);
 	}
 
 	handleError(err,req,rsp) {
-		this.logger.write('handling error: '+err);
+		this.logger.write(`error for ${req.method} ${req.url}: ${err}`);
 		this.stop();
 		rsp.writeHead(500, {'Content-Type': 'text/plain'});
-		rsp.write('webcentral upstream error: '+err);
+		rsp.write('Webcentral upstream error: '+err);
 		rsp.end();
 	}
 }

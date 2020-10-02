@@ -195,3 +195,4 @@ function configureServer(server, port) {
 	server.listen(port);
 }
 
+exports.handleRequest = handleRequest;
