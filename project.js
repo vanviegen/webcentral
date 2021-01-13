@@ -7,9 +7,23 @@ const httpProxy = require('http-proxy');
 const net = require('net');
 const serveStatic = require('serve-static');
 const ini = require('ini');
+const parseUrl = require('url').parse;
 
 const index = require('./index');
 const Logger = require('./logger');
+
+
+/* Hot-patch for http-proxy https://github.com/http-party/node-http-proxy/pull/1379 */
+(function() {
+	let wsi = require('http-proxy/lib/http-proxy/passes/ws-incoming')
+	let old = wsi.XHeaders;
+	wsi.XHeaders = function(req, socket, options) {
+		old.call(this, req, socket, options);
+		req.headers['x-forwarded-host'] = req.headers['x-forwarded-host'] || req.headers['host'] || '';
+		// flask_socketio can't handle proto wss. not sure if it should, but we'll work around it here:
+		req.headers['x-forwarded-proto'] = req.headers['x-forwarded-proto'].replace(/ws/g, 'http');
+	};
+})();
 
 
 function portReachable(port) {
@@ -141,7 +155,8 @@ module.exports = class Project {
 			this.handler = this.handleRedirect;
 		} else if (config.proxy) {
 			this.logger.write("starting proxy for "+config.proxy);
-			this.createProxy({target: config.proxy, changeOrigin: true, autoRewrite: true});
+			let domain = parseUrl(config.proxy).host;
+			this.createProxy({target: config.proxy, changeOrigin: true, autoRewrite: true, protocolRewrite: true, cookieDomainRewrite: domain, ws: true});
 			this.handler = this.handleProxy;
 		} else if (config.port) {
 			let target = {
@@ -149,7 +164,7 @@ module.exports = class Project {
 				port: config.port,
 			};
 			this.logger.write("starting forward to http://"+target.host+":"+target.port);
-			this.createProxy({target});
+			this.createProxy({target, xfwd: true, ws: true});
 			this.handler = this.handleProxy;
 		} else {
 			this.logger.write("starting static file server");
