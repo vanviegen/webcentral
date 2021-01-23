@@ -43,12 +43,14 @@ The `webcentral-projects` directories should contain subdirectories that have th
 
 ### Project types
 
-1. **Application.** If `webcentral.ini` exists and has a top-level `command` property, this command will be run from within a Firejail or Docker sandbox. The command is expected to set up an HTTP service on port $PORT (which will always be 8000 when Docker is used). This shouldn't take too long, as the incoming HTTP request will be stalled until the server is ready.
+1. **Application.** If `webcentral.ini` exists and has a top-level `command` property or `[docker]` section, a server process will will be run from within a Firejail sandbox or Docker container. The command is expected to set up an HTTP service on port $PORT (which will always be 8000 when Docker is used). This shouldn't take too long, as the incoming HTTP request will be stalled until the server is ready.
     - Firejail is the default option. It allows read-only access to system directories of the host system, such as `/bin` and `/usr`, but doesn't expose files like those in your home directory.
     - Docker is selected by creating a `[docker]` section in the .ini-file. No files of the host system, except from the project directory itself, will be exposed. Instead, a separate Linux distribution is created for the application. Generally, this will consume more memory and take a bit longer to start than when using Firejail. By default the container will run a pristine Alpine linux image, but options in the `[docker]` section of the .ini-file can be used to change that:
       - `base` sets the Docker base image to start with.
       - `commands` is an array of commands used to build the Docker image. Each command can either be a string, which will be executed as a shell command, or an array of strings, which will be executed without involving a shell.
       - `packages` is an array of packages to install on the base system. This only works on base systems that offer either `apt-get` (Debian/Ubuntu) or `apk` (Alpine) as a means to install them. This is just a shortcut for prepending `commands`.
+      - `mounts` is an array of directories in the context of the Docker container that should be persisted. The directories can be absolute or relative to the Docker workdir (`/app`). In the host system, empty directories that don't exist yet are automatically created in the `mounts/` directory. The `/app` directory itself is always mounted.
+      - `http_port` is the TCP port within the container that the HTTP server will be running on. It defaults to 8000.
     
     Example `webcentral.ini` using PHP from the host system:
     ```ini
@@ -56,14 +58,19 @@ The `webcentral-projects` directories should contain subdirectories that have th
     ```
     And using PHP from a Docker image:
     ```ini
-    command = php -S 0.0.0.0:$PORT -file entrypoint.php
+    command = php -S 0.0.0.0:$PORT -file test.php
     [docker]
     base = debian
     packages[] = php
     packages[] = composer
     commands[] = composer install
     ```
-2. **Forward.** If `webcentral.ini` exists and has a top-level `port` property, requests will be forwarded to this port, without modifying the `Host:` header. The `host` property can specify a host name or ip address to use -- it defaults to localhost.
+    Or to just run the default command of a Docker image:
+    ```ini
+    [docker]
+    base = some-docker-image:version
+    ```
+  - **Forward.** Otherwise, when the .ini-file has a top-level `port` property, requests will be forwarded to this port, without modifying the `Host:` header. The `host` property can specify a host name or ip address to use -- it defaults to localhost.
     ```ini
     port = 3000
     host = 192.168.10.20
@@ -81,7 +88,7 @@ The `webcentral-projects` directories should contain subdirectories that have th
 6. **Static server.** In other cases, everything under `public/` in the project directory will be **served statically** as just a bunch of files.
 
 ### Reloading
-Node.js and Docker applications will be automatically shut down when...
+Applications will be automatically shut down when...
 1. The service has been inactive for 5 minutes. This period can be overridden or disabled using the `timeout` property in the `[reload]` section of the `webcentral.ini`. It indicates the time in seconds. Zero disables inactivity shutdown.
 2. When any of the files in the application directory change. By default, the following file patterns are excluded from this:
    - `data` (A file or directory with this name in the root of the project directory.)
@@ -113,6 +120,18 @@ In case a replacement results in a path that matches `webcentral://<NAME>/<PATH>
 /favicon.ico = /facicon.ico ; make sure the following rule does not apply for favicons
 /[^/]* = /index.html ; any other top-level paths are redirect to index.html
 ; everything else (resources 
+```
+
+### Environment variables
+All properties in the `[environment]` section are set as environment variables for the web server command that will be executed. For example:
+```ini
+[docker]
+base = bitwardenrs/server:alpine
+mounts[] = data
+mounts[] = web-vault
+[environment]
+ROCKET_PORT = 8000
+WEB_VAULT_ENABLED = true
 ```
 
 ## Options

@@ -17,7 +17,7 @@ class Logger {
 	}
 
 	write(topic, msg) {
-		if (msg) msg = `[${topic}] ${(msg+'').trim()}`;
+		if (msg!=null) msg = `[${topic}] ${(msg+'').trim()}`;
 		else {
 			msg = (topic+'').trim();
 			topic = '';

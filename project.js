@@ -2,6 +2,7 @@
 
 const childProcess = require('child_process');
 const fs = require('fs');
+const joinPath = require('path').join;
 const getPort = require('get-port');
 const httpProxy = require('http-proxy');
 const net = require('net');
@@ -112,7 +113,7 @@ module.exports = class Project {
 			if (typeof this.reload.exclude === 'string') this.reload.exclude = [this.reload.exclude];
 			this.reload.exclude.push('log');
 		} else {
-			this.reload.exclude = ["data", "log", "logs", "node_modules", "**/*.log", "**/.*"];
+			this.reload.exclude = ["data", "mounts", "log", "logs", "node_modules", "**/*.log", "**/.*"];
 		}
 		if (this.reload.include) {
 			if (typeof this.reload.include === 'string') this.reload.include = [this.reload.include];
@@ -138,10 +139,11 @@ module.exports = class Project {
 				this.rewritePairs.push([new RegExp('^(?:'+regexp+')$'), config.rewrite[regexp]]);
 			}
 		}
-		if (config.command) {
-			this.command = typeof config.command === 'string' ? ['/bin/sh', '-c', config.command] : config.command;
+		if (config.command || config.docker) {
+			this.command = config.command == null ? [] : (typeof config.command === 'string' ? ['/bin/sh', '-c', config.command] : config.command);
 			this.host = "localhost";
 			this.docker = config.docker;
+			this.environment = config.environment;
 			getPort().then(port => {
 				this.port = port;
 				this.createProxy({target: {host: 'localhost', port}});
@@ -237,6 +239,7 @@ module.exports = class Project {
 				// permission denied when connecting to the docker socket. Instead, we'll build as root, and then ask
 				// 'docker run' to set the user for us.
 				user = `--user=${this.uid}:${this.gid}`;
+				this.dockerUid = this.uid;
 				delete this.uid;
 				delete this.gid;
 			} else {
@@ -253,7 +256,39 @@ module.exports = class Project {
 				if (code) {
 					this.stop();
 				} else {
-					this.startProcess("docker", "run", "--rm", "--env", "PORT=8000", "--env", "HOME=/tmp", "--mount", "type=bind,src=/etc/passwd,dst=/etc/passwd", "--mount", "type=bind,ro,src=/etc/group,dst=/etc/group", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:8000`, user, imageHash.trim());
+					let httpPort = docker.http_port || 8000;
+					let args = ["docker", "run", "--rm", "--env", `PORT=${httpPort}`, "--env", "HOME=/tmp", "--mount", "type=bind,src=/etc/passwd,dst=/etc/passwd", "--mount", "type=bind,ro,src=/etc/group,dst=/etc/group", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:${httpPort}`, user];
+
+					// Add the environment variabels as arguments to docker
+					for(let k in this.environment) {
+						args.push('--env');
+						args.push(`${k}=${this.environment[k]}`);
+					}
+					this.environment = {};
+
+					// Add any extra mounts as docker arguments
+					for(let dst of docker.mounts || []) {
+						if (dst[0] != '/') dst = joinPath("/app", dst);
+						let src = joinPath(this.dir, 'mounts', dst);
+						if (this.dockerUid) {
+							let oldEuid = process.geteuid();
+							try {
+								process.seteuid(this.dockerUid);
+								fs.mkdirSync(src, {recursive: true});
+							} finally {
+								process.seteuid(oldEuid);
+							}
+						}
+						else {
+							fs.mkdirSync(src, {recurse: true});
+						}
+						
+						args.push('--mount');
+						args.push(`type=bind,src=${src},dst=${dst}`);
+					}
+
+					args.push(imageHash.trim());
+					this.startProcess(...args);
 				}
 			};
 
@@ -284,10 +319,10 @@ module.exports = class Project {
 
 	getProcessOpts() {
 		let opts = {
-			env: {
+			env: Object.assign({}, this.environment, {
 				PORT: this.port,
 				PATH: process.env.PATH,
-			},
+			}),
 			cwd: this.dir,
 		};
 		if (this.uid) {
