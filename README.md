@@ -43,7 +43,7 @@ The `webcentral-projects` directories should contain subdirectories that have th
 
 ### Project types
 
-1. **Application.** If `webcentral.ini` exists and has a top-level `command` property or `[docker]` section, a server process will will be run from within a Firejail sandbox or Docker container. The command is expected to set up an HTTP service on port $PORT (which will always be 8000 when Docker is used). This shouldn't take too long, as the incoming HTTP request will be stalled until the server is ready.
+1. **Application.** If `webcentral.ini` exists and has a top-level `command` property or `[docker]` section, a server process will will be run from within a Firejail sandbox or Docker container. The command is expected to set up an HTTP service on port $PORT (which will be 8000 by default when Docker is used). This shouldn't take too long, as the incoming HTTP request will be stalled until the server is ready.
     - Firejail is the default option. It allows read-only access to system directories of the host system, such as `/bin` and `/usr`, but doesn't expose files like those in your home directory.
     - Docker is selected by creating a `[docker]` section in the .ini-file. No files of the host system, except from the project directory itself, will be exposed. Instead, a separate Linux distribution is created for the application. Generally, this will consume more memory and take a bit longer to start than when using Firejail. By default the container will run a pristine Alpine linux image, but options in the `[docker]` section of the .ini-file can be used to change that:
       - `base` sets the Docker base image to start with.
@@ -51,11 +51,14 @@ The `webcentral-projects` directories should contain subdirectories that have th
       - `packages` is an array of packages to install on the base system. This only works on base systems that offer either `apt-get` (Debian/Ubuntu) or `apk` (Alpine) as a means to install them. This is just a shortcut for prepending `commands`.
       - `mounts` is an array of directories in the context of the Docker container that should be persisted. The directories can be absolute or relative to the Docker workdir (`/app`). In the host system, empty directories that don't exist yet are automatically created in the `mounts/` directory. The `/app` directory itself is always mounted.
       - `http_port` is the TCP port within the container that the HTTP server will be running on. It defaults to 8000.
+      - `app_dir` is the directory with the Docker container to which the host's project directory will be mounted. It defaults to `/app`.
+      - `mount_app_dir` can be set to `false` in order to prevent the host's project directory from being mounted.
     
     Example `webcentral.ini` using PHP from the host system:
     ```ini
     command = php -S 0.0.0.0:$PORT -file test.php
     ```
+    
     And using PHP from a Docker image:
     ```ini
     command = php -S 0.0.0.0:$PORT -file test.php
@@ -65,10 +68,20 @@ The `webcentral-projects` directories should contain subdirectories that have th
     packages[] = composer
     commands[] = composer install
     ```
+    
     Or to just run the default command of a Docker image:
     ```ini
     [docker]
     base = some-docker-image:version
+    ```
+    
+    A real-world example for setting up a Trilium Notes server:
+    ```ini
+    command = node /usr/src/app/src/www
+    [docker]
+    base = zadam/trilium:0.47.6
+    http_port = 8080
+    mounts[] = /home/node/trillium-data
     ```
   - **Forward.** Otherwise, when the .ini-file has a top-level `port` property, requests will be forwarded to this port, without modifying the `Host:` header. The `host` property can specify a host name or ip address to use -- it defaults to localhost.
     ```ini

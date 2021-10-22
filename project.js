@@ -21,8 +21,10 @@ const Logger = require('./logger');
 	wsi.XHeaders = function(req, socket, options) {
 		old.call(this, req, socket, options);
 		req.headers['x-forwarded-host'] = req.headers['x-forwarded-host'] || req.headers['host'] || '';
-		// flask_socketio can't handle proto wss. not sure if it should, but we'll work around it here:
-		req.headers['x-forwarded-proto'] = req.headers['x-forwarded-proto'].replace(/ws/g, 'http');
+		if (req.headers['x-forwarded-proto']) {
+			// flask_socketio can't handle proto wss. not sure if it should, but we'll work around it here:
+			req.headers['x-forwarded-proto'] = req.headers['x-forwarded-proto'].replace(/ws/g, 'http');
+		}
 	};
 })();
 
@@ -227,9 +229,11 @@ module.exports = class Project {
 			}
 			commands = commands.map(s => "RUN "+(typeof s === 'string' ? s : JSON.stringify(s)));
 
+			let appDir = docker.app_dir || "/app";
+
 			let dockerfile = [
 				`FROM ${docker.base}`,
-				`WORKDIR /app`
+				`WORKDIR ${appDir}`
 			].concat(commands).join("\n");
 			this.logger.write('build', dockerfile);
 
@@ -257,7 +261,11 @@ module.exports = class Project {
 					this.stop();
 				} else {
 					let httpPort = docker.http_port || 8000;
-					let args = ["docker", "run", "--rm", "--env", `PORT=${httpPort}`, "--env", "HOME=/tmp", "--mount", "type=bind,src=/etc/passwd,dst=/etc/passwd", "--mount", "type=bind,ro,src=/etc/group,dst=/etc/group", "--mount", `type=bind,src=${this.dir},dst=/app`, "-p", `${this.port}:${httpPort}`, user];
+					let args = ["docker", "run", "--rm", "--env", `PORT=${httpPort}`, "--env", "HOME=/tmp", "--mount", "type=bind,src=/etc/passwd,dst=/etc/passwd", "--mount", "type=bind,ro,src=/etc/group,dst=/etc/group", "-p", `${this.port}:${httpPort}`, user];
+
+					if (docker.mount_app_dir !== false) {
+						args.push("--mount", `type=bind,src=${this.dir},dst=${appDir}`);
+					}
 
 					// Add the environment variabels as arguments to docker
 					for(let k in this.environment) {
@@ -268,7 +276,7 @@ module.exports = class Project {
 
 					// Add any extra mounts as docker arguments
 					for(let dst of docker.mounts || []) {
-						if (dst[0] != '/') dst = joinPath("/app", dst);
+						if (dst[0] != '/') dst = joinPath(appDir, dst);
 						let src = joinPath(this.dir, 'mounts', dst);
 						if (this.dockerUid) {
 							let oldEuid = process.geteuid();
@@ -329,6 +337,7 @@ module.exports = class Project {
 			opts.uid = this.uid;
 			opts.gid = this.gid;
 		}
+		opts.env.HOME = childProcess.execSync(`getent passwd ${(0|this.uid) || process.getuid()} | cut -d: -f6`).toString();
 		return opts;
 	}
 
@@ -339,7 +348,7 @@ module.exports = class Project {
 			if (typeof this.command === 'string') this.command = ['/bin/sh', '-c', this.command];
 			args = args.concat(this.command);
 		}
-		this.logger.write("start process "+JSON.stringify(args));
+		this.logger.write(`start process: '${args.join("' '")}'`);
 
 		this.process = childProcess.spawn(args[0], args.slice(1), this.getProcessOpts());
 

@@ -9,12 +9,12 @@
   "license": "ISC",
   "dependencies": {
     "get-port": "^4.0.0",
-    "glob": "^7.1.3",
+    "glob": "^7.1.7",
     "greenlock": "^2.8.8",
-    "greenlock-store-fs": "3",
+    "greenlock-store-fs": "^3.2.2",
     "http-proxy": "^1.18.1",
-    "ini": "^1.3.5",
-    "redirect-https": "^1.1.6",
+    "ini": "^1.3.8",
+    "redirect-https": "^1.3.1",
     "serve-static": "^1.14.1"
   }
 }
