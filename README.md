@@ -49,7 +49,7 @@ The `webcentral-projects` directories should contain subdirectories that have th
       - `base` sets the Docker base image to start with.
       - `commands` is an array of commands used to build the Docker image. Each command can either be a string, which will be executed as a shell command, or an array of strings, which will be executed without involving a shell.
       - `packages` is an array of packages to install on the base system. This only works on base systems that offer either `apt-get` (Debian/Ubuntu) or `apk` (Alpine) as a means to install them. This is just a shortcut for prepending `commands`.
-      - `mounts` is an array of directories in the context of the Docker container that should be persisted. The directories can be absolute or relative to the Docker workdir (`/app`). In the host system, empty directories that don't exist yet are automatically created in the `mounts/` directory. The `/app` directory itself is always mounted.
+      - `mounts` is an array of directories in the context of the Docker container that should be persisted. The directories can be absolute or relative to the Docker workdir (`/app`). In the host system, empty directories that don't exist yet are automatically created in the `_webcentral_data/mounts/` directory. The `/app` directory itself is always mounted, unless `mount_app_dir` is set to `false`.
       - `http_port` is the TCP port within the container that the HTTP server will be running on. It defaults to 8000.
       - `app_dir` is the directory with the Docker container to which the host's project directory will be mounted. It defaults to `/app`.
       - `mount_app_dir` can be set to `false` in order to prevent the host's project directory from being mounted.
@@ -81,7 +81,6 @@ The `webcentral-projects` directories should contain subdirectories that have th
     [docker]
     base = zadam/trilium:0.47.6
     http_port = 8080
-    mounts[] = /home/node/trillium-data
     ```
   - **Forward.** Otherwise, when the .ini-file has a top-level `port` property, requests will be forwarded to this port, without modifying the `Host:` header. The `host` property can specify a host name or ip address to use -- it defaults to localhost.
     ```ini
@@ -104,13 +103,15 @@ The `webcentral-projects` directories should contain subdirectories that have th
 Applications will be automatically shut down when...
 1. The service has been inactive for 5 minutes. This period can be overridden or disabled using the `timeout` property in the `[reload]` section of the `webcentral.ini`. It indicates the time in seconds. Zero disables inactivity shutdown.
 2. When any of the files in the application directory change. By default, the following file patterns are excluded from this:
-   - `data` (A file or directory with this name in the root of the project directory.)
+   - `_webcentral_data` (A file or directory with this name in the root of the project directory.)
+   - `data`
    - `log`
    - `logs`
+   - `home`
    - `node_modules`
    - `**/*.log` (A file or directory with a name ending in *.log* in the root directory or any subdirectory.)
    - `**/.*` (Hidden files.)
-   This behaviour can be overriden using the `include` and `exclude` properties in the `[reload]` section of `webcentral.ini`. Both can be string arrays containing patterns like the above. Exclusion always overrules inclusion. When `include` is not set, everything will be included by default. Even when `include` is manually set, `webcentral.ini` will always be added to it automatically, to make sure errors can be corrected. Similarly, `exclude` will always have `log` appended to it, because it makes little sense to reload for each log message written by Webcentral.
+   This behaviour can be overriden using the `include` and `exclude` properties in the `[reload]` section of `webcentral.ini`. Both can be string arrays containing patterns like the above. Exclusion always overrules inclusion. When `include` is not set, everything will be included by default. Even when `include` is manually set, `webcentral.ini` will always be added to it automatically, to make sure errors can be corrected. Similarly, `exclude` will always have `_webcentral_data` appended to it, because it makes little sense to reload for log messages written by Webcentral or data modified by the app.
    ```ini
    command = ./start.sh --production
    [reload]
@@ -163,7 +164,7 @@ WEB_VAULT_ENABLED = true
 
 ## Log files
 
-Output of (and about) client projects is written to `log/webcentral_<DATE>.log` in the project directory. Log files are automatically deleted after three weeks. This is currently not configurable (except by trivially modifying the source code).
+Output of (and about) client projects is written to `_webcentral_data/log/<DATE>.log` in the project directory. Log files are automatically deleted after three weeks. This is currently not configurable (except by trivially modifying the source code).
 
 
 ## Starting from systemd

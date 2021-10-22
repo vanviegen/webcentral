@@ -9,11 +9,6 @@ class Logger {
 		Object.assign(this, opts);
 		if (!this.path) throw new Error("path is a required option");
 		if (!this.base) this.base = "";
-
-		try {
-			fs.mkdirSync(this.path);
-			if (this.uid) fs.chownSync(this.path, this.uid, this.gid);
-		} catch(e) {}
 	}
 
 	write(topic, msg) {

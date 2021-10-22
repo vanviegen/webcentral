@@ -66,6 +66,23 @@ function wildcardsToRegExp(wildcards) {
 }
 
 
+function makePathSync(path, uid) {
+	if (uid) {
+		let oldEuid = process.geteuid();
+		try {
+			process.seteuid(uid);
+			fs.mkdirSync(path, {recursive: true});
+		} finally {
+			process.seteuid(oldEuid);
+		}
+	}
+	else {
+		fs.mkdirSync(path, {recursive: true});
+	}
+}
+
+
+
 const all = {};
 
 module.exports = class Project {
@@ -93,7 +110,10 @@ module.exports = class Project {
 			this.gid = stat.gid;
 		}
 
-		this.logger = new Logger({path: this.dir+"/log", base: "webcentral_", uid: this.uid, gid: this.gid, deleteAfterDays: 21});
+		let logPath = this.dir+"/_webcentral_data/log";
+		makePathSync(logPath, this.uid);
+
+		this.logger = new Logger({path: logPath, base: "", uid: this.uid, gid: this.gid, deleteAfterDays: 21});
 		
 		let config = {};
 		if (fs.existsSync(dir+"webcentral.ini")) {
@@ -113,9 +133,9 @@ module.exports = class Project {
 	
 		if (this.reload.exclude) {
 			if (typeof this.reload.exclude === 'string') this.reload.exclude = [this.reload.exclude];
-			this.reload.exclude.push('log');
+			this.reload.exclude.push('_webcentral_data');
 		} else {
-			this.reload.exclude = ["data", "mounts", "log", "logs", "node_modules", "**/*.log", "**/.*"];
+			this.reload.exclude = ["_webcentral_data", "data", "log", "logs", "node_modules", "**/*.log", "**/.*"];
 		}
 		if (this.reload.include) {
 			if (typeof this.reload.include === 'string') this.reload.include = [this.reload.include];
@@ -261,36 +281,32 @@ module.exports = class Project {
 					this.stop();
 				} else {
 					let httpPort = docker.http_port || 8000;
-					let args = ["docker", "run", "--rm", "--env", `PORT=${httpPort}`, "--env", "HOME=/tmp", "--mount", "type=bind,src=/etc/passwd,dst=/etc/passwd", "--mount", "type=bind,ro,src=/etc/group,dst=/etc/group", "-p", `${this.port}:${httpPort}`, user];
+					let args = ["docker", "run", "--rm", "--mount", "type=bind,src=/etc/passwd,dst=/etc/passwd", "--mount", "type=bind,ro,src=/etc/group,dst=/etc/group", "-p", `${this.port}:${httpPort}`, user];
 
+					let homeDir = '/tmp';
 					if (docker.mount_app_dir !== false) {
 						args.push("--mount", `type=bind,src=${this.dir},dst=${appDir}`);
+						makePathSync(`${this.dir}/_webcentral_data/home`, this.dockerUid);
+						homeDir = `${appDir}/_webcentral_data/home`;
 					}
 
-					// Add the environment variabels as arguments to docker
-					for(let k in this.environment) {
+					let dockerEnv = this.environment || {};
+					if (dockerEnv.PORT==null) dockerEnv.PORT = httpPort;
+					if (dockerEnv.HOME==null) dockerEnv.HOME = homeDir;
+
+					// Add the environment variables as arguments to Docker
+					for(let k in dockerEnv) {
 						args.push('--env');
-						args.push(`${k}=${this.environment[k]}`);
+						args.push(`${k}=${dockerEnv[k]}`);
 					}
+					// Don't add the environment variables when executing Docker itself
 					this.environment = {};
 
 					// Add any extra mounts as docker arguments
 					for(let dst of docker.mounts || []) {
 						if (dst[0] != '/') dst = joinPath(appDir, dst);
-						let src = joinPath(this.dir, 'mounts', dst);
-						if (this.dockerUid) {
-							let oldEuid = process.geteuid();
-							try {
-								process.seteuid(this.dockerUid);
-								fs.mkdirSync(src, {recursive: true});
-							} finally {
-								process.seteuid(oldEuid);
-							}
-						}
-						else {
-							fs.mkdirSync(src, {recurse: true});
-						}
-						
+						let src = joinPath(this.dir, '_webcentral_data', 'mounts', dst);
+						makePathSync(src, this.dockerUid);
 						args.push('--mount');
 						args.push(`type=bind,src=${src},dst=${dst}`);
 					}
