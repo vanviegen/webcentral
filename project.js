@@ -139,7 +139,7 @@ module.exports = class Project {
 		}
 		if (this.reload.include) {
 			if (typeof this.reload.include === 'string') this.reload.include = [this.reload.include];
-			this.reload.include.push('webcentral.yaml');
+			this.reload.include.push('webcentral.ini');
 		}
 		this.reload.include = wildcardsToRegExp(this.reload.include);
 		this.reload.exclude = wildcardsToRegExp(this.reload.exclude);
@@ -247,14 +247,15 @@ module.exports = class Project {
 				let packages = typeof docker.packages === 'string' ? docker.packages : docker.packages.join(' ');
 				commands.unshift(`if command -v apk > /dev/null ; then apk update && apk add --no-cache ${packages} ; else apt-get update && apt-get install --no-install-recommends --yes ${packages}; fi`);
 			}
-			commands = commands.map(s => "RUN "+(typeof s === 'string' ? s : JSON.stringify(s)));
+			commands = commands.map(s => "RUN "+(typeof s === 'string' ? s+"\n" : JSON.stringify(s)+"\n")).join("");
 
 			let appDir = docker.app_dir || "/app";
 
-			let dockerfile = [
-				`FROM ${docker.base}`,
-				`WORKDIR ${appDir}`
-			].concat(commands).join("\n");
+			let dockerfile = `FROM ${docker.base}\n`;
+			if (docker.mount_app_dir !== false) {
+				dockerfile += `WORKDIR ${appDir}\n`;
+			}
+			dockerfile += commands;
 			this.logger.write('build', dockerfile);
 
 			let user;
@@ -408,7 +409,7 @@ module.exports = class Project {
 				}
 			} else {
 				for(let opts of this.queue) {
-					if (opts.socket) opts.socket.close();
+					if (opts.socket) opts.socket.destroy();
 					else this.handleError("cannot start application", opts.req, opts.rsp);
 				}
 			}
