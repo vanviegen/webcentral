@@ -13,6 +13,7 @@ Host multiple sandboxed started-on-demand web applications on a single machine. 
 - Restart applications without downtime when files are changed, for easy updates.
 - Shut down applications after some period of inactivity.
 - Automatically set up HTTPS using LetsEncrypt, and redirects HTTP requests to HTTPS.
+- Automatically redirect `example.com` to `www.example.com`, or the other way around.
 - Passthrough WebSocket traffic.
 - Run projects on behalf of multiple users, when started as root. Applications run with the user's permissions. The first user to claim a domain will get to keep it.
 - Write application stdout and stderr to rotating log files in the project directory.
@@ -133,7 +134,6 @@ In case a replacement results in a path that matches `webcentral://<NAME>/<PATH>
 /blog/(.*?)/.* = /articles/$1.html ; ignore the verbose title in the URL and add .html to find the static article file
 /favicon.ico = /facicon.ico ; make sure the following rule does not apply for favicons
 /[^/]* = /index.html ; any other top-level paths are redirect to index.html
-; everything else (resources 
 ```
 
 ### Environment variables
@@ -158,7 +158,7 @@ WEB_VAULT_ENABLED = true
 | `--https=PORT` | Run the HTTPS server on TCP port `PORT`. Defaults to 443. Set to 0 to disable HTTPS. |
 | `--http=PORT` | Run the HTTP server on TCP port `PORT`. Defaults to 80. Set to 0 to disable HTTP. |
 | `--redirect-http=BOOL` | When `true` (as it is by default) and both `http` and `https` are not 0, incoming HTTP requests will be redirected to HTTPS. When set to `false`, requests are handled on both HTTP and HTTPS. |
-| `--optional-www=BOOL` | When `true` (as it is by default), "www.example.com" will be looked up as "example.com" if it doesn't exist, and vice versa. |
+| `--redirect-www=BOOL` | When `true` (as it is by default), "www.example.com" will be redirect to "example.com" if the former doesn't exist but the latter does, and vice versa. |
 | `--firejail=BOOL` | Set to `false` to disable the use of Firejail containing Node processes. This is bad for security and may cause process leaks. Defaults to `true`. |
 
 

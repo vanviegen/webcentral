@@ -99,7 +99,8 @@ module.exports = class Project {
 	
 	constructor(dir) {
 		this.dir = dir;
-		this.project = dir.split('/').pop();
+		let parts = dir.split('/');
+		this.domain = parts[parts.length-1] || parts[parts.length-2];
 		this.queue = [];
 		this.lastUse = new Date().getTime();
 		this.watchers = [];

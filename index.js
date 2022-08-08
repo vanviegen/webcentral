@@ -13,7 +13,7 @@ let email = process.env.EMAIL || '';
 let httpPort = 80;
 let httpsPort = 443;
 let redirectHttp = null;
-let optionalWww = true;
+let redirectWww = true;
 let firejail = true;
 
 let argv = process.argv.slice(2);
@@ -26,7 +26,7 @@ for(let i=0; i<argv.length; i++) {
 	else if (key=="--http") httpPort = 0|val;
 	else if (key=="--https") httpsPort = 0|val;
 	else if (key=="--redirect-http") redirectHttp = (val==="true" || val==="yes");
-	else if (key=="--optional-www") optionalWww = (val==="true" || val==="yes");
+	else if (key=="--redirect-www") redirectWww = (val==="true" || val==="yes");
 	else if (key=="--firejail") firejail = (val==="true" || val==="yes");
 	else help("invalid option: "+key);
 }
@@ -37,7 +37,7 @@ if (httpPort && httpsPort) {
 	redirectHttp = false;
 }
 
-console.log(process.argv[1]+" --config="+configDir+" --projects="+projectDir+" --email="+email+ " --http="+httpPort+" --https="+httpsPort+" --redirect-http="+(redirectHttp?"true":"false")+" --optional-www="+(optionalWww?"true":"false")+" --firejail="+(firejail?"true":"false"));
+console.log(process.argv[1]+" --config="+configDir+" --projects="+projectDir+" --email="+email+ " --http="+httpPort+" --https="+httpsPort+" --redirect-http="+(redirectHttp?"true":"false")+" --redirect-www="+(redirectWww?"true":"false")+" --firejail="+(firejail?"true":"false"));
 
 if (httpsPort && (!email || !email.match(/@/))) {
 	help("an email address should be specified");
@@ -89,30 +89,43 @@ function getProjectDir(domain) {
 	}
 }
 
+function isDir(path) {
+	try {
+	    return fs.lstatSync(path).isDirectory();
+	} catch (e) {
+	    return false;
+	}
+}
+
 function realGetProjectDir(domain) {
 	domain = domain.replace(/:\d+$/, '');
 	if (typeof domain !== "string" || !domain.match(/^[a-zA-Z.0-9-:]+$/)) return;
 
-	let candidates = glob(projectDir+domain+"/", {cwd: "/", absolute: true});
-	if (!candidates.length) {
-		if (!optionalWww) return;
+	// Has the domain already been bound to a directory (that still exists)?
+	let binding = bindings[domain];
+	if (binding && isDir(binding)) return binding;
 
-		if (domain.substr(0,4)==='www.') domain = domain.substr(4);
-		else domain = 'www.'+domain;
-		
-		candidates = glob(projectDir+domain+"/", {cwd: "/", absolute: true});
-		if (!candidates.length) return;
+	// Has the www-alternative domain been bound to a directory (that still exists)?
+	let altDomain;
+	if (redirectWww) {
+		altDomain = (domain.substr(0,4)==='www.') ? domain.substr(4) : "www."+domain;
+		let binding = bindings[altDomain];
+		if (binding && isDir(binding)) return binding;
 	}
 
-	let binding = bindings[domain];
-	if (binding && candidates.indexOf(binding)>=0) {
+	// Scan for matching project directories for the domain.
+	let candidates = glob(projectDir+domain+"/", {cwd: "/", absolute: true});
+	if (!candidates && redirectWww) {
+		// Scan for matching project directories for the www-alternative domain.
+		candidates = glob(projectDir+altDomain+"/", {cwd: "/", absolute: true});
+	}
+
+	if (candidates) {
+		binding = candidates[0];
+		bindings[domain] = binding;
+		fs.writeFile(bindingsFile, JSON.stringify(bindings), 'utf8', function(){});
 		return binding;
 	}
-
-	binding = candidates[0];
-	bindings[domain] = binding;
-	fs.writeFile(bindingsFile, JSON.stringify(bindings), 'utf8', function(){});
-	return binding;
 }
 
 function approveDomains(opts, certs, cb) {
@@ -137,7 +150,16 @@ function handleRequest(req, rsp) {
 		return;
 	}
 
-	Project.get(projectDir).handle({req, rsp});
+	let project = Project.get(projectDir);
+
+	if (project.domain != req.headers.host) {
+		// The www-alternative domain was used. We need to redirect.
+		rsp.writeHead(301, {Location: '//' + project.domain + req.url});
+		rsp.end();
+	} else {
+		// Have the project handle the request.
+		project.handle({req, rsp});
+	}
 }
 
 function handleWebSocket(req, socket, head) {
