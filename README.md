@@ -83,10 +83,14 @@ The `webcentral-projects` directories should contain subdirectories that have th
     base = zadam/trilium:0.47.6
     http_port = 8080
     ```
-  - **Forward.** Otherwise, when the .ini-file has a top-level `port` property, requests will be forwarded to this port, without modifying the `Host:` header. The `host` property can specify a host name or ip address to use -- it defaults to localhost.
+  - **Forward.** Otherwise, when the .ini-file has a top-level `port` or `socket_path` property, requests will be forwarded to this port or UNIX domain socket, without modifying the `Host:` header. When used with `port`, the `host` property can specify a host name or ip address to use -- it defaults to localhost.
     ```ini
     port = 3000
     host = 192.168.10.20
+    ```
+    Or
+    ```ini
+    socket_path = /my/path/test.socket
     ```
 3. **Redirect.** If `webcentral.ini` exists and has a top-level `redirect` property, all requests will receive an HTTP 301 redirect to the URL given in that property, concatenated with the path and query string of the request.
     ```ini
@@ -165,6 +169,12 @@ WEB_VAULT_ENABLED = true
 ## Log files
 
 Output of (and about) client projects is written to `_webcentral_data/log/<DATE>.log` in the project directory. Log files are automatically deleted after three weeks. This is currently not configurable (except by trivially modifying the source code).
+
+Projects can enable request logging by setting the following property in `webcentral.ini`:
+
+```ini
+log_requests = true
+```
 
 
 ## Starting from systemd

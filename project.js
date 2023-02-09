@@ -162,6 +162,9 @@ module.exports = class Project {
 				this.rewritePairs.push([new RegExp('^(?:'+regexp+')$'), config.rewrite[regexp]]);
 			}
 		}
+
+		this.logRequests = config.log_requests || false;
+		
 		if (config.command || config.docker) {
 			this.command = config.command == null ? [] : (typeof config.command === 'string' ? ['/bin/sh', '-c', config.command] : config.command);
 			this.host = "localhost";
@@ -189,6 +192,13 @@ module.exports = class Project {
 				port: config.port,
 			};
 			this.logger.write("starting forward to http://"+target.host+":"+target.port);
+			this.createProxy({target, xfwd: true, ws: true});
+			this.handler = this.handleProxy;
+		} else if (config.socket_path) {
+			let target = {
+				socketPath: config.socket_path
+			};
+			this.logger.write("starting forward to socket "+target.socketPath);
 			this.createProxy({target, xfwd: true, ws: true});
 			this.handler = this.handleProxy;
 		} else {

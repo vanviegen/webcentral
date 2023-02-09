@@ -158,6 +158,7 @@ function handleRequest(req, rsp) {
 		rsp.end();
 	} else {
 		// Have the project handle the request.
+		if (project.logRequests) project.logger.write(`${req.method} ${req.url}`);
 		project.handle({req, rsp});
 	}
 }
