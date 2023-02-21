@@ -184,7 +184,7 @@ module.exports = class Project {
 		} else if (config.proxy) {
 			this.logger.write("starting proxy for "+config.proxy);
 			let domain = parseUrl(config.proxy).host;
-			this.createProxy({target: config.proxy, changeOrigin: true, autoRewrite: true, protocolRewrite: true, cookieDomainRewrite: domain, ws: true});
+			this.createProxy({target: config.proxy, changeOrigin: true, autoRewrite: true, protocolRewrite: true, cookieDomainRewrite: domain});
 			this.handler = this.handleProxy;
 		} else if (config.port) {
 			let target = {
@@ -192,14 +192,14 @@ module.exports = class Project {
 				port: config.port,
 			};
 			this.logger.write("starting forward to http://"+target.host+":"+target.port);
-			this.createProxy({target, xfwd: true, ws: true});
+			this.createProxy({target});
 			this.handler = this.handleProxy;
 		} else if (config.socket_path) {
 			let target = {
 				socketPath: config.socket_path
 			};
 			this.logger.write("starting forward to socket "+target.socketPath);
-			this.createProxy({target, xfwd: true, ws: true});
+			this.createProxy({target});
 			this.handler = this.handleProxy;
 		} else {
 			this.logger.write("starting static file server");
@@ -233,8 +233,21 @@ module.exports = class Project {
 	}
 
 	createProxy(opts) {
-		this.proxy = httpProxy.createProxyServer(opts);
-		this.proxy.on('error', this.handleError.bind(this));
+		this.proxy = httpProxy.createProxyServer({...opts, xfwd: true, ws: true});
+		this.proxy.on('error', this.handleProxyError.bind(this));
+	}
+
+	handleProxyError(err, req, rsp) {
+		let retry = req.proxy_retry = (req.proxy_retry||0) + 1;
+		if (retry > 10) {
+			this.handleError(err, req, rsp);
+		}
+		else {
+			this.logger.write(`retrying after error ${req.method} ${req.url}: ${err}`);
+			setTimeout(() => {
+				this.proxy.proxyRequest(req, rsp);
+			}, 500);
+		}
 	}
 
 	runCommand() {
