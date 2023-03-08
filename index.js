@@ -15,6 +15,8 @@ let httpsPort = 443;
 let redirectHttp = null;
 let redirectWww = true;
 let firejail = true;
+let acmeUrl = 'https://acme-v02.api.letsencrypt.org/directory';
+let acmeVersion = 'draft-11';
 
 let argv = process.argv.slice(2);
 for(let i=0; i<argv.length; i++) {
@@ -28,6 +30,8 @@ for(let i=0; i<argv.length; i++) {
 	else if (key=="--redirect-http") redirectHttp = (val==="true" || val==="yes");
 	else if (key=="--redirect-www") redirectWww = (val==="true" || val==="yes");
 	else if (key=="--firejail") firejail = (val==="true" || val==="yes");
+	else if (key=="--acme-url") acmeUrl = val;
+	else if (key=="--acme-version") acmeVersion = val;
 	else help("invalid option: "+key);
 }
 
@@ -37,7 +41,7 @@ if (httpPort && httpsPort) {
 	redirectHttp = false;
 }
 
-console.log(process.argv[1]+" --config="+configDir+" --projects="+projectDir+" --email="+email+ " --http="+httpPort+" --https="+httpsPort+" --redirect-http="+(redirectHttp?"true":"false")+" --redirect-www="+(redirectWww?"true":"false")+" --firejail="+(firejail?"true":"false"));
+console.log(process.argv[1]+" --config="+configDir+" --projects="+projectDir+" --email="+email+ " --http="+httpPort+" --https="+httpsPort+" --redirect-http="+(redirectHttp?"true":"false")+" --redirect-www="+(redirectWww?"true":"false")+" --firejail="+(firejail?"true":"false")+" --acme-url="+acmeUrl+" --acme-version="+acmeVersion);
 
 if (httpsPort && (!email || !email.match(/@/))) {
 	help("an email address should be specified");
@@ -172,11 +176,11 @@ function handleWebSocket(req, socket, head) {
 	}
 	Project.get(projectDir).handle({req, socket, head});
 }
- 
+
 
 const greenlock = require('greenlock').create({
-	version: 'draft-11',
-	server: 'https://acme-v02.api.letsencrypt.org/directory',
+	version: acmeVersion,
+	server: acmeUrl,
 	configDir: configDir+'acme/',
 	email: email,
 	agreeTos: true,

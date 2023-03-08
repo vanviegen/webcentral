@@ -164,7 +164,8 @@ WEB_VAULT_ENABLED = true
 | `--redirect-http=BOOL` | When `true` (as it is by default) and both `http` and `https` are not 0, incoming HTTP requests will be redirected to HTTPS. When set to `false`, requests are handled on both HTTP and HTTPS. |
 | `--redirect-www=BOOL` | When `true` (as it is by default), "www.example.com" will be redirect to "example.com" if the former doesn't exist but the latter does, and vice versa. |
 | `--firejail=BOOL` | Set to `false` to disable the use of Firejail containing Node processes. This is bad for security and may cause process leaks. Defaults to `true`. |
-
+| `--acme-url=URL` | Use the given ACME directory URL. Defaults to using Let's Encrypt: `https://acme-v02.api.letsencrypt.org/directory`. BuyPass is also known to work: `https://api.buypass.com/acme/directory`. |
+| `--acme-version=VER` | Try to use the given ACME protocol version. Defaults to `draft-11`. |
 
 ## Log files
 
