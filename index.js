@@ -141,6 +141,7 @@ let projects = {};
 function handleRequest(req, rsp) {
 	if (!req.headers.host) {
 		console.error('no host', req.headers, req.path);
+		req.headers.host = '<none>';
 	}
 	let projectDir = getProjectDir(req.headers.host);
 	if (!projectDir) {
