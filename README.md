@@ -127,7 +127,7 @@ Applications will be automatically shut down when...
    exclude[] = **/*.bak ; And ignore any .bak file
    ```
    
-## Rewrites (Experimental!)
+### Rewrites (Experimental!)
 Request paths can be rewritten before they are handled. To do that, create a `[rewrite]` section in the `webcentral.ini` of a project. Its keys and values will be applied in order as regular expressions and their replacement values. A regular expression must match the entire path string. The replacement string can use `$1`, `$2` etc to captured expressions. After a match, any further replacement rules are skipped. 
 
 In case a replacement results in a path that matches `webcentral://<NAME>/<PATH>`, the request will be handed of to a Webcentral project named `<NAME>`, giving it `/<PATH>` as its request path. The `<NAME>` of that Webcentral project does not need to resolve to this host in DNS.
@@ -152,6 +152,15 @@ ROCKET_PORT = 8000
 WEB_VAULT_ENABLED = true
 ```
 
+### Redirect http/https
+Requests can be redirected from http to https, or the other way around. This can be configured through the `redirect_http` and `redirect_https` boolean properties. The former has a default value that can be set using `--redirect-http` command line argument. The latter defaults to `false`.
+
+This example redirects https traffic to http:
+```ini
+redirect_http = false
+redirect_https = true
+```
+
 ## Options
 
 | Option | Description |
@@ -161,7 +170,7 @@ WEB_VAULT_ENABLED = true
 | `--config=DIR` | Directory where domain to directory mappings and LetsEncrypt config are stored. Defaults to `/var/lib/webcentral` when run as root, or to `$HOME/.webcentral` otherwise.
 | `--https=PORT` | Run the HTTPS server on TCP port `PORT`. Defaults to 443. Set to 0 to disable HTTPS. |
 | `--http=PORT` | Run the HTTP server on TCP port `PORT`. Defaults to 80. Set to 0 to disable HTTP. |
-| `--redirect-http=BOOL` | When `true` (as it is by default) and both `http` and `https` are not 0, incoming HTTP requests will be redirected to HTTPS. When set to `false`, requests are handled on both HTTP and HTTPS. |
+| `--redirect-http=BOOL` | When `true` (as it is by default) and both `http` and `https` are not 0, incoming HTTP requests will be redirected to HTTPS. When set to `false`, requests are handled on both HTTP and HTTPS. This behaviour can be overriden by individual projects. |
 | `--redirect-www=BOOL` | When `true` (as it is by default), "www.example.com" will be redirect to "example.com" if the former doesn't exist but the latter does, and vice versa. |
 | `--firejail=BOOL` | Set to `false` to disable the use of Firejail containing Node processes. This is bad for security and may cause process leaks. Defaults to `true`. |
 | `--acme-url=URL` | Use the given ACME directory URL. Defaults to using Let's Encrypt: `https://acme-v02.api.letsencrypt.org/directory`. BuyPass is also known to work: `https://api.buypass.com/acme/directory`. |

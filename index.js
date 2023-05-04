@@ -95,9 +95,9 @@ function getProjectDir(domain) {
 
 function isDir(path) {
 	try {
-	    return fs.lstatSync(path).isDirectory();
+		return fs.lstatSync(path).isDirectory();
 	} catch (e) {
-	    return false;
+		return false;
 	}
 }
 
@@ -140,7 +140,6 @@ function approveDomains(opts, certs, cb) {
 	}
 }
 
-let projects = {};
 
 function handleRequest(req, rsp) {
 	if (!req.headers.host) {
@@ -156,6 +155,21 @@ function handleRequest(req, rsp) {
 	}
 
 	let project = Project.get(projectDir);
+
+	if (req.socket._tlsOptions) {
+		if (project.redirectHttps && httpPort) {
+			// Redirect from https to http
+			rsp.writeHead(301, {Location: 'http://' + project.domain + (httpPort==80 ? '' : ':'+httpPort) + req.url});
+			rsp.end();
+			return;
+		}
+	} else {
+		if (httpsPort && (project.redirectHttp==null ? redirectHttp : project.redirectHttp) && !project.redirectHttps) {
+			rsp.writeHead(301, {Location: 'https://' + project.domain + (httpsPort==443 ? '' : ':'+httpsPort) + req.url});
+			rsp.end();
+			return;
+		}
+	}
 
 	if (project.domain != req.headers.host) {
 		// The www-alternative domain was used. We need to redirect.
@@ -178,6 +192,28 @@ function handleWebSocket(req, socket, head) {
 }
 
 
+function configureServer(server, port) {
+	server.on('upgrade', handleWebSocket);
+
+	let connections = new Set();
+	server.on('connection', function(connection) {
+		connections.add(connection);
+		connection.on('close', function() {
+			connections.delete(connection);
+		});
+	});
+
+	server.destroy = function() {
+		server.close();
+		for (var connection of connections) {
+			connection.destroy();
+		}
+	};
+	
+	server.listen(port);
+}
+
+
 const greenlock = require('greenlock').create({
 	version: acmeVersion,
 	server: acmeUrl,
@@ -191,36 +227,28 @@ const greenlock = require('greenlock').create({
 	store: require('greenlock-store-fs'),
 });
 
+
 let servers = [];
 if (httpsPort) {
-	let server = require('https').createServer(greenlock.tlsOptions);
+	let server = require('https').createServer(greenlock.tlsOptions, handleRequest);
 	servers.push(server);
 	configureServer(server, httpsPort);
 }
 
 if (httpPort) {
-	if (httpsPort && redirectHttp) {
-		let server = require('http').createServer(greenlock.middleware(require('redirect-https')({port:httpsPort})))
-		server.listen(httpPort);
-		servers.push(server)
-	} else {
-		let server = require('http').createServer();
-		configureServer(server, httpPort);
-		servers.push(server);
-	}
+	let server = require('http').createServer(greenlock.middleware(handleRequest));
+	configureServer(server, httpPort);
+	servers.push(server);
 }
+
+
 process.on('SIGTERM', () => {
 	console.log('SIGTERM received');
 	for(let server of servers) {
-		server.close();
+		server.destroy();
 	}
 	Project.stopAll();
 });
 
-function configureServer(server, port) {
-	server.on('request', handleRequest);
-	server.on('upgrade', handleWebSocket);
-	server.listen(port);
-}
 
 exports.handleRequest = handleRequest;

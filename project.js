@@ -164,6 +164,8 @@ module.exports = class Project {
 		}
 
 		this.logRequests = config.log_requests || false;
+		this.redirectHttp = config.redirect_http;
+		this.redirectHttps = config.redirect_https || false;
 		
 		if (config.command || config.docker) {
 			this.command = config.command == null ? [] : (typeof config.command === 'string' ? ['/bin/sh', '-c', config.command] : config.command);
