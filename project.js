@@ -241,7 +241,7 @@ module.exports = class Project {
 
 	handleProxyError(err, req, rsp) {
 		let retry = req.proxy_retry = (req.proxy_retry||0) + 1;
-		if (retry > 10) {
+		if (retry > 10 || req.method!=='GET') {
 			this.handleError(err, req, rsp);
 		}
 		else {
