@@ -339,7 +339,7 @@ module.exports = class Project {
 					}
 
 					args.push(imageHash.trim());
-					this.startProcess(...args);
+					this.startProcess(args);
 				}
 			};
 
@@ -351,7 +351,7 @@ module.exports = class Project {
 			builder.stdin.end();
 			
 		} else if (Project.firejail) {
-			this.startProcess(
+			this.startProcess([
 				"firejail",
 				"--noprofile",
 				"--private="+this.dir,
@@ -362,18 +362,18 @@ module.exports = class Project {
 				"--caps.drop=all",
 				"--disable-mnt",
 				"--shell=none"
-			);
+			], {HOME: this.dir});
 		} else {
 			this.startProcess();
 		}
 	}
 
-	getProcessOpts() {
+	getProcessOpts(env) {
 		let opts = {
 			env: Object.assign({}, this.environment, {
 				PORT: this.port,
 				PATH: process.env.PATH,
-			}),
+			}, env||{}),
 			cwd: this.dir,
 		};
 		if (this.uid) {
@@ -384,8 +384,9 @@ module.exports = class Project {
 		return opts;
 	}
 
-	startProcess(...args) {
+	startProcess(args, env) {
 		if (this.stopped) return;
+		args = args || []
 
 		if (this.command) {
 			if (typeof this.command === 'string') this.command = ['/bin/sh', '-c', this.command];
@@ -393,7 +394,7 @@ module.exports = class Project {
 		}
 		this.logger.write(`start process: '${args.join("' '")}'`);
 
-		this.process = childProcess.spawn(args[0], args.slice(1), this.getProcessOpts());
+		this.process = childProcess.spawn(args[0], args.slice(1), this.getProcessOpts(env));
 
 		this.process.stdout.on('data', data => this.logger.write("out", data));
 		this.process.stderr.on('data', data => this.logger.write("err", data));
