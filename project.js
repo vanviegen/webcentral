@@ -380,7 +380,7 @@ module.exports = class Project {
 			opts.uid = this.uid;
 			opts.gid = this.gid;
 		}
-		opts.env.HOME = childProcess.execSync(`getent passwd ${(0|this.uid) || process.getuid()} | cut -d: -f6`).toString();
+		opts.env.HOME = childProcess.execSync(`getent passwd ${(0|this.uid) || process.getuid()} | cut -d: -f6`).toString().trim();
 		return opts;
 	}
 
