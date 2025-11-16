@@ -1,0 +1,15 @@
+# Binaries
+webcentral
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Output of go build
+*.out
+
+# Go workspace file
+go.work
