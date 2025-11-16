@@ -72,6 +72,11 @@ func NewServer(config *Config) (*Server, error) {
 }
 
 func (s *Server) Start() error {
+	// Proactively acquire certificates for all domains
+	if s.certManager != nil {
+		go s.ensureAllCertificates()
+	}
+
 	// Start HTTP server
 	if s.config.HTTPPort > 0 {
 		var handler http.Handler = http.HandlerFunc(s.handleHTTP)
@@ -343,35 +348,89 @@ func (s *Server) saveBindings() {
 }
 
 func (s *Server) getCertificateWithLogging(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	domain := hello.ServerName
+	// Just get the certificate - logging happens in ensureAllCertificates
+	// This is called on every TLS handshake, usually just reading from cache
+	return s.certManager.GetCertificate(hello)
+}
 
-	// Track if we're already requesting a cert for this domain
-	s.certRequestsMu.Lock()
-	isRequesting := s.certRequests[domain]
-	if !isRequesting {
-		s.certRequests[domain] = true
-		fmt.Printf("Starting certificate acquisition for %s\n", domain)
-	}
-	s.certRequestsMu.Unlock()
-
-	// Get the certificate (autocert handles deduplication internally)
-	cert, err := s.certManager.GetCertificate(hello)
-
-	// Clean up tracking
-	s.certRequestsMu.Lock()
-	delete(s.certRequests, domain)
-	s.certRequestsMu.Unlock()
-
+func (s *Server) ensureAllCertificates() {
+	// Scan for all project directories
+	matches, err := filepath.Glob(s.config.Projects)
 	if err != nil {
-		fmt.Printf("Certificate acquisition failed for %s: %v\n", domain, err)
-		return nil, err
+		fmt.Printf("Failed to scan for projects: %v\n", err)
+		return
 	}
 
-	if cert != nil {
-		fmt.Printf("Certificate ready for %s\n", domain)
+	var domains []string
+	for _, basePath := range matches {
+		entries, err := os.ReadDir(basePath)
+		if err != nil {
+			continue
+		}
+
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+
+			domain := entry.Name()
+			// Validate domain format
+			validDomain := regexp.MustCompile(`^[a-zA-Z0-9.-]+$`)
+			if !validDomain.MatchString(domain) {
+				continue
+			}
+
+			domains = append(domains, domain)
+		}
 	}
 
-	return cert, nil
+	fmt.Printf("Acquiring certificates for %d domains...\n", len(domains))
+
+	// Request certificates for all domains (with rate limiting to avoid Let's Encrypt limits)
+	for i, domain := range domains {
+		// Check if we're already tracking this request
+		s.certRequestsMu.Lock()
+		if s.certRequests[domain] {
+			s.certRequestsMu.Unlock()
+			continue
+		}
+		s.certRequests[domain] = true
+		s.certRequestsMu.Unlock()
+
+		// Use a minimal ClientHello to trigger certificate acquisition
+		hello := &tls.ClientHelloInfo{
+			ServerName: domain,
+		}
+
+		// Time the request to detect if it was cached vs newly acquired
+		start := time.Now()
+		cert, err := s.certManager.GetCertificate(hello)
+		elapsed := time.Since(start)
+
+		s.certRequestsMu.Lock()
+		delete(s.certRequests, domain)
+		s.certRequestsMu.Unlock()
+
+		if err != nil {
+			fmt.Printf("  %s: certificate acquisition failed: %v\n", domain, err)
+		} else if cert != nil {
+			if elapsed < 100*time.Millisecond {
+				// Fast response = cached certificate
+				fmt.Printf("  %s: using cached certificate\n", domain)
+			} else {
+				// Slow response = newly acquired certificate
+				fmt.Printf("  %s: acquired new certificate (took %v)\n", domain, elapsed.Round(time.Millisecond))
+			}
+		}
+
+		// Small delay between requests to serialize them
+		// (autocert already handles caching and won't hit Let's Encrypt if cert exists)
+		if i < len(domains)-1 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	fmt.Printf("Certificate acquisition complete\n")
 }
 
 func (s *Server) approveHost(ctx context.Context, host string) error {
