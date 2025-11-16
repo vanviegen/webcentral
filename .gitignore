@@ -1,5 +1,9 @@
-node_modules
-shrinkwrap.yaml
-pnpm-debug.log
-package-lock.json
-pnpm-lock.yaml
+webcentral
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+.claude
