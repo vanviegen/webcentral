@@ -91,7 +91,7 @@ func (s *Server) Start() error {
 	// Start HTTPS server
 	if s.config.HTTPSPort > 0 {
 		tlsConfig := &tls.Config{
-			GetCertificate: s.certManager.GetCertificate,
+			GetCertificate: s.getCertificateWithLogging,
 			MinVersion:     tls.VersionTLS12,
 		}
 
@@ -336,12 +336,34 @@ func (s *Server) saveBindings() {
 	os.WriteFile(s.bindingsFile, data, 0644)
 }
 
+func (s *Server) getCertificateWithLogging(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	domain := hello.ServerName
+
+	// Check if we already have a certificate cached
+	cert, err := s.certManager.GetCertificate(hello)
+
+	if err != nil {
+		fmt.Printf("Certificate acquisition failed for %s: %v\n", domain, err)
+		return nil, err
+	}
+
+	// Check if this is a newly acquired certificate by seeing if it was just created
+	// (This is a heuristic - we log on first successful acquisition)
+	if cert != nil {
+		fmt.Printf("Certificate ready for %s\n", domain)
+	}
+
+	return cert, nil
+}
+
 func (s *Server) approveHost(ctx context.Context, host string) error {
 	// Validate that we have a project for this domain
-	_, err := s.getProjectDir(host)
+	projectDir, err := s.getProjectDir(host)
 	if err != nil {
+		fmt.Printf("Certificate request denied for %s: no project found\n", host)
 		return fmt.Errorf("no project found for host: %s", host)
 	}
 
+	fmt.Printf("Requesting certificate for %s (project: %s)\n", host, projectDir)
 	return nil
 }

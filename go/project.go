@@ -93,12 +93,27 @@ func GetProject(dir string, useFirejail bool) (*Project, error) {
 
 	projects[dir] = p
 
-	logger.Write("project", fmt.Sprintf("Initialized project: %s", dir))
+	// Log what type of handler this is
+	if p.config.Redirect != "" {
+		logger.Write("", fmt.Sprintf("starting redirect to %s", p.config.Redirect))
+	} else if p.config.Proxy != "" {
+		logger.Write("", fmt.Sprintf("starting proxy for %s", p.config.Proxy))
+	} else if p.config.SocketPath != "" {
+		logger.Write("", fmt.Sprintf("starting forward to socket %s", p.config.SocketPath))
+	} else if p.config.Port > 0 {
+		host := p.config.Host
+		if host == "" {
+			host = "localhost"
+		}
+		logger.Write("", fmt.Sprintf("starting forward to http://%s:%d", host, p.config.Port))
+	} else if p.config.Command == "" && p.config.Docker == nil {
+		logger.Write("", "starting static file server")
+	}
 
 	// Start file watcher if not a static/redirect/proxy/forward without command
 	if p.needsProcessManagement() {
 		if err := p.startFileWatcher(); err != nil {
-			logger.Write("error", fmt.Sprintf("Failed to start file watcher: %v", err))
+			logger.Write("", fmt.Sprintf("Failed to start file watcher: %v", err))
 		}
 
 		if p.config.Reload.Timeout > 0 {
@@ -147,7 +162,7 @@ func (p *Project) Handle(w http.ResponseWriter, r *http.Request) {
 	p.updateActivity()
 
 	if p.config.LogRequests {
-		p.logger.Write("request", fmt.Sprintf("%s %s", r.Method, r.URL.Path))
+		p.logger.Write("", fmt.Sprintf("%s %s", r.Method, r.URL.Path))
 	}
 
 	// Apply URL rewrites
@@ -310,7 +325,7 @@ func (p *Project) handleProxyRemote(w http.ResponseWriter, r *http.Request) {
 			req.Header.Set("X-Forwarded-Proto", getProto(r))
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			p.logger.Write("proxy-error", err.Error())
+			p.logger.Write("", fmt.Sprintf("proxy error: %v", err))
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		},
 	}
@@ -380,14 +395,14 @@ func (p *Project) startProcess() error {
 	}
 	p.activityMu.Unlock()
 
-	p.logger.Write("start", "Starting application")
-
 	// Allocate a free port
 	port, err := getFreePort()
 	if err != nil {
-		p.logger.Write("error", fmt.Sprintf("Failed to allocate port: %v", err))
+		p.logger.Write("", fmt.Sprintf("failed to allocate port: %v", err))
 		return err
 	}
+
+	p.logger.Write("", fmt.Sprintf("starting on port %d", port))
 	p.port = port
 
 	// Build and run the command
@@ -402,7 +417,7 @@ func (p *Project) startProcess() error {
 	}
 
 	if err != nil {
-		p.logger.Write("error", fmt.Sprintf("Failed to build command: %v", err))
+		p.logger.Write("", fmt.Sprintf("failed to build command: %v", err))
 		return err
 	}
 
@@ -431,12 +446,12 @@ func (p *Project) startProcess() error {
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 
-	go p.logOutput(stdout, "stdout")
-	go p.logOutput(stderr, "stderr")
+	go p.logOutput(stdout, "out")
+	go p.logOutput(stderr, "err")
 
 	// Start the process
 	if err := cmd.Start(); err != nil {
-		p.logger.Write("error", fmt.Sprintf("Failed to start process: %v", err))
+		p.logger.Write("", fmt.Sprintf("failed to start process: %v", err))
 		return err
 	}
 
@@ -447,7 +462,7 @@ func (p *Project) startProcess() error {
 		if p.waitForPort(30 * time.Second) {
 			p.onStarted()
 		} else {
-			p.logger.Write("error", "Application failed to start listening on port")
+			p.logger.Write("", "application failed to start listening on port")
 			p.Stop()
 		}
 	}()
@@ -455,7 +470,7 @@ func (p *Project) startProcess() error {
 	// Monitor process exit
 	go func() {
 		cmd.Wait()
-		p.logger.Write("exit", fmt.Sprintf("Process exited with status: %v", cmd.ProcessState))
+		p.logger.Write("", fmt.Sprintf("process exited with code %v", cmd.ProcessState))
 		p.onProcessExit()
 	}()
 
@@ -539,7 +554,7 @@ func (p *Project) buildDockerCommand() (*exec.Cmd, error) {
 	buildCmd := exec.Command("docker", "build", "-t", imageName, "-f", dockerfilePath, p.dir)
 	buildCmd.Dir = p.dir
 	if output, err := buildCmd.CombinedOutput(); err != nil {
-		p.logger.Write("docker-build", string(output))
+		p.logger.Write("build", string(output))
 		return nil, fmt.Errorf("docker build failed: %v", err)
 	}
 
@@ -611,7 +626,7 @@ func (p *Project) waitForPort(timeout time.Duration) bool {
 }
 
 func (p *Project) onStarted() {
-	p.logger.Write("ready", fmt.Sprintf("Application listening on port %d", p.port))
+	p.logger.Write("", fmt.Sprintf("reachable on port %d", p.port))
 
 	// Create reverse proxy
 	target := &url.URL{
@@ -668,7 +683,7 @@ func (p *Project) Stop() {
 	p.stopping = true
 	p.activityMu.Unlock()
 
-	p.logger.Write("stop", "Stopping project")
+	p.logger.Write("", "stopping")
 
 	if p.cancelWatch != nil {
 		p.cancelWatch()
@@ -725,7 +740,7 @@ func (p *Project) checkInactivity() {
 
 		if p.started && time.Since(p.lastActivity) > time.Duration(p.config.Reload.Timeout)*time.Second {
 			p.activityMu.Unlock()
-			p.logger.Write("timeout", "Stopping due to inactivity")
+			p.logger.Write("", "stopping due to inactivity")
 			p.Stop()
 			return
 		}
@@ -793,7 +808,17 @@ func (p *Project) startFileWatcher() error {
 				}
 
 				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove) != 0 {
-					p.logger.Write("reload", fmt.Sprintf("File changed: %s, restarting", event.Name))
+					opType := "change"
+					if event.Op&fsnotify.Create != 0 {
+						opType = "create"
+					} else if event.Op&fsnotify.Remove != 0 {
+						opType = "remove"
+					} else if event.Op&fsnotify.Write != 0 {
+						opType = "change"
+					} else if event.Op&fsnotify.Rename != 0 {
+						opType = "rename"
+					}
+					p.logger.Write("", fmt.Sprintf("stopping due to %s for %s", opType, event.Name))
 					p.Stop()
 					return
 				}
@@ -802,7 +827,7 @@ func (p *Project) startFileWatcher() error {
 				if !ok {
 					return
 				}
-				p.logger.Write("watch-error", err.Error())
+				p.logger.Write("", fmt.Sprintf("file watch error: %v", err))
 
 			case <-ctx.Done():
 				return

@@ -46,26 +46,33 @@ func (l *Logger) Write(topic string, message string) error {
 		}
 	}
 
-	timestamp := time.Now().Format("2006-01-02T15:04:05.000Z07:00")
+	// Format: HH:MM:SS (not full ISO timestamp)
+	timestamp := time.Now().Format("15:04:05")
 
-	var output string
+	// Format message with optional topic
+	var msg string
 	if topic != "" {
-		output = fmt.Sprintf("%s %s\n", timestamp, topic)
+		msg = fmt.Sprintf("[%s] %s", topic, strings.TrimSpace(message))
 	} else {
-		output = fmt.Sprintf("%s\n", timestamp)
+		msg = strings.TrimSpace(message)
 	}
 
-	// Handle multi-line messages with indentation
-	lines := strings.Split(message, "\n")
-	for i, line := range lines {
-		if i == 0 && topic != "" {
-			output += fmt.Sprintf("  %s\n", line)
-		} else if line != "" {
-			output += fmt.Sprintf("  %s\n", line)
-		} else if i < len(lines)-1 {
-			output += "\n"
-		}
+	if msg == "" {
+		return nil
 	}
+
+	// Calculate prefix for multi-line continuation
+	// Prefix is: newline + 9 spaces (for time + space) + topic length with brackets if present
+	prefixLen := 9
+	if topic != "" {
+		prefixLen += len(topic) + 3 // [topic] = topic + 3 chars
+	}
+	prefix := "\n" + strings.Repeat(" ", prefixLen)
+
+	// Replace newlines in message with proper indentation
+	formattedMsg := strings.ReplaceAll(msg, "\n", prefix)
+
+	output := fmt.Sprintf("%s %s\n", timestamp, formattedMsg)
 
 	_, err := l.file.WriteString(output)
 	if err != nil {
