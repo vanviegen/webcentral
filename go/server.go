@@ -68,9 +68,16 @@ func NewServer(config *Config) (*Server, error) {
 func (s *Server) Start() error {
 	// Start HTTP server
 	if s.config.HTTPPort > 0 {
+		var handler http.Handler = http.HandlerFunc(s.handleHTTP)
+
+		// Wrap with autocert HTTP handler for ACME challenges
+		if s.certManager != nil {
+			handler = s.certManager.HTTPHandler(handler)
+		}
+
 		s.httpServer = &http.Server{
 			Addr:    fmt.Sprintf(":%d", s.config.HTTPPort),
-			Handler: http.HandlerFunc(s.handleHTTP),
+			Handler: handler,
 		}
 
 		go func() {
@@ -86,6 +93,13 @@ func (s *Server) Start() error {
 		tlsConfig := &tls.Config{
 			GetCertificate: s.certManager.GetCertificate,
 			MinVersion:     tls.VersionTLS12,
+		}
+
+		// Enable TLS-ALPN-01 challenge support along with standard protocols
+		tlsConfig.NextProtos = []string{
+			acme.ALPNProto, // Enable TLS-ALPN-01 challenge
+			"h2",           // HTTP/2
+			"http/1.1",     // HTTP/1.1
 		}
 
 		s.httpsServer = &http.Server{
@@ -119,12 +133,6 @@ func (s *Server) Stop() {
 }
 
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
-	// Handle ACME challenges
-	if s.certManager != nil && strings.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
-		s.certManager.HTTPHandler(nil).ServeHTTP(w, r)
-		return
-	}
-
 	domain := s.extractDomain(r)
 	if domain == "" {
 		http.Error(w, "Bad Request: Missing Host header", http.StatusBadRequest)
