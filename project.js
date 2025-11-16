@@ -67,17 +67,9 @@ function wildcardsToRegExp(wildcards) {
 
 
 function makePathSync(path, uid) {
+	fs.mkdirSync(path, {recursive: true});
 	if (uid) {
-		let oldEuid = process.geteuid();
-		try {
-			process.seteuid(uid);
-			fs.mkdirSync(path, {recursive: true});
-		} finally {
-			process.seteuid(oldEuid);
-		}
-	}
-	else {
-		fs.mkdirSync(path, {recursive: true});
+		fs.chownSync(path, uid, process.getegid());
 	}
 }
 
@@ -241,11 +233,11 @@ module.exports = class Project {
 
 	handleProxyError(err, req, rsp) {
 		let retry = req.proxy_retry = (req.proxy_retry||0) + 1;
-		if (retry > 10 || req.method!=='GET') {
+		if (retry > 6 || req.method!=='GET') {
 			this.handleError(err, req, rsp);
 		}
 		else {
-			this.logger.write(`retrying after error ${req.method} ${req.url}: ${err}`);
+			this.logger.write(`retrying after error ${req.method} ${req.url}: ${JSON.stringify(err)}`);
 			setTimeout(() => {
 				this.proxy.proxyRequest(req, rsp);
 			}, 500);
@@ -504,11 +496,15 @@ module.exports = class Project {
 	}
 
 	handleError(err,req,rsp) {
-		this.logger.write(`error for ${req.method} ${req.url}: ${err}`);
+		this.logger.write(`error for ${req.method} ${req.url}: ${JSON.stringify(err)}`);
 		this.stop();
-		rsp.writeHead(500, {'Content-Type': 'text/plain'});
-		rsp.write('Webcentral upstream error: '+err);
-		rsp.end();
+		if (rsp && rsp.writeHead) {
+			rsp.writeHead(500, {'Content-Type': 'text/plain'});
+			rsp.write('Webcentral upstream error: '+err);
+			rsp.end();
+		} else {
+			console.error(`error for ${req.method} ${req.url}: ${err.name} ${err.message}, but no response object to reply to`, err.errors);
+		}
 	}
 }
 
