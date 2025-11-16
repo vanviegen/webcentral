@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -30,6 +31,7 @@ type Server struct {
 	certRequestsMu  sync.Mutex
 	approvedHosts   map[string]bool
 	approvedHostsMu sync.RWMutex
+	watcher         *fsnotify.Watcher
 }
 
 func NewServer(config *Config) (*Server, error) {
@@ -75,6 +77,11 @@ func (s *Server) Start() error {
 	// Proactively acquire certificates for all domains
 	if s.certManager != nil {
 		go s.ensureAllCertificates()
+
+		// Watch for new project directories
+		if err := s.watchProjectDirectories(); err != nil {
+			fmt.Printf("Warning: Failed to set up directory watcher: %v\n", err)
+		}
 	}
 
 	// Start HTTP server
@@ -134,12 +141,105 @@ func (s *Server) Stop() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	if s.watcher != nil {
+		s.watcher.Close()
+	}
+
 	if s.httpServer != nil {
 		s.httpServer.Shutdown(ctx)
 	}
 
 	if s.httpsServer != nil {
 		s.httpsServer.Shutdown(ctx)
+	}
+}
+
+func (s *Server) watchProjectDirectories() error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+
+	s.watcher = watcher
+
+	// Find all project base directories and watch them
+	matches, err := filepath.Glob(s.config.Projects)
+	if err != nil {
+		return err
+	}
+
+	for _, basePath := range matches {
+		if err := watcher.Add(basePath); err != nil {
+			fmt.Printf("Warning: Failed to watch %s: %v\n", basePath, err)
+		} else {
+			fmt.Printf("Watching for new projects in %s\n", basePath)
+		}
+	}
+
+	// Start watching in background
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+
+				// Only care about directory creation
+				if event.Op&fsnotify.Create != 0 {
+					// Check if it's a directory
+					if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+						domain := filepath.Base(event.Name)
+
+						// Validate domain format
+						validDomain := regexp.MustCompile(`^[a-zA-Z0-9.-]+$`)
+						if validDomain.MatchString(domain) {
+							fmt.Printf("New project directory detected: %s\n", domain)
+							go s.acquireCertificateForDomain(domain)
+						}
+					}
+				}
+
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				fmt.Printf("Directory watcher error: %v\n", err)
+			}
+		}
+	}()
+
+	return nil
+}
+
+func (s *Server) acquireCertificateForDomain(domain string) {
+	// Check if already being requested
+	s.certRequestsMu.Lock()
+	if s.certRequests[domain] {
+		s.certRequestsMu.Unlock()
+		return
+	}
+	s.certRequests[domain] = true
+	s.certRequestsMu.Unlock()
+
+	// Use a minimal ClientHello to trigger certificate acquisition
+	hello := &tls.ClientHelloInfo{
+		ServerName: domain,
+	}
+
+	fmt.Printf("Acquiring certificate for new domain: %s\n", domain)
+	start := time.Now()
+	cert, err := s.certManager.GetCertificate(hello)
+	elapsed := time.Since(start)
+
+	s.certRequestsMu.Lock()
+	delete(s.certRequests, domain)
+	s.certRequestsMu.Unlock()
+
+	if err != nil {
+		fmt.Printf("  %s: certificate acquisition failed: %v\n", domain, err)
+	} else if cert != nil {
+		fmt.Printf("  %s: acquired certificate (took %v)\n", domain, elapsed.Round(time.Millisecond))
 	}
 }
 
