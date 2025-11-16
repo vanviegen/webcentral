@@ -18,21 +18,27 @@ import (
 )
 
 type Server struct {
-	config       *Config
-	httpServer   *http.Server
-	httpsServer  *http.Server
-	certManager  *autocert.Manager
-	bindings     map[string]string
-	bindingsFile string
-	bindingsMu   sync.RWMutex
-	lastScan     time.Time
+	config          *Config
+	httpServer      *http.Server
+	httpsServer     *http.Server
+	certManager     *autocert.Manager
+	bindings        map[string]string
+	bindingsFile    string
+	bindingsMu      sync.RWMutex
+	lastScan        time.Time
+	certRequests    map[string]bool
+	certRequestsMu  sync.Mutex
+	approvedHosts   map[string]bool
+	approvedHostsMu sync.RWMutex
 }
 
 func NewServer(config *Config) (*Server, error) {
 	s := &Server{
-		config:       config,
-		bindings:     make(map[string]string),
-		bindingsFile: filepath.Join(config.ConfigDir, "bindings.json"),
+		config:        config,
+		bindings:      make(map[string]string),
+		bindingsFile:  filepath.Join(config.ConfigDir, "bindings.json"),
+		certRequests:  make(map[string]bool),
+		approvedHosts: make(map[string]bool),
 	}
 
 	// Set the global projects pattern for cross-project routing
@@ -339,16 +345,28 @@ func (s *Server) saveBindings() {
 func (s *Server) getCertificateWithLogging(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	domain := hello.ServerName
 
-	// Check if we already have a certificate cached
+	// Track if we're already requesting a cert for this domain
+	s.certRequestsMu.Lock()
+	isRequesting := s.certRequests[domain]
+	if !isRequesting {
+		s.certRequests[domain] = true
+		fmt.Printf("Starting certificate acquisition for %s\n", domain)
+	}
+	s.certRequestsMu.Unlock()
+
+	// Get the certificate (autocert handles deduplication internally)
 	cert, err := s.certManager.GetCertificate(hello)
+
+	// Clean up tracking
+	s.certRequestsMu.Lock()
+	delete(s.certRequests, domain)
+	s.certRequestsMu.Unlock()
 
 	if err != nil {
 		fmt.Printf("Certificate acquisition failed for %s: %v\n", domain, err)
 		return nil, err
 	}
 
-	// Check if this is a newly acquired certificate by seeing if it was just created
-	// (This is a heuristic - we log on first successful acquisition)
 	if cert != nil {
 		fmt.Printf("Certificate ready for %s\n", domain)
 	}
@@ -357,12 +375,32 @@ func (s *Server) getCertificateWithLogging(hello *tls.ClientHelloInfo) (*tls.Cer
 }
 
 func (s *Server) approveHost(ctx context.Context, host string) error {
+	// Check if already approved (with read lock first for fast path)
+	s.approvedHostsMu.RLock()
+	if s.approvedHosts[host] {
+		s.approvedHostsMu.RUnlock()
+		return nil
+	}
+	s.approvedHostsMu.RUnlock()
+
+	// Not in cache, validate with write lock
+	s.approvedHostsMu.Lock()
+	defer s.approvedHostsMu.Unlock()
+
+	// Double-check after acquiring write lock
+	if s.approvedHosts[host] {
+		return nil
+	}
+
 	// Validate that we have a project for this domain
 	projectDir, err := s.getProjectDir(host)
 	if err != nil {
 		fmt.Printf("Certificate request denied for %s: no project found\n", host)
 		return fmt.Errorf("no project found for host: %s", host)
 	}
+
+	// Cache the approval
+	s.approvedHosts[host] = true
 
 	fmt.Printf("Requesting certificate for %s (project: %s)\n", host, projectDir)
 	return nil
