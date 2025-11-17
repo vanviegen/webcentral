@@ -168,8 +168,8 @@ func (p *Project) runLifecycle() {
 		p.logger.Write("", fmt.Sprintf("Failed to start file watcher: %v", err))
 	}
 
-	// Inactivity timer only for projects with processes
-	if p.needsProcessManagement() && p.config.Reload.Timeout > 0 {
+	// Inactivity timer for all projects to clean up resources
+	if p.config.Reload.Timeout > 0 {
 		p.startInactivityTimer(s)
 	}
 
@@ -180,15 +180,20 @@ func (p *Project) runLifecycle() {
 			switch s.phase {
 			case "stopped":
 				if e.Type == "start" {
-					s.queue = append(s.queue, *e.Request)
-					if port, err := getFreePort(); err == nil {
-						s.phase, s.port = "starting", port
-						p.logger.Write("", fmt.Sprintf("starting on port %d", port))
-						go p.startProcess(port)
+					s.lastActivity = time.Now()
+					if e.Request != nil {
+						s.queue = append(s.queue, *e.Request)
+						if port, err := getFreePort(); err == nil {
+							s.phase, s.port = "starting", port
+							p.logger.Write("", fmt.Sprintf("starting on port %d", port))
+							go p.startProcess(port)
+						} else {
+							p.logger.Write("", fmt.Sprintf("failed to allocate port: %v", err))
+							p.flushQueue(s.queue, "Failed to allocate port")
+							s.queue = nil
+						}
 					} else {
-						p.logger.Write("", fmt.Sprintf("failed to allocate port: %v", err))
-						p.flushQueue(s.queue, "Failed to allocate port")
-						s.queue = nil
+						s.phase = "running"
 					}
 				}
 
@@ -215,7 +220,9 @@ func (p *Project) runLifecycle() {
 				switch e.Type {
 				case "start":
 					s.lastActivity = time.Now()
-					p.serveRequest(s, *e.Request)
+					if e.Request != nil {
+						p.serveRequest(s, *e.Request)
+					}
 				case "file_changed":
 					p.logger.Write("", fmt.Sprintf("stopping due to change for %s", e.Path))
 					s.phase = "stopping"
@@ -330,6 +337,12 @@ func (p *Project) findProjectByName(name string) (string, error) {
 }
 
 func (p *Project) Handle(w http.ResponseWriter, r *http.Request) {
+	// Track activity for inactivity timeout (non-blocking)
+	select {
+	case p.eventCh <- &Event{Type: "start"}:
+	default:
+	}
+
 	if p.config.LogRequests {
 		p.logger.Write("", fmt.Sprintf("%s %s", r.Method, r.URL.Path))
 	}
@@ -618,7 +631,7 @@ func (p *Project) startWorkers(port int) []*exec.Cmd {
 
 	var workers []*exec.Cmd
 
-	for i, workerCmd := range p.config.Workers {
+	for name, workerCmd := range p.config.Workers {
 		// Build worker command
 		var cmd *exec.Cmd
 
@@ -649,20 +662,20 @@ func (p *Project) startWorkers(port int) []*exec.Cmd {
 			cmd = exec.Command("/bin/sh", "-c", workerCmd)
 		}
 
-		p.setupCommand(cmd, port, fmt.Sprintf("worker-%d", i+1))
+		p.setupCommand(cmd, port, fmt.Sprintf("worker-%s", name))
 
 		if err := cmd.Start(); err != nil {
-			p.logger.Write("", fmt.Sprintf("failed to start worker %d: %v", i+1, err))
+			p.logger.Write("", fmt.Sprintf("failed to start worker %s: %v", name, err))
 			continue
 		}
 
 		workers = append(workers, cmd)
 
 		// Monitor worker exit
-		go func(workerNum int, workerCmd *exec.Cmd) {
+		go func(workerName string, workerCmd *exec.Cmd) {
 			workerCmd.Wait()
-			p.logger.Write("", fmt.Sprintf("worker %d exited with code %v", workerNum, workerCmd.ProcessState))
-		}(i+1, cmd)
+			p.logger.Write("", fmt.Sprintf("worker %s exited with code %v", workerName, workerCmd.ProcessState))
+		}(name, cmd)
 	}
 
 	return workers
@@ -817,9 +830,12 @@ func (p *Project) waitForPort(port int, timeout time.Duration) bool {
 }
 
 func (p *Project) stopProcess(s *projectState) {
+	hasProcess := false
+
 	// Stop workers
 	for i, worker := range s.workers {
 		if worker != nil && worker.Process != nil {
+			hasProcess = true
 			p.logger.Write("", fmt.Sprintf("stopping worker %d", i+1))
 			worker.Process.Signal(syscall.SIGTERM)
 			time.AfterFunc(2*time.Second, func() { worker.Process.Kill() })
@@ -828,11 +844,18 @@ func (p *Project) stopProcess(s *projectState) {
 
 	// Stop main process
 	if s.process != nil && s.process.Process != nil {
+		hasProcess = true
 		s.process.Process.Signal(syscall.SIGTERM)
 		time.AfterFunc(2*time.Second, func() { s.process.Process.Kill() })
 	}
 
-	// Wait a bit then signal completion
+	// Fast-path for non-apps: signal completion immediately
+	if !hasProcess {
+		p.eventCh <- &Event{Type: "stop_complete"}
+		return
+	}
+
+	// Wait a bit then signal completion for apps
 	go func() {
 		time.Sleep(2500 * time.Millisecond)
 		p.eventCh <- &Event{Type: "stop_complete"}

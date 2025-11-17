@@ -197,7 +197,7 @@ type ProjectConfig struct {
 	Dir                      string
 	Command                  string
 	CommandArray             []string
-	Workers                  []string
+	Workers                  map[string]string
 	Port                     int
 	Host                     string
 	SocketPath               string
@@ -234,6 +234,7 @@ func LoadProjectConfig(dir string) (*ProjectConfig, error) {
 		Dir:         dir,
 		Environment: make(map[string]string),
 		Rewrites:    make(map[string]string),
+		Workers:     make(map[string]string),
 	}
 
 	// Try to load webcentral.ini
@@ -249,8 +250,22 @@ func LoadProjectConfig(dir string) (*ProjectConfig, error) {
 			config.Command = cmd
 		}
 
-		// Load workers
-		config.Workers = ini.GetArray("", "worker")
+		// Load workers (support both 'worker' and 'worker:name' syntax)
+		rootSection := ini.GetSection("")
+		for key, val := range rootSection {
+			if key == "worker" {
+				// Un-suffixed form uses 'default' as name
+				if str, ok := val.(string); ok {
+					config.Workers["default"] = str
+				}
+			} else if strings.HasPrefix(key, "worker:") {
+				// Extract name from 'worker:name'
+				name := strings.TrimPrefix(key, "worker:")
+				if str, ok := val.(string); ok {
+					config.Workers[name] = str
+				}
+			}
+		}
 
 		// Load port/host/socket
 		config.Port = ini.GetInt("", "port", 0)
@@ -351,10 +366,12 @@ func LoadProjectConfig(dir string) (*ProjectConfig, error) {
 					config.Command = webCmd
 				}
 
-				// Check for worker processes
+				// Check for worker processes (use numeric names: 0, 1, 2, etc.)
+				workerIndex := 0
 				for processType, cmd := range procfile.Processes {
 					if processType == "worker" || processType == "urgentworker" {
-						config.Workers = append(config.Workers, cmd)
+						config.Workers[strconv.Itoa(workerIndex)] = cmd
+						workerIndex++
 					} else if processType != "web" {
 						config.UnsupportedProcfileTypes = append(config.UnsupportedProcfileTypes, processType)
 					}
