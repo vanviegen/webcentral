@@ -30,32 +30,51 @@ var (
 	projectsPattern string
 )
 
-type Project struct {
-	dir          string
-	config       *ProjectConfig
-	logger       *Logger
+// Event represents all lifecycle events with a single type
+type Event struct {
+	Type    string // "start", "process_started", "ready", "exit", "file_changed", "timeout", "stop_complete", "shutdown"
+	Request *QueuedRequest
+	Process *exec.Cmd
+	Workers []*exec.Cmd
+	Path    string
+	Reason  string
+}
+
+// projectState holds all mutable state for a project (owned by lifecycle goroutine)
+type projectState struct {
+	phase        string // "stopped", "starting", "running", "stopping"
 	process      *exec.Cmd
 	workers      []*exec.Cmd
 	port         int
 	proxy        *httputil.ReverseProxy
-	watcher      *fsnotify.Watcher
 	queue        []QueuedRequest
-	started      bool
-	stopping     bool
 	lastActivity time.Time
-	activityMu   sync.Mutex
-	queueMu      sync.Mutex
-	uid          int
-	gid          int
-	useFirejail  bool
-	pruneLogs    int
 	cancelWatch  context.CancelFunc
+	watcher      *fsnotify.Watcher
+	cancelTimer  context.CancelFunc
+}
+
+// Project represents a single domain/application
+type Project struct {
+	// Immutable configuration (safe to read from any goroutine)
+	dir         string
+	config      *ProjectConfig
+	logger      *Logger
+	uid         int
+	gid         int
+	useFirejail bool
+	pruneLogs   int
+
+	// Lifecycle management (single goroutine owns state)
+	eventCh chan *Event
+	done    chan struct{}
 }
 
 type QueuedRequest struct {
-	w   http.ResponseWriter
-	r   *http.Request
-	ctx context.Context
+	w    http.ResponseWriter
+	r    *http.Request
+	ctx  context.Context
+	done chan struct{} // Signal when request is complete
 }
 
 func SetProjectsPattern(pattern string) {
@@ -84,14 +103,15 @@ func GetProject(dir string, useFirejail bool, pruneLogs int) (*Project, error) {
 	}
 
 	p := &Project{
-		dir:          dir,
-		config:       config,
-		logger:       logger,
-		lastActivity: time.Now(),
-		uid:          uid,
-		gid:          gid,
-		useFirejail:  useFirejail,
-		pruneLogs:    pruneLogs,
+		dir:         dir,
+		config:      config,
+		logger:      logger,
+		uid:         uid,
+		gid:         gid,
+		useFirejail: useFirejail,
+		pruneLogs:   pruneLogs,
+		eventCh:     make(chan *Event, 10),
+		done:        make(chan struct{}),
 	}
 
 	projects[dir] = p
@@ -114,23 +134,12 @@ func GetProject(dir string, useFirejail bool, pruneLogs int) (*Project, error) {
 	}
 
 	// Log unsupported Procfile entries
-	for key := range p.config.Environment {
-		if strings.HasPrefix(key, "_WEBCENTRAL_UNSUPPORTED_PROCFILE_") {
-			processType := strings.TrimPrefix(key, "_WEBCENTRAL_UNSUPPORTED_PROCFILE_")
-			logger.Write("", fmt.Sprintf("Procfile process type '%s' is not supported and will be ignored", processType))
-		}
+	for _, processType := range config.UnsupportedProcfileTypes {
+		logger.Write("", fmt.Sprintf("Procfile process type '%s' is not supported and will be ignored", processType))
 	}
 
-	// Start file watcher if not a static/redirect/proxy/forward without command
-	if p.needsProcessManagement() {
-		if err := p.startFileWatcher(); err != nil {
-			logger.Write("", fmt.Sprintf("Failed to start file watcher: %v", err))
-		}
-
-		if p.config.Reload.Timeout > 0 {
-			go p.checkInactivity()
-		}
-	}
+	// Start lifecycle manager for all projects (even static ones watch for config changes)
+	go p.runLifecycle()
 
 	return p, nil
 }
@@ -147,7 +156,158 @@ func StopAllProjects() {
 func (p *Project) needsProcessManagement() bool {
 	return p.config.Command != "" || p.config.Docker != nil ||
 		(p.config.Redirect == "" && p.config.Proxy == "" &&
-		 p.config.Port == 0 && p.config.SocketPath == "")
+			p.config.Port == 0 && p.config.SocketPath == "")
+}
+
+// runLifecycle is the main lifecycle management goroutine
+func (p *Project) runLifecycle() {
+	s := &projectState{phase: "stopped", lastActivity: time.Now()}
+
+	// Always start file watcher (all projects watch webcentral.ini, apps watch more)
+	if err := p.startFileWatcher(s); err != nil {
+		p.logger.Write("", fmt.Sprintf("Failed to start file watcher: %v", err))
+	}
+
+	// Inactivity timer only for projects with processes
+	if p.needsProcessManagement() && p.config.Reload.Timeout > 0 {
+		p.startInactivityTimer(s)
+	}
+
+	// Event loop with inline state machine
+	for {
+		select {
+		case e := <-p.eventCh:
+			switch s.phase {
+			case "stopped":
+				if e.Type == "start" {
+					s.queue = append(s.queue, *e.Request)
+					if port, err := getFreePort(); err == nil {
+						s.phase, s.port = "starting", port
+						p.logger.Write("", fmt.Sprintf("starting on port %d", port))
+						go p.startProcess(port)
+					} else {
+						p.logger.Write("", fmt.Sprintf("failed to allocate port: %v", err))
+						p.flushQueue(s.queue, "Failed to allocate port")
+						s.queue = nil
+					}
+				}
+
+			case "starting":
+				switch e.Type {
+				case "start":
+					s.queue = append(s.queue, *e.Request)
+				case "process_started":
+					s.process = e.Process
+				case "ready":
+					s.phase, s.workers = "running", e.Workers
+					s.proxy = p.createProxy(s.port)
+					p.logger.Write("", fmt.Sprintf("reachable on port %d", s.port))
+					p.serveQueue(s)
+				case "exit":
+					p.logger.Write("", fmt.Sprintf("process exited during startup: %s", e.Reason))
+					p.flushQueue(s.queue, "Application failed to start")
+					s.phase, s.queue = "stopped", nil
+				case "file_changed":
+					p.logger.Write("", fmt.Sprintf("file changed during startup: %s", e.Path))
+				}
+
+			case "running":
+				switch e.Type {
+				case "start":
+					s.lastActivity = time.Now()
+					p.serveRequest(s, *e.Request)
+				case "file_changed":
+					p.logger.Write("", fmt.Sprintf("stopping due to change for %s", e.Path))
+					s.phase = "stopping"
+					go p.stopProcess(s)
+				case "timeout":
+					if time.Since(s.lastActivity) > time.Duration(p.config.Reload.Timeout)*time.Second {
+						p.logger.Write("", "stopping due to inactivity")
+						s.phase = "stopping"
+						go p.stopProcess(s)
+					}
+				case "exit":
+					p.logger.Write("", fmt.Sprintf("process exited unexpectedly: %s", e.Reason))
+					s.phase, s.proxy = "stopped", nil
+				}
+
+			case "stopping":
+				switch e.Type {
+				case "start":
+					s.queue = append(s.queue, *e.Request)
+				case "stop_complete":
+					s.phase, s.process, s.workers, s.proxy, s.port = "stopped", nil, nil, nil, 0
+					if len(s.queue) > 0 {
+						p.logger.Write("", "restarting due to queued requests")
+						// Re-inject first request to trigger restart
+						p.eventCh <- &Event{Type: "start", Request: &s.queue[0]}
+					}
+				}
+			}
+
+		case <-p.done:
+			p.cleanup(s)
+			return
+		}
+	}
+}
+
+// serveRequest serves a single request using the proxy
+func (p *Project) serveRequest(s *projectState, req QueuedRequest) {
+	defer close(req.done)
+
+	if req.ctx.Err() != nil {
+		return // Request cancelled
+	}
+
+	if s.proxy != nil {
+		s.proxy.ServeHTTP(req.w, req.r)
+	} else {
+		http.Error(req.w, "Service Unavailable", http.StatusServiceUnavailable)
+	}
+}
+
+// Helper functions
+
+func (p *Project) flushQueue(queue []QueuedRequest, errorMsg string) {
+	for _, req := range queue {
+		if req.ctx.Err() == nil {
+			http.Error(req.w, errorMsg, http.StatusServiceUnavailable)
+		}
+		close(req.done)
+	}
+}
+
+func (p *Project) serveQueue(s *projectState) {
+	queue := s.queue
+	s.queue = nil
+	for _, req := range queue {
+		p.serveRequest(s, req)
+	}
+}
+
+func (p *Project) createProxy(port int) *httputil.ReverseProxy {
+	target := &url.URL{
+		Scheme: "http",
+		Host:   fmt.Sprintf("localhost:%d", port),
+	}
+
+	return &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.Header.Set("X-Forwarded-Host", req.Host)
+			proto := getProto(req)
+			req.Header.Set("X-Forwarded-Proto", proto)
+
+			// Special handling for WebSocket
+			if req.Header.Get("Upgrade") == "websocket" {
+				if proto == "https" {
+					req.Header.Set("X-Forwarded-Proto", "http")
+				}
+			}
+		},
+	}
 }
 
 func (p *Project) findProjectByName(name string) (string, error) {
@@ -170,8 +330,6 @@ func (p *Project) findProjectByName(name string) (string, error) {
 }
 
 func (p *Project) Handle(w http.ResponseWriter, r *http.Request) {
-	p.updateActivity()
-
 	if p.config.LogRequests {
 		p.logger.Write("", fmt.Sprintf("%s %s", r.Method, r.URL.Path))
 	}
@@ -371,138 +529,101 @@ func (r *responseRecorder) WriteHeader(code int) {
 }
 
 func (p *Project) handleApplication(w http.ResponseWriter, r *http.Request) {
-	if !p.started {
-		p.queueMu.Lock()
-		if !p.started {
-			p.queue = append(p.queue, QueuedRequest{w, r, r.Context()})
-			p.queueMu.Unlock()
-
-			go p.startProcess()
-
-			select {
-			case <-r.Context().Done():
-				return
-			case <-time.After(60 * time.Second):
-				http.Error(w, "Application startup timeout", http.StatusGatewayTimeout)
-				return
-			}
-		}
-		p.queueMu.Unlock()
-		return
+	done := make(chan struct{})
+	p.eventCh <- &Event{
+		Type:    "start",
+		Request: &QueuedRequest{w: w, r: r, ctx: r.Context(), done: done},
 	}
-
-	if p.proxy != nil {
-		p.proxy.ServeHTTP(w, r)
-	} else {
-		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-	}
+	<-done // Block until request is served
 }
 
-func (p *Project) startProcess() error {
-	p.activityMu.Lock()
-	if p.started || p.stopping {
-		p.activityMu.Unlock()
-		return nil
-	}
-	p.activityMu.Unlock()
-
-	// Allocate a free port
-	port, err := getFreePort()
-	if err != nil {
-		p.logger.Write("", fmt.Sprintf("failed to allocate port: %v", err))
-		return err
-	}
-
-	p.logger.Write("", fmt.Sprintf("starting on port %d", port))
-	p.port = port
-
-	// Build and run the command
-	var cmd *exec.Cmd
-
-	if p.config.Docker != nil {
-		cmd, err = p.buildDockerCommand()
-	} else if p.config.Command != "" {
-		cmd, err = p.buildCommand()
-	} else {
-		cmd, err = p.buildCommand()
-	}
-
-	if err != nil {
-		p.logger.Write("", fmt.Sprintf("failed to build command: %v", err))
-		return err
-	}
-
-	// Set up process environment
+// setupCommand configures a command with environment, dir, uid/gid, and logging
+func (p *Project) setupCommand(cmd *exec.Cmd, port int, label string) {
 	cmd.Env = os.Environ()
-	cmd.Env = append(cmd.Env, fmt.Sprintf("PORT=%d", p.port))
-
+	cmd.Env = append(cmd.Env, fmt.Sprintf("PORT=%d", port))
 	for key, val := range p.config.Environment {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, val))
 	}
 
-	// Set working directory
 	cmd.Dir = p.dir
 
-	// Set UID/GID if running as root
 	if os.Geteuid() == 0 {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Credential: &syscall.Credential{
-				Uid: uint32(p.uid),
-				Gid: uint32(p.gid),
-			},
+			Credential: &syscall.Credential{Uid: uint32(p.uid), Gid: uint32(p.gid)},
 		}
 	}
 
-	// Capture stdout/stderr
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
+	go p.logOutput(stdout, label)
+	go p.logOutput(stderr, label)
+}
 
-	go p.logOutput(stdout, "out")
-	go p.logOutput(stderr, "err")
+func (p *Project) startProcess(port int) {
+	var cmd *exec.Cmd
+	var err error
 
-	// Start the process
-	if err := cmd.Start(); err != nil {
-		p.logger.Write("", fmt.Sprintf("failed to start process: %v", err))
-		return err
+	if p.config.Docker != nil {
+		cmd, err = p.buildDockerCommand(port)
+	} else {
+		cmd, err = p.buildCommand(port)
 	}
 
-	p.process = cmd
+	if err != nil {
+		p.logger.Write("", fmt.Sprintf("failed to build command: %v", err))
+		p.eventCh <- &Event{Type: "exit", Reason: fmt.Sprintf("build failed: %v", err)}
+		return
+	}
 
-	// Wait for the port to become available
-	go func() {
-		if p.waitForPort(30 * time.Second) {
-			p.onStarted()
-			// Start worker processes after main process is ready
-			p.startWorkers()
-		} else {
-			p.logger.Write("", "application failed to start listening on port")
-			p.Stop()
-		}
-	}()
+	p.setupCommand(cmd, port, "out")
+
+	if err := cmd.Start(); err != nil {
+		p.logger.Write("", fmt.Sprintf("failed to start process: %v", err))
+		p.eventCh <- &Event{Type: "exit", Reason: fmt.Sprintf("start failed: %v", err)}
+		return
+	}
+
+	// Send process started event
+	p.eventCh <- &Event{Type: "process_started", Process: cmd}
 
 	// Monitor process exit
 	go func() {
 		cmd.Wait()
-		p.logger.Write("", fmt.Sprintf("process exited with code %v", cmd.ProcessState))
-		p.onProcessExit()
+		reason := "exit code 0"
+		if cmd.ProcessState != nil {
+			reason = fmt.Sprintf("exit code %d", cmd.ProcessState.ExitCode())
+		}
+		p.logger.Write("", fmt.Sprintf("process exited: %s", reason))
+		p.eventCh <- &Event{Type: "exit", Reason: reason}
 	}()
 
-	return nil
+	// Wait for port and start workers
+	go func() {
+		if p.waitForPort(port, 30*time.Second) {
+			workers := p.startWorkers(port)
+			p.eventCh <- &Event{Type: "ready", Workers: workers}
+		} else {
+			p.logger.Write("", "application failed to start listening on port")
+			p.eventCh <- &Event{Type: "exit", Reason: "port timeout"}
+		}
+	}()
 }
 
-func (p *Project) startWorkers() {
+func (p *Project) startWorkers(port int) []*exec.Cmd {
 	if len(p.config.Workers) == 0 {
-		return
+		return nil
 	}
 
 	p.logger.Write("", fmt.Sprintf("starting %d worker(s)", len(p.config.Workers)))
+
+	var workers []*exec.Cmd
 
 	for i, workerCmd := range p.config.Workers {
 		// Build worker command
 		var cmd *exec.Cmd
 
 		// Substitute $PORT in worker command
-		workerCmd = strings.ReplaceAll(workerCmd, "$PORT", strconv.Itoa(p.port))
+		workerCmd = strings.ReplaceAll(workerCmd, "$PORT", strconv.Itoa(port))
 
 		if p.useFirejail && p.config.Docker == nil {
 			homeDir := p.dir
@@ -528,45 +649,14 @@ func (p *Project) startWorkers() {
 			cmd = exec.Command("/bin/sh", "-c", workerCmd)
 		}
 
-		// Set up process environment (same as main process)
-		cmd.Env = os.Environ()
-		cmd.Env = append(cmd.Env, fmt.Sprintf("PORT=%d", p.port))
+		p.setupCommand(cmd, port, fmt.Sprintf("worker-%d", i+1))
 
-		for key, val := range p.config.Environment {
-			// Skip internal tracking variables
-			if !strings.HasPrefix(key, "_WEBCENTRAL_") {
-				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, val))
-			}
-		}
-
-		// Set working directory
-		cmd.Dir = p.dir
-
-		// Set UID/GID if running as root
-		if os.Geteuid() == 0 {
-			cmd.SysProcAttr = &syscall.SysProcAttr{
-				Credential: &syscall.Credential{
-					Uid: uint32(p.uid),
-					Gid: uint32(p.gid),
-				},
-			}
-		}
-
-		// Capture stdout/stderr
-		stdout, _ := cmd.StdoutPipe()
-		stderr, _ := cmd.StderrPipe()
-
-		workerLabel := fmt.Sprintf("worker-%d", i+1)
-		go p.logOutput(stdout, workerLabel)
-		go p.logOutput(stderr, workerLabel)
-
-		// Start the worker
 		if err := cmd.Start(); err != nil {
 			p.logger.Write("", fmt.Sprintf("failed to start worker %d: %v", i+1, err))
 			continue
 		}
 
-		p.workers = append(p.workers, cmd)
+		workers = append(workers, cmd)
 
 		// Monitor worker exit
 		go func(workerNum int, workerCmd *exec.Cmd) {
@@ -574,16 +664,18 @@ func (p *Project) startWorkers() {
 			p.logger.Write("", fmt.Sprintf("worker %d exited with code %v", workerNum, workerCmd.ProcessState))
 		}(i+1, cmd)
 	}
+
+	return workers
 }
 
-func (p *Project) buildCommand() (*exec.Cmd, error) {
+func (p *Project) buildCommand(port int) (*exec.Cmd, error) {
 	command := p.config.Command
 	if command == "" {
 		command = "npm start"
 	}
 
 	// Substitute $PORT
-	command = strings.ReplaceAll(command, "$PORT", strconv.Itoa(p.port))
+	command = strings.ReplaceAll(command, "$PORT", strconv.Itoa(port))
 
 	var cmd *exec.Cmd
 
@@ -614,7 +706,7 @@ func (p *Project) buildCommand() (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-func (p *Project) buildDockerCommand() (*exec.Cmd, error) {
+func (p *Project) buildDockerCommand(port int) (*exec.Cmd, error) {
 	dc := p.config.Docker
 
 	// Generate a unique container name based on directory
@@ -641,7 +733,7 @@ func (p *Project) buildDockerCommand() (*exec.Cmd, error) {
 		}
 	}
 
-	dockerfile += fmt.Sprintf("ENV PORT=%d\n", p.port)
+	dockerfile += fmt.Sprintf("ENV PORT=%d\n", port)
 	dockerfile += fmt.Sprintf("EXPOSE %d\n", dc.HTTPPort)
 
 	// Write Dockerfile to temp location
@@ -661,7 +753,7 @@ func (p *Project) buildDockerCommand() (*exec.Cmd, error) {
 	args := []string{"run", "--rm", "--name", containerName}
 
 	// Port mapping
-	args = append(args, "-p", fmt.Sprintf("%d:%d", p.port, dc.HTTPPort))
+	args = append(args, "-p", fmt.Sprintf("%d:%d", port, dc.HTTPPort))
 
 	// Volume mounts
 	if dc.MountAppDir {
@@ -709,11 +801,11 @@ func (p *Project) logOutput(r io.Reader, source string) {
 	}
 }
 
-func (p *Project) waitForPort(timeout time.Duration) bool {
+func (p *Project) waitForPort(port int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", p.port), 200*time.Millisecond)
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", port), 200*time.Millisecond)
 		if err == nil {
 			conn.Close()
 			return true
@@ -724,158 +816,73 @@ func (p *Project) waitForPort(timeout time.Duration) bool {
 	return false
 }
 
-func (p *Project) onStarted() {
-	p.logger.Write("", fmt.Sprintf("reachable on port %d", p.port))
-
-	// Create reverse proxy
-	target := &url.URL{
-		Scheme: "http",
-		Host:   fmt.Sprintf("localhost:%d", p.port),
-	}
-
-	p.proxy = &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.Header.Set("X-Forwarded-Host", req.Host)
-			proto := getProto(req)
-			req.Header.Set("X-Forwarded-Proto", proto)
-
-			// Special handling for WebSocket
-			if req.Header.Get("Upgrade") == "websocket" {
-				if proto == "https" {
-					req.Header.Set("X-Forwarded-Proto", "http")
-				}
-			}
-		},
-	}
-
-	p.started = true
-
-	// Process queued requests
-	p.queueMu.Lock()
-	queue := p.queue
-	p.queue = nil
-	p.queueMu.Unlock()
-
-	for _, qr := range queue {
-		if qr.ctx.Err() == nil {
-			p.proxy.ServeHTTP(qr.w, qr.r)
-		}
-	}
-}
-
-func (p *Project) onProcessExit() {
-	p.activityMu.Lock()
-	p.started = false
-	p.proxy = nil
-	p.process = nil
-	p.workers = nil
-	p.activityMu.Unlock()
-}
-
-func (p *Project) Stop() {
-	p.activityMu.Lock()
-	if p.stopping {
-		p.activityMu.Unlock()
-		return
-	}
-	p.stopping = true
-	p.activityMu.Unlock()
-
-	p.logger.Write("", "stopping")
-
-	if p.cancelWatch != nil {
-		p.cancelWatch()
-	}
-
-	if p.watcher != nil {
-		p.watcher.Close()
-	}
-
-	// Stop worker processes first
-	for i, worker := range p.workers {
+func (p *Project) stopProcess(s *projectState) {
+	// Stop workers
+	for i, worker := range s.workers {
 		if worker != nil && worker.Process != nil {
 			p.logger.Write("", fmt.Sprintf("stopping worker %d", i+1))
 			worker.Process.Signal(syscall.SIGTERM)
-
-			done := make(chan bool)
-			go func(w *exec.Cmd) {
-				w.Wait()
-				done <- true
-			}(worker)
-
-			select {
-			case <-done:
-			case <-time.After(2 * time.Second):
-				worker.Process.Kill()
-			}
+			time.AfterFunc(2*time.Second, func() { worker.Process.Kill() })
 		}
 	}
 
 	// Stop main process
-	if p.process != nil {
-		p.process.Process.Signal(syscall.SIGTERM)
+	if s.process != nil && s.process.Process != nil {
+		s.process.Process.Signal(syscall.SIGTERM)
+		time.AfterFunc(2*time.Second, func() { s.process.Process.Kill() })
+	}
 
-		done := make(chan bool)
-		go func() {
-			p.process.Wait()
-			done <- true
-		}()
+	// Wait a bit then signal completion
+	go func() {
+		time.Sleep(2500 * time.Millisecond)
+		p.eventCh <- &Event{Type: "stop_complete"}
+	}()
+}
 
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			p.process.Process.Kill()
+func (p *Project) Stop() {
+	select {
+	case p.done <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Project) cleanup(s *projectState) {
+	if s.cancelWatch != nil {
+		s.cancelWatch()
+	}
+	if s.cancelTimer != nil {
+		s.cancelTimer()
+	}
+	if s.watcher != nil {
+		s.watcher.Close()
+	}
+
+	// Stop processes if running
+	if s.phase == "running" || s.phase == "starting" {
+		if s.process != nil && s.process.Process != nil {
+			s.process.Process.Kill()
+		}
+		for _, w := range s.workers {
+			if w != nil && w.Process != nil {
+				w.Process.Kill()
+			}
 		}
 	}
 
 	p.logger.Close()
+
+	projectsMu.Lock()
+	delete(projects, p.dir)
+	projectsMu.Unlock()
 }
 
-func (p *Project) updateActivity() {
-	p.activityMu.Lock()
-	p.lastActivity = time.Now()
-	p.activityMu.Unlock()
-}
-
-func (p *Project) checkInactivity() {
-	if p.config.Reload.Timeout == 0 {
-		return
-	}
-
-	interval := time.Duration(p.config.Reload.Timeout/10) * time.Second
-	if interval < 10*time.Second {
-		interval = 10 * time.Second
-	}
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		p.activityMu.Lock()
-		if p.stopping {
-			p.activityMu.Unlock()
-			return
-		}
-
-		if p.started && time.Since(p.lastActivity) > time.Duration(p.config.Reload.Timeout)*time.Second {
-			p.activityMu.Unlock()
-			p.logger.Write("", "stopping due to inactivity")
-			p.Stop()
-			return
-		}
-		p.activityMu.Unlock()
-	}
-}
-
-func (p *Project) startFileWatcher() error {
+func (p *Project) startFileWatcher(state *projectState) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
 	}
 
-	p.watcher = watcher
+	state.watcher = watcher
 
 	// Add directories to watch
 	includes := p.config.Reload.Include
@@ -891,34 +898,37 @@ func (p *Project) startFileWatcher() error {
 		watcher.Add(iniPath)
 	}
 
-	// Watch directories based on include/exclude patterns
-	filepath.Walk(p.dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-
-		relPath, _ := filepath.Rel(p.dir, path)
-
-		// Check excludes
-		for _, pattern := range excludes {
-			if matched, _ := filepath.Match(pattern, relPath); matched {
-				if info.IsDir() {
-					return filepath.SkipDir
-				}
+	// Only watch other files if this project runs processes
+	if p.needsProcessManagement() {
+		// Watch directories based on include/exclude patterns
+		filepath.Walk(p.dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
 				return nil
 			}
-		}
 
-		if info.IsDir() {
-			watcher.Add(path)
-		}
+			relPath, _ := filepath.Rel(p.dir, path)
 
-		return nil
-	})
+			// Check excludes
+			for _, pattern := range excludes {
+				if matched, _ := filepath.Match(pattern, relPath); matched {
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+			}
+
+			if info.IsDir() {
+				watcher.Add(path)
+			}
+
+			return nil
+		})
+	}
 
 	// Start watching
 	ctx, cancel := context.WithCancel(context.Background())
-	p.cancelWatch = cancel
+	state.cancelWatch = cancel
 
 	go func() {
 		for {
@@ -929,18 +939,7 @@ func (p *Project) startFileWatcher() error {
 				}
 
 				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove) != 0 {
-					opType := "change"
-					if event.Op&fsnotify.Create != 0 {
-						opType = "create"
-					} else if event.Op&fsnotify.Remove != 0 {
-						opType = "remove"
-					} else if event.Op&fsnotify.Write != 0 {
-						opType = "change"
-					} else if event.Op&fsnotify.Rename != 0 {
-						opType = "rename"
-					}
-					p.logger.Write("", fmt.Sprintf("stopping due to %s for %s", opType, event.Name))
-					p.Stop()
+					p.eventCh <- &Event{Type: "file_changed", Path: event.Name}
 					return
 				}
 
@@ -957,6 +956,34 @@ func (p *Project) startFileWatcher() error {
 	}()
 
 	return nil
+}
+
+func (p *Project) startInactivityTimer(state *projectState) {
+	if p.config.Reload.Timeout == 0 {
+		return
+	}
+
+	interval := time.Duration(p.config.Reload.Timeout/10) * time.Second
+	if interval < 10*time.Second {
+		interval = 10 * time.Second
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	state.cancelTimer = cancel
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				p.eventCh <- &Event{Type: "timeout"}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 func getProto(r *http.Request) string {

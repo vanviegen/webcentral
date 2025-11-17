@@ -194,22 +194,23 @@ func ParseProcfile(path string) (*Procfile, error) {
 }
 
 type ProjectConfig struct {
-	Dir          string
-	Command      string
-	CommandArray []string
-	Workers      []string
-	Port         int
-	Host         string
-	SocketPath   string
-	Redirect     string
-	Proxy        string
-	LogRequests  bool
-	RedirectHTTP *bool
-	RedirectHTTPS *bool
-	Environment  map[string]string
-	Docker       *DockerConfig
-	Reload       *ReloadConfig
-	Rewrites     map[string]string
+	Dir                      string
+	Command                  string
+	CommandArray             []string
+	Workers                  []string
+	Port                     int
+	Host                     string
+	SocketPath               string
+	Redirect                 string
+	Proxy                    string
+	LogRequests              bool
+	RedirectHTTP             *bool
+	RedirectHTTPS            *bool
+	Environment              map[string]string
+	Docker                   *DockerConfig
+	Reload                   *ReloadConfig
+	Rewrites                 map[string]string
+	UnsupportedProcfileTypes []string
 }
 
 type DockerConfig struct {
@@ -355,14 +356,7 @@ func LoadProjectConfig(dir string) (*ProjectConfig, error) {
 					if processType == "worker" || processType == "urgentworker" {
 						config.Workers = append(config.Workers, cmd)
 					} else if processType != "web" {
-						// Log unsupported process types (will be logged by project when it starts)
-						// We'll store these to log them later
-						if config.Environment == nil {
-							config.Environment = make(map[string]string)
-						}
-						// Store unsupported types with a special prefix
-						envKey := "_WEBCENTRAL_UNSUPPORTED_PROCFILE_" + processType
-						config.Environment[envKey] = cmd
+						config.UnsupportedProcfileTypes = append(config.UnsupportedProcfileTypes, processType)
 					}
 				}
 			}
