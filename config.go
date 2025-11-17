@@ -152,10 +152,52 @@ func ParsePackageJSON(path string) (*PackageJSON, error) {
 	return &pkg, nil
 }
 
+type Procfile struct {
+	Processes map[string]string
+}
+
+func ParseProcfile(path string) (*Procfile, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	procfile := &Procfile{
+		Processes: make(map[string]string),
+	}
+
+	scanner := bufio.NewScanner(file)
+	lineRegex := regexp.MustCompile(`^([a-zA-Z0-9_]+)\s*:\s*(.+)$`)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse process: command
+		if matches := lineRegex.FindStringSubmatch(line); matches != nil {
+			processType := matches[1]
+			command := matches[2]
+			procfile.Processes[processType] = command
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	return procfile, nil
+}
+
 type ProjectConfig struct {
 	Dir          string
 	Command      string
 	CommandArray []string
+	Workers      []string
 	Port         int
 	Host         string
 	SocketPath   string
@@ -205,6 +247,9 @@ func LoadProjectConfig(dir string) (*ProjectConfig, error) {
 		if cmd, ok := ini.Get("", "command"); ok {
 			config.Command = cmd
 		}
+
+		// Load workers
+		config.Workers = ini.GetArray("", "worker")
 
 		// Load port/host/socket
 		config.Port = ini.GetInt("", "port", 0)
@@ -294,7 +339,37 @@ func LoadProjectConfig(dir string) (*ProjectConfig, error) {
 		}
 	}
 
-	// If no command found, check for package.json
+	// If no command found, check for Procfile
+	if config.Command == "" && config.Docker == nil && config.Port == 0 && config.SocketPath == "" && config.Redirect == "" && config.Proxy == "" {
+		procfilePath := filepath.Join(dir, "Procfile")
+		if _, err := os.Stat(procfilePath); err == nil {
+			procfile, err := ParseProcfile(procfilePath)
+			if err == nil {
+				// Check for 'web' process type
+				if webCmd, ok := procfile.Processes["web"]; ok {
+					config.Command = webCmd
+				}
+
+				// Check for worker processes
+				for processType, cmd := range procfile.Processes {
+					if processType == "worker" || processType == "urgentworker" {
+						config.Workers = append(config.Workers, cmd)
+					} else if processType != "web" {
+						// Log unsupported process types (will be logged by project when it starts)
+						// We'll store these to log them later
+						if config.Environment == nil {
+							config.Environment = make(map[string]string)
+						}
+						// Store unsupported types with a special prefix
+						envKey := "_WEBCENTRAL_UNSUPPORTED_PROCFILE_" + processType
+						config.Environment[envKey] = cmd
+					}
+				}
+			}
+		}
+	}
+
+	// If still no command found, check for package.json
 	if config.Command == "" && config.Docker == nil && config.Port == 0 && config.SocketPath == "" && config.Redirect == "" && config.Proxy == "" {
 		pkgPath := filepath.Join(dir, "package.json")
 		if _, err := os.Stat(pkgPath); err == nil {

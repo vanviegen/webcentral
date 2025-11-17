@@ -35,6 +35,7 @@ type Project struct {
 	config       *ProjectConfig
 	logger       *Logger
 	process      *exec.Cmd
+	workers      []*exec.Cmd
 	port         int
 	proxy        *httputil.ReverseProxy
 	watcher      *fsnotify.Watcher
@@ -110,6 +111,14 @@ func GetProject(dir string, useFirejail bool, pruneLogs int) (*Project, error) {
 		logger.Write("", fmt.Sprintf("starting forward to http://%s:%d", host, p.config.Port))
 	} else if p.config.Command == "" && p.config.Docker == nil {
 		logger.Write("", "starting static file server")
+	}
+
+	// Log unsupported Procfile entries
+	for key := range p.config.Environment {
+		if strings.HasPrefix(key, "_WEBCENTRAL_UNSUPPORTED_PROCFILE_") {
+			processType := strings.TrimPrefix(key, "_WEBCENTRAL_UNSUPPORTED_PROCFILE_")
+			logger.Write("", fmt.Sprintf("Procfile process type '%s' is not supported and will be ignored", processType))
+		}
 	}
 
 	// Start file watcher if not a static/redirect/proxy/forward without command
@@ -463,6 +472,8 @@ func (p *Project) startProcess() error {
 	go func() {
 		if p.waitForPort(30 * time.Second) {
 			p.onStarted()
+			// Start worker processes after main process is ready
+			p.startWorkers()
 		} else {
 			p.logger.Write("", "application failed to start listening on port")
 			p.Stop()
@@ -477,6 +488,92 @@ func (p *Project) startProcess() error {
 	}()
 
 	return nil
+}
+
+func (p *Project) startWorkers() {
+	if len(p.config.Workers) == 0 {
+		return
+	}
+
+	p.logger.Write("", fmt.Sprintf("starting %d worker(s)", len(p.config.Workers)))
+
+	for i, workerCmd := range p.config.Workers {
+		// Build worker command
+		var cmd *exec.Cmd
+
+		// Substitute $PORT in worker command
+		workerCmd = strings.ReplaceAll(workerCmd, "$PORT", strconv.Itoa(p.port))
+
+		if p.useFirejail && p.config.Docker == nil {
+			homeDir := p.dir
+			if os.Geteuid() == 0 {
+				homeDir = getUserHome(p.uid)
+			}
+
+			args := []string{
+				"--quiet",
+				"--noprofile",
+				"--private-tmp",
+				"--private-dev",
+				fmt.Sprintf("--private=%s", homeDir),
+				fmt.Sprintf("--whitelist=%s", p.dir),
+				"--read-only=/",
+				fmt.Sprintf("--read-write=%s", p.dir),
+				"--",
+				"/bin/sh", "-c", workerCmd,
+			}
+
+			cmd = exec.Command("firejail", args...)
+		} else {
+			cmd = exec.Command("/bin/sh", "-c", workerCmd)
+		}
+
+		// Set up process environment (same as main process)
+		cmd.Env = os.Environ()
+		cmd.Env = append(cmd.Env, fmt.Sprintf("PORT=%d", p.port))
+
+		for key, val := range p.config.Environment {
+			// Skip internal tracking variables
+			if !strings.HasPrefix(key, "_WEBCENTRAL_") {
+				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, val))
+			}
+		}
+
+		// Set working directory
+		cmd.Dir = p.dir
+
+		// Set UID/GID if running as root
+		if os.Geteuid() == 0 {
+			cmd.SysProcAttr = &syscall.SysProcAttr{
+				Credential: &syscall.Credential{
+					Uid: uint32(p.uid),
+					Gid: uint32(p.gid),
+				},
+			}
+		}
+
+		// Capture stdout/stderr
+		stdout, _ := cmd.StdoutPipe()
+		stderr, _ := cmd.StderrPipe()
+
+		workerLabel := fmt.Sprintf("worker-%d", i+1)
+		go p.logOutput(stdout, workerLabel)
+		go p.logOutput(stderr, workerLabel)
+
+		// Start the worker
+		if err := cmd.Start(); err != nil {
+			p.logger.Write("", fmt.Sprintf("failed to start worker %d: %v", i+1, err))
+			continue
+		}
+
+		p.workers = append(p.workers, cmd)
+
+		// Monitor worker exit
+		go func(workerNum int, workerCmd *exec.Cmd) {
+			workerCmd.Wait()
+			p.logger.Write("", fmt.Sprintf("worker %d exited with code %v", workerNum, workerCmd.ProcessState))
+		}(i+1, cmd)
+	}
 }
 
 func (p *Project) buildCommand() (*exec.Cmd, error) {
@@ -673,6 +770,7 @@ func (p *Project) onProcessExit() {
 	p.started = false
 	p.proxy = nil
 	p.process = nil
+	p.workers = nil
 	p.activityMu.Unlock()
 }
 
@@ -695,6 +793,27 @@ func (p *Project) Stop() {
 		p.watcher.Close()
 	}
 
+	// Stop worker processes first
+	for i, worker := range p.workers {
+		if worker != nil && worker.Process != nil {
+			p.logger.Write("", fmt.Sprintf("stopping worker %d", i+1))
+			worker.Process.Signal(syscall.SIGTERM)
+
+			done := make(chan bool)
+			go func(w *exec.Cmd) {
+				w.Wait()
+				done <- true
+			}(worker)
+
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				worker.Process.Kill()
+			}
+		}
+	}
+
+	// Stop main process
 	if p.process != nil {
 		p.process.Process.Signal(syscall.SIGTERM)
 

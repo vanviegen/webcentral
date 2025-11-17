@@ -51,6 +51,7 @@ sudo ./webcentral --email you@example.com
 The `email` flag is mandatory, as it's needed for Let’s Encrypt. Alternatively you can disable HTTPS (` ./webcentral -https 0`). See `./webcentral --help` for more options.
 
 Create a directory at `~/webcentral-projects/someapp.yourdomain.com/` with either:
+- A `Procfile` for Heroku-style applications
 - A `package.json` for Node.js apps
 - A `public/` folder for static files
 - A `webcentral.ini` for custom configuration
@@ -86,6 +87,18 @@ Runs a server process in a Firejail sandbox. The process should start an HTTP se
 ```ini
 command = php -S 0.0.0.0:$PORT -file test.php
 ```
+
+**Worker processes:**
+
+You can run background worker processes alongside the main command:
+
+```ini
+command = python app.py --port $PORT
+worker[] = python background_tasks.py
+worker[] = python email_processor.py
+```
+
+Workers share the same lifecycle as the main process and have access to the same environment variables.
 
 ### 2. Dockerized Command
 
@@ -161,13 +174,40 @@ redirect = https://new-service-name.example.com
 proxy = https://www.google.com
 ```
 
-### 6. Node.js Application
+### 6. Procfile Application
 
-**Trigger:** `package.json` exists (no `webcentral.ini` needed)
+**Trigger:** `Procfile` exists (no `webcentral.ini` needed)
+
+Runs applications using Heroku's Procfile format. The `web` process should start an HTTP server on `$PORT`.
+
+**Supported process types:**
+- `web` - Main HTTP server process (required)
+- `worker` - Background worker process (optional, multiple allowed)
+- `urgentworker` - Same as worker (alias)
+
+**Unsupported process types** (will be logged and ignored):
+- `release`, `console`, and other custom types
+
+**Example Procfile:**
+```
+web: python app.py --port $PORT
+worker: python background_tasks.py
+worker: python email_processor.py
+```
+
+**Notes:**
+- All processes share the same environment variables
+- Workers start after the web process is ready
+- Workers are stopped when the application stops
+- All processes run in the same sandbox (Firejail or Docker)
+
+### 7. Node.js Application
+
+**Trigger:** `package.json` exists (no `webcentral.ini` or `Procfile` needed)
 
 Automatically runs `npm start`, which should start an HTTP server on `process.env.PORT`.
 
-### 7. Static Files
+### 8. Static Files
 
 **Trigger:** `public/` directory exists (no `webcentral.ini` needed)
 
