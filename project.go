@@ -133,9 +133,9 @@ func GetProject(dir string, useFirejail bool, pruneLogs int) (*Project, error) {
 		logger.Write("", "starting static file server")
 	}
 
-	// Log unsupported Procfile entries
-	for _, processType := range config.UnsupportedProcfileTypes {
-		logger.Write("", fmt.Sprintf("Procfile process type '%s' is not supported and will be ignored", processType))
+	// Log configuration errors
+	for _, errMsg := range config.ConfigErrors {
+		logger.Write("", errMsg)
 	}
 
 	// Start lifecycle manager for all projects (even static ones watch for config changes)

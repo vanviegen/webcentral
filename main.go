@@ -13,6 +13,7 @@ type Config struct {
 	Email        string
 	Projects     string
 	ConfigDir    string
+	BindingsFile string
 	HTTPSPort    int
 	HTTPPort     int
 	RedirectHTTP bool
@@ -71,6 +72,7 @@ func parseArgs() *Config {
 	email := flag.String("email", os.Getenv("EMAIL"), "Email for LetsEncrypt certificate registration")
 	projects := flag.String("projects", defaultProjects, "Projects directory pattern")
 	configDir := flag.String("config", defaultConfig, "Config and certificate storage directory")
+	bindingsFile := flag.String("bindings-file", "", "Bindings cache file (defaults to <config>/bindings.json)")
 	httpsPort := flag.Int("https", 443, "HTTPS port (0 to disable)")
 	httpPort := flag.Int("http", 80, "HTTP port (0 to disable)")
 
@@ -89,6 +91,7 @@ func parseArgs() *Config {
 	config.Email = *email
 	config.Projects = *projects
 	config.ConfigDir = *configDir
+	config.BindingsFile = *bindingsFile
 	config.HTTPSPort = *httpsPort
 	config.HTTPPort = *httpPort
 	config.RedirectHTTP = *redirectHTTP

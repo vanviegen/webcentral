@@ -35,10 +35,15 @@ type Server struct {
 }
 
 func NewServer(config *Config) (*Server, error) {
+	bindingsFile := config.BindingsFile
+	if bindingsFile == "" {
+		bindingsFile = filepath.Join(config.ConfigDir, "bindings.json")
+	}
+
 	s := &Server{
 		config:        config,
 		bindings:      make(map[string]string),
-		bindingsFile:  filepath.Join(config.ConfigDir, "bindings.json"),
+		bindingsFile:  bindingsFile,
 		certRequests:  make(map[string]bool),
 		approvedHosts: make(map[string]bool),
 	}
@@ -379,8 +384,12 @@ func (s *Server) getProjectDir(domain string) (string, error) {
 	s.bindingsMu.RLock()
 	if time.Since(s.lastScan) < 10*time.Second {
 		if dir, ok := s.bindings[domain]; ok {
-			s.bindingsMu.RUnlock()
-			return dir, nil
+			// Verify directory still exists
+			if _, err := os.Stat(dir); err == nil {
+				s.bindingsMu.RUnlock()
+				return dir, nil
+			}
+			// Directory no longer exists, need to rescan
 		}
 	}
 	s.bindingsMu.RUnlock()
@@ -392,7 +401,12 @@ func (s *Server) getProjectDir(domain string) (string, error) {
 	// Double-check after acquiring write lock
 	if time.Since(s.lastScan) < 10*time.Second {
 		if dir, ok := s.bindings[domain]; ok {
-			return dir, nil
+			// Verify directory still exists
+			if _, err := os.Stat(dir); err == nil {
+				return dir, nil
+			}
+			// Directory no longer exists, remove from cache
+			delete(s.bindings, domain)
 		}
 	}
 
