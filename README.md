@@ -1,152 +1,228 @@
 # Webcentral
 
-Host multiple sandboxed started-on-demand web applications on a single machine. Create a DNS (sub)domain for your application, put it in a directory with the domain as its name, and it's good to go! This is especially convenient when used with a wildcard DNS record, for quickly throwing things online.
+A reverse proxy that runs multiple web applications on a single server. Just put your apps in directories named after their domains (like `myapp.example.com`), point its DNS at the server, and you're done! The apps will start (and shutdown) on-demand, and reload when their files change.
 
-> **Note:** This is a Go reimplementation of the [original Node.js version](https://github.com/vanviegen/webcentral). The rewrite was necessitated by Node.js dependency rot and was AI-generated to ensure accuracy. This version is faster, has a smaller memory footprint, and includes additional features like configurable log retention.
+> **Note:** This is an AI-driven Go reimplementation of the [original Node.js version](https://github.com/vanviegen/webcentral/tree/nodejs). It was born out of Node.js dependency rot frustration.
+
+---
 
 ## Features
 
-Based on directory names that should match the domain of an incoming request, Webcentral will:
+### Per domain request handling
+- Run an executable (that should start serving on $PORT) either from a Docker image or in a Firejail sandbox
+- Port-forward, HTTP-redirect, HTTP-proxy or static-serve requests
+- Config file not always needed (detects `Procfile`, `package.json`, `public/`)
 
-- Start a Node.js application on-demand, within a Firejail sandbox.
-- Run a web service within a trivially easy to configure Docker environment on-demand.
-- Host static files.
-- Proxy requests to some (remote) service, optionally masquerading the original domain.
-- Browser redirect requests.
-- Restart applications without downtime when files are changed, for easy updates.
-- Shut down applications after some period of inactivity.
-- Automatically set up HTTPS using LetsEncrypt, and redirects HTTP requests to HTTPS.
-- Automatically redirect `example.com` to `www.example.com`, or the other way around.
-- Passthrough WebSocket traffic.
-- Run projects on behalf of multiple users, when started as root. Applications run with the user's permissions. The first user to claim a domain will get to keep it.
-- Write application stdout and stderr to rotating log files in the project directory.
-- Rewrite request paths using regular expressions.
+### Application lifecycle
+- On-demand startup when first accessed
+- Zero-downtime application restarts triggered by file changes
+- Automatic shutdown after configurable idle period
+- Daily log per application files with automatic pruning
 
-**Caveats:**
-- Although Firejail and Docker will add a layer of security compared to running random code without a sandbox, the way we're using these from Webcentral has not been scrutinized all that well. Also, Webcentral itself may add additional attack surface. In other words: don't rely on this too much for security.
+### HTTPS & routing
+- Let's Encrypt certificates acquired and renewed automatically
+- Configurable HTTP ↔ HTTPS and www redirects
+- Transparent WebSocket proxying
 
-## Installation
+### Multi-user & isolation
+- When started as root, all local users can host applications (run with their own permissions)
+- Firejail or Docker sandboxing
+- Each application has its own decentralized configuration
 
-Installation should be something along the lines of:
+**Security Notice:** While Firejail and Docker add sandboxing, the integration hasn't been thoroughly audited. Webcentral may introduce additional attack surface. Use appropriate caution.
+
+---
+
+## Quick Start
 
 ```sh
+# Install dependencies
 sudo apt install git firejail docker.io golang
+
+# Build
 git clone https://github.com/vanviegen/webcentral.git
 cd webcentral
-go build -o webcentral
+go build
+
+# Run
+sudo ./webcentral --email you@example.com
 ```
 
-## Usage
+The `email` flag is mandatory, as it's needed for Let’s Encrypt. Alternatively you can disable HTTPS (` ./webcentral -https 0`). See `./webcentral --help` for more options.
 
-`./webcentral --email you@example.com`
+Create a directory at `~/webcentral-projects/someapp.yourdomain.com/` with either:
+- A `package.json` for Node.js apps
+- A `public/` folder for static files
+- A `webcentral.ini` for custom configuration
 
-This will start the Webcentral server, dispatching to projects in the `webcentral-projects` directory in your home directory. If the above command was run as root, the `webcentral-projects` directories of all users will be searched, and projects will be run as their owning users.
+Point DNS for `someapp.yourdomain.com` at your server. Up and running!
 
-The `webcentral-projects` directories should contain subdirectories that have the name of the (sub)domains they are claiming. For instance: `/home/frank/webcentral-projects/example.com/`. Based on the contents, a project can be treated in various ways:
+---
 
-### Project types
+## Non-root vs root usage
 
-1. **Application.** If `webcentral.ini` exists and has a top-level `command` property or `[docker]` section, a server process will be run from within a Firejail sandbox or Docker container. The command is expected to set up an HTTP service on port $PORT (which will be 8000 by default when Docker is used). This shouldn't take too long, as the incoming HTTP request will be stalled until the server is ready.
-    - Firejail is the default option. It allows read-only access to system directories of the host system, such as `/bin` and `/usr`, but doesn't expose files like those in your home directory.
-    - Docker is selected by creating a `[docker]` section in the .ini-file. No files of the host system, except from the project directory itself, will be exposed. Instead, a separate Linux distribution is created for the application. Generally, this will consume more memory and take a bit longer to start than when using Firejail. By default the container will run a pristine Alpine linux image, but options in the `[docker]` section of the .ini-file can be used to change that:
-      - `base` sets the Docker base image to start with.
-      - `commands` is an array of commands used to build the Docker image. Each command can either be a string, which will be executed as a shell command, or an array of strings, which will be executed without involving a shell.
-      - `packages` is an array of packages to install on the base system. This only works on base systems that offer either `apt-get` (Debian/Ubuntu) or `apk` (Alpine) as a means to install them. This is just a shortcut for prepending `commands`.
-      - `mounts` is an array of directories in the context of the Docker container that should be persisted. The directories can be absolute or relative to the Docker workdir (`/app`). In the host system, empty directories that don't exist yet are automatically created in the `_webcentral_data/mounts/` directory. The `/app` directory itself is always mounted, unless `mount_app_dir` is set to `false`.
-      - `http_port` is the TCP port within the container that the HTTP server will be running on. It defaults to 8000.
-      - `app_dir` is the directory with the Docker container to which the host's project directory will be mounted. It defaults to `/app`.
-      - `mount_app_dir` can be set to `false` in order to prevent the host's project directory from being mounted.
+When run as a regular user, by default Webcentral searches `~/webcentral-projects/` for project directories. When run as root, it searches all users' `webcentral-projects` directories by default and runs each project with its owner's permissions. This allows multiple users to share the precious ports 80 and 443, without having to give them privileged access to the server.
 
-    Example `webcentral.ini` using PHP from the host system:
-    ```ini
-    command = php -S 0.0.0.0:$PORT -file test.php
-    ```
+If you want to run WebCentral as a regular user while still being able to bind to privileged ports, run `sudo setcap 'cap_net_bind_service=+ep' ./webcentral` once.
 
-    And using PHP from a Docker image:
-    ```ini
-    command = php -S 0.0.0.0:$PORT -file test.php
-    [docker]
-    base = debian
-    packages[] = php
-    packages[] = composer
-    commands[] = composer install
-    ```
+---
 
-    Or to just run the default command of a Docker image:
-    ```ini
-    [docker]
-    base = some-docker-image:version
-    ```
+## Request Handling
 
-    A real-world example for setting up a Trilium Notes server:
-    ```ini
-    command = node /usr/src/app/src/www
-    [docker]
-    base = zadam/trilium:0.47.6
-    http_port = 8080
-    ```
-2. **Forward.** Otherwise, when the .ini-file has a top-level `port` or `socket_path` property, requests will be forwarded to this port or UNIX domain socket, without modifying the `Host:` header. When used with `port`, the `host` property can specify a host name or ip address to use -- it defaults to localhost.
-    ```ini
-    port = 3000
-    host = 192.168.10.20
-    ```
-    Or
-    ```ini
-    socket_path = /my/path/test.socket
-    ```
-3. **Redirect.** If `webcentral.ini` exists and has a top-level `redirect` property, all requests will receive an HTTP 301 redirect to the URL given in that property, concatenated with the path and query string of the request.
-    ```ini
-    redirect = https://new-service-name.example.com
-    ```
-4. **Proxy.** (Experimental!) If `webcentral.ini` exists and has a top-level `proxy` property containing a URL, requests will be proxied to that URL. This is similar to forwarding, except that proxying is not visible to the target host as headers such as `Host:` are rewritten.
-    ```ini
-    proxy = https://www.google.com
-    ```
-5. **Node.js application.** If `package.json` exists in the project directory, the project is assumed to be an *Application* and the command is set to `npm start`. This allows hosting Node.js projects without even having a `webcentral.ini` file.
-   - `npm start` within the project directory should bring up an HTTP server on port `process.env.PORT`. This shouldn't take too long, as the HTTP client will be kept waiting.
-6. **Static server.** In other cases, everything under `public/` in the project directory will be **served statically** as just a bunch of files.
+Projects are automatically detected based on their contents:
 
-### Reloading
+### 1. Firejailed Command
 
-Applications will be automatically shut down when...
-1. The service has been inactive for 5 minutes. This period can be overridden or disabled using the `timeout` property in the `[reload]` section of the `webcentral.ini`. It indicates the time in seconds. Zero disables inactivity shutdown.
-2. When any of the files in the application directory change. By default, the following file patterns are excluded from this:
-   - `_webcentral_data` (A file or directory with this name in the root of the project directory.)
-   - `data`
-   - `log`
-   - `logs`
-   - `home`
-   - `node_modules`
-   - `**/*.log` (A file or directory with a name ending in *.log* in the root directory or any subdirectory.)
-   - `**/.*` (Hidden files.)
-   This behaviour can be overriden using the `include` and `exclude` properties in the `[reload]` section of `webcentral.ini`. Both can be string arrays containing patterns like the above. Exclusion always overrules inclusion. When `include` is not set, everything will be included by default. Even when `include` is manually set, `webcentral.ini` will always be added to it automatically, to make sure errors can be corrected. Similarly, `exclude` will always have `_webcentral_data` appended to it, because it makes little sense to reload for log messages written by Webcentral or data modified by the app.
-   ```ini
-   command = ./start.sh --production
-   [reload]
-   timeout = 0 ; Disable inactivity shutdown
-   include[] = src ; Reload for changes in src/ directory
-   include[] = config.yaml ; And for changes to this file
-   exclude[] = src/build ; But ignore the build directory
-   exclude[] = **/*.bak ; And ignore any .bak file
-   ```
+**Trigger:** `webcentral.ini` with `command` property (without `[docker]` section)
 
-### Rewrites (Experimental!)
+Runs a server process in a Firejail sandbox. The process should start an HTTP server on `$PORT`.
 
-Request paths can be rewritten before they are handled. To do that, create a `[rewrite]` section in the `webcentral.ini` of a project. Its keys and values will be applied in order as regular expressions and their replacement values. A regular expression must match the entire path string. The replacement string can use `$1`, `$2` etc to captured expressions. After a match, any further replacement rules are skipped.
+**Firejail sandboxing:**
+- Read-only access to system directories (`/bin`, `/usr`)
+- No access to home directories or other user files
+- Faster startup, lower memory usage
 
-In case a replacement results in a path that matches `webcentral://<NAME>/<PATH>`, the request will be handed of to a Webcentral project named `<NAME>`, giving it `/<PATH>` as its request path. The `<NAME>` of that Webcentral project does not need to resolve to this host in DNS.
+**Example:**
+```ini
+command = php -S 0.0.0.0:$PORT -file test.php
+```
+
+### 2. Dockerized Command
+
+**Trigger:** `webcentral.ini` with `command` property and `[docker]` section
+
+Runs a server process in a Docker container. The process should start an HTTP server on `$PORT` (defaults to 8000).
+
+**Docker containerization:**
+- Completely isolated environment
+- Higher memory usage, slower startup
+- More configuration options
+
+**Example:**
+```ini
+command = php -S 0.0.0.0:$PORT -file test.php
+[docker]
+base = debian
+packages[] = php
+packages[] = composer
+commands[] = composer install
+```
+
+**Docker Configuration Options:**
+- `base` - Base Docker image (default: `alpine`)
+- `commands` - Build commands (strings or arrays)
+- `packages` - Packages to install via `apt-get` or `apk`
+- `mounts` - Persistent directories (stored in `_webcentral_data/mounts/`)
+- `http_port` - Container HTTP port (default: 8000)
+- `app_dir` - Mount point for project directory (default: `/app`)
+- `mount_app_dir` - Set to `false` to skip mounting project directory
+
+**Real-world example (Trilium Notes):**
+```ini
+command = node /usr/src/app/src/www
+[docker]
+base = zadam/trilium:0.47.6
+http_port = 8080
+```
+
+### 3. Forward
+
+**Trigger:** `webcentral.ini` with `port` or `socket_path` property
+
+Forwards requests to a local port or UNIX socket without modifying the `Host:` header.
+
+```ini
+port = 3000
+host = 192.168.10.20
+```
+
+Or:
+```ini
+socket_path = /my/path/test.socket
+```
+
+### 4. Redirect
+
+**Trigger:** `webcentral.ini` with `redirect` property
+
+Returns HTTP 301 redirect to the specified URL plus the request path and query string.
+
+```ini
+redirect = https://new-service-name.example.com
+```
+
+### 5. Proxy
+
+**Trigger:** `webcentral.ini` with `proxy` property
+
+**(Experimental!)** Proxies requests to a remote URL with header rewriting (unlike Forward).
+
+```ini
+proxy = https://www.google.com
+```
+
+### 6. Node.js Application
+
+**Trigger:** `package.json` exists (no `webcentral.ini` needed)
+
+Automatically runs `npm start`, which should start an HTTP server on `process.env.PORT`.
+
+### 7. Static Files
+
+**Trigger:** `public/` directory exists (no `webcentral.ini` needed)
+
+Serves files from the `public/` directory.
+
+---
+
+## Configuration
+
+### Auto-Reload
+
+Applications automatically reload when:
+
+1. **Files change** - Watches for changes in the project directory
+2. **After inactivity** - Default 5 minutes of no requests
+
+**Default exclusions** (not watched for changes):
+- `_webcentral_data`, `data`, `log`, `logs`, `home`
+- `node_modules`
+- `**/*.log`
+- `**/.*` (hidden files)
+
+**Custom reload configuration:**
+```ini
+command = ./start.sh --production
+[reload]
+timeout = 0                ; Disable inactivity shutdown (seconds)
+include[] = src            ; Only watch src/ directory
+include[] = config.yaml    ; And this file
+exclude[] = src/build      ; Ignore build directory
+exclude[] = **/*.bak       ; Ignore .bak files
+```
+
+Note: `webcentral.ini` is always watched, and `_webcentral_data` is always excluded.
+
+### URL Rewrites
+
+**(Experimental!)** Rewrite request paths using regular expressions.
 
 ```ini
 [rewrite]
-/api/(.*) = webcentral://my-api/$1 ; let these requests be handled by a Webcentral service named my-api
-/blog/(.*?)/.* = /articles/$1.html ; ignore the verbose title in the URL and add .html to find the static article file
-/favicon.ico = /favicon.ico ; make sure the following rule does not apply for favicons
-/[^/]* = /index.html ; any other top-level paths are redirect to index.html
+/api/(.*) = webcentral://my-api/$1              ; Route to another project
+/blog/(.*?)/.* = /articles/$1.html              ; Simplify URLs
+/favicon.ico = /favicon.ico                     ; Passthrough
+/[^/]* = /index.html                            ; Catch-all to index.html
 ```
 
-### Environment variables
+Rules are applied in order. First match wins. Use `$1`, `$2`, etc. for captures.
 
-All properties in the `[environment]` section are set as environment variables for the web server command that will be executed. For example:
+The special `webcentral://<project>/<path>` syntax routes requests to other projects by directory name (DNS not required).
+
+### Environment Variables
+
+Set environment variables for your application:
+
 ```ini
 [docker]
 base = bitwardenrs/server:alpine
@@ -157,45 +233,54 @@ ROCKET_PORT = 8000
 WEB_VAULT_ENABLED = true
 ```
 
-### Redirect http/https
+### HTTP/HTTPS Redirects
 
-Requests can be redirected from http to https, or the other way around. This can be configured through the `redirect_http` and `redirect_https` boolean properties. The former has a default value that can be set using `--redirect-http` command line argument. The latter defaults to `false`.
+Control protocol redirects per-project:
 
-This example redirects https traffic to http:
 ```ini
-redirect_http = false
-redirect_https = true
+redirect_http = false      ; Don't redirect HTTP to HTTPS
+redirect_https = true      ; Redirect HTTPS to HTTP
 ```
 
-## Options
+Defaults: `redirect_http = true`, `redirect_https = false` (configurable via `--redirect-http`)
 
-| Option | Description |
-| --- | --- |
-| `--email=EMAIL` | Set the email address used for LetsEncrypt to `EMAIL`. Defaults to the $EMAIL environment variable. An email address is required, unless `--https=0`. |
-| `--projects=DIR` | Search for projects in DIR, where `DIR` can be a `glob` expression. Projects need to be directories (containing a `package.json` file), named exactly like the domain they are serving. Defaults to `/home/*/webcentral-projects` when run as root, or to `$HOME/webcentral-projects` otherwise. |
-| `--config=DIR` | Directory where domain to directory mappings and LetsEncrypt config are stored. Defaults to `/var/lib/webcentral` when run as root, or to `$HOME/.webcentral` otherwise. |
-| `--https=PORT` | Run the HTTPS server on TCP port `PORT`. Defaults to 443. Set to 0 to disable HTTPS. |
-| `--http=PORT` | Run the HTTP server on TCP port `PORT`. Defaults to 80. Set to 0 to disable HTTP. |
-| `--redirect-http=BOOL` | When `true` (as it is by default) and both `http` and `https` are not 0, incoming HTTP requests will be redirected to HTTPS. When set to `false`, requests are handled on both HTTP and HTTPS. This behaviour can be overriden by individual projects. |
-| `--redirect-www=BOOL` | When `true` (as it is by default), "www.example.com" will be redirected to "example.com" if the former doesn't exist but the latter does, and vice versa. |
-| `--firejail=BOOL` | Set to `false` to disable the use of Firejail containing processes. This is bad for security and may cause process leaks. Defaults to `true`. |
-| `--prune-logs=DAYS` | Number of days to keep log files. Log files older than this will be automatically deleted when a new log file is created. Defaults to 28 days. Set to 0 to disable automatic log pruning. |
-| `--acme-url=URL` | Use the given ACME directory URL. Defaults to using Let's Encrypt: `https://acme-v02.api.letsencrypt.org/directory`. BuyPass is also known to work: `https://api.buypass.com/acme/directory`. |
-| `--acme-version=VER` | Try to use the given ACME protocol version. Defaults to `draft-11`. |
+### Request Logging
 
-## Log files
-
-Output of (and about) client projects is written to `_webcentral_data/log/<DATE>.log` in the project directory. Log files are automatically pruned based on the `--prune-logs` setting (default: 28 days).
-
-Projects can enable request logging by setting the following property in `webcentral.ini`:
+Enable per-project request logging:
 
 ```ini
 log_requests = true
 ```
 
-## Starting from systemd
+---
 
-Create a file named `/etc/systemd/system/webcentral.service` containing:
+## Command-Line Options
+
+| Option | Description |
+|--------|-------------|
+| `--email=EMAIL` | Email for Let's Encrypt. Required unless `--https=0`. |
+| `--projects=DIR` | Project directory glob. Default: `/home/*/webcentral-projects` (root) or `$HOME/webcentral-projects` (user). |
+| `--config=DIR` | Config storage directory. Default: `/var/lib/webcentral` (root) or `$HOME/.webcentral` (user). |
+| `--https=PORT` | HTTPS port. Default: `443`. Set to `0` to disable. |
+| `--http=PORT` | HTTP port. Default: `80`. Set to `0` to disable. |
+| `--redirect-http=BOOL` | Redirect HTTP to HTTPS. Default: `true`. |
+| `--redirect-www=BOOL` | Auto-redirect between `example.com` and `www.example.com`. Default: `true`. |
+| `--firejail=BOOL` | Enable Firejail sandboxing. Default: `true`. (Disabling risks security and process leaks.) |
+| `--prune-logs=DAYS` | Days to keep log files. Default: `28`. Set to `0` to disable pruning. |
+| `--acme-url=URL` | ACME directory URL. Default: Let's Encrypt (`https://acme-v02.api.letsencrypt.org/directory`). |
+| `--acme-version=VER` | ACME protocol version. Default: `draft-11`. |
+
+---
+
+## Log Files
+
+Application output is written to `_webcentral_data/log/<DATE>.log` in each project directory. Logs rotate daily and are automatically pruned after 28 days (configurable via `--prune-logs`).
+
+---
+
+## Running with systemd
+
+Create `/etc/systemd/system/webcentral.service`:
 
 ```ini
 [Service]
@@ -206,47 +291,51 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-To start the service:
+Start the service:
 
 ```sh
 sudo systemctl daemon-reload
 sudo systemctl start webcentral
+sudo systemctl enable webcentral  # Start on boot
 ```
 
-To have the service start after reboots:
-
-```sh
-sudo systemctl enable webcentral
-```
-
-Make sure no other servers are already running on port 80 or 443. To see any non-project-specific problems:
+Check status:
 
 ```sh
 sudo systemctl status webcentral -n 20
 ```
 
+Make sure no other services are using ports 80 or 443.
+
+---
+
 ## Differences from Node.js Version
 
-This Go implementation offers several improvements:
+The Go implementation provides:
 
-- **Single static binary** - No Node.js runtime or npm dependencies required
-- **Better performance** - Lower memory usage and faster startup
-- **Improved concurrency** - Native goroutines handle requests more efficiently
-- **Additional features**:
-  - Configurable log retention via `--prune-logs`
-  - Proactive certificate acquisition for new project directories
-  - Better prevention of duplicate certificate requests
+- **Single static binary** - No runtime dependencies or npm packages
+- **Better performance** - Lower memory footprint and faster startup
+- **Native concurrency** - Goroutines handle requests more efficiently
+- **Enhanced features:**
+  - Configurable log retention (`--prune-logs`)
+  - Proactive certificate acquisition for new projects
 
-The Go version maintains full compatibility with the Node.js version's configuration format and project structure.
+Fully compatible with the Node.js version's configuration format and project structure.
+
+---
 
 ## Dependencies
 
-The Go version requires only:
-- Go 1.16+ for building
-- Firejail (optional, for sandboxing)
-- Docker (optional, for containerized applications)
+**Build time:**
+- Go 1.16 or later
 
-No runtime dependencies - just a single static binary.
+**Runtime (optional):**
+- Firejail (for sandboxing)
+- Docker (for containerized applications)
+
+The compiled binary is self-contained with no runtime dependencies.
+
+---
 
 ## License
 
