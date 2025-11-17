@@ -177,30 +177,33 @@ func (p *Project) runLifecycle() {
 	for {
 		select {
 		case e := <-p.eventCh:
-			switch s.phase {
-			case "stopped":
+
+			if s.phase == "stopped" {
 				if e.Type == "start" {
 					s.lastActivity = time.Now()
-					if e.Request != nil {
-						s.queue = append(s.queue, *e.Request)
+					if p.needsProcessManagement() {
 						if port, err := getFreePort(); err == nil {
 							s.phase, s.port = "starting", port
 							p.logger.Write("", fmt.Sprintf("starting on port %d", port))
 							go p.startProcess(port)
+							// Adding to queue happens in 'starting' phase
 						} else {
 							p.logger.Write("", fmt.Sprintf("failed to allocate port: %v", err))
-							p.flushQueue(s.queue, "Failed to allocate port")
-							s.queue = nil
+							http.Error(e.Request.w, "Failed to allocate port", http.StatusServiceUnavailable)
+							close(e.Request.done)
 						}
 					} else {
 						s.phase = "running"
 					}
 				}
+			}
 
-			case "starting":
+			if s.phase == "starting" {
 				switch e.Type {
 				case "start":
-					s.queue = append(s.queue, *e.Request)
+					if e.Request != nil {
+						s.queue = append(s.queue, *e.Request)
+					}
 				case "process_started":
 					s.process = e.Process
 				case "ready":
@@ -215,8 +218,9 @@ func (p *Project) runLifecycle() {
 				case "file_changed":
 					p.logger.Write("", fmt.Sprintf("file changed during startup: %s", e.Path))
 				}
+			}
 
-			case "running":
+			if s.phase == "running" {
 				switch e.Type {
 				case "start":
 					s.lastActivity = time.Now()
@@ -237,8 +241,9 @@ func (p *Project) runLifecycle() {
 					p.logger.Write("", fmt.Sprintf("process exited unexpectedly: %s", e.Reason))
 					s.phase, s.proxy = "stopped", nil
 				}
+			}
 
-			case "stopping":
+			if s.phase == "stopping" {
 				switch e.Type {
 				case "start":
 					s.queue = append(s.queue, *e.Request)
@@ -251,7 +256,7 @@ func (p *Project) runLifecycle() {
 					}
 				}
 			}
-
+		
 		case <-p.done:
 			p.cleanup(s)
 			return

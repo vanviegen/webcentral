@@ -79,6 +79,7 @@ func ParseINI(path string) (*INIConfig, error) {
 func (c *INIConfig) Get(section, key string) (string, bool) {
 	if sec, ok := c.sections[section]; ok {
 		if val, ok := sec[key]; ok {
+			delete(sec, key) // Remove key as it's consumed
 			if str, ok := val.(string); ok {
 				return str, true
 			}
@@ -90,6 +91,7 @@ func (c *INIConfig) Get(section, key string) (string, bool) {
 func (c *INIConfig) GetArray(section, key string) []string {
 	if sec, ok := c.sections[section]; ok {
 		if val, ok := sec[key]; ok {
+			delete(sec, key) // Remove key as it's consumed
 			if arr, ok := val.([]string); ok {
 				return arr
 			}
@@ -246,92 +248,78 @@ func LoadProjectConfig(dir string) (*ProjectConfig, error) {
 		}
 
 		// Load root section
-		rootSection := ini.GetSection("")
-		validRootKeys := map[string]bool{}
-
 		if cmd, ok := ini.Get("", "command"); ok {
 			config.Command = cmd
-			validRootKeys["command"] = true
 		}
 
 		// Load workers (support both 'worker' and 'worker:name' syntax)
-		for key, val := range rootSection {
-			if key == "worker" {
-				if str, ok := val.(string); ok {
-					config.Workers["default"] = str
-					validRootKeys[key] = true
-				}
-			} else if strings.HasPrefix(key, "worker:") {
-				name := strings.TrimPrefix(key, "worker:")
-				if str, ok := val.(string); ok {
-					config.Workers[name] = str
-					validRootKeys[key] = true
+		// Need to get list of worker keys first since Get() modifies the map
+		rootSection := ini.GetSection("")
+		var workerKeys []string
+		for key := range rootSection {
+			if key == "worker" || strings.HasPrefix(key, "worker:") {
+				workerKeys = append(workerKeys, key)
+			}
+		}
+		for _, key := range workerKeys {
+			if val, ok := ini.Get("", key); ok {
+				if key == "worker" {
+					config.Workers["default"] = val
+				} else {
+					name := strings.TrimPrefix(key, "worker:")
+					config.Workers[name] = val
 				}
 			}
 		}
 
 		config.Port = ini.GetInt("", "port", 0)
-		if config.Port != 0 {
-			validRootKeys["port"] = true
-		}
 
 		if host, ok := ini.Get("", "host"); ok {
 			config.Host = host
-			validRootKeys["host"] = true
 		} else {
 			config.Host = "localhost"
 		}
 
 		if socketPath, ok := ini.Get("", "socket_path"); ok {
 			config.SocketPath = socketPath
-			validRootKeys["socket_path"] = true
 		}
 
 		if redirect, ok := ini.Get("", "redirect"); ok {
 			config.Redirect = redirect
-			validRootKeys["redirect"] = true
 		}
 		if proxy, ok := ini.Get("", "proxy"); ok {
 			config.Proxy = proxy
-			validRootKeys["proxy"] = true
 		}
 
 		config.LogRequests = ini.GetBool("", "log_requests", false)
-		if config.LogRequests {
-			validRootKeys["log_requests"] = true
-		}
 
-		if _, ok := ini.Get("", "redirect_http"); ok {
-			b := ini.GetBool("", "redirect_http", false)
+		if val, ok := ini.Get("", "redirect_http"); ok {
+			b := val == "true" || val == "1" || val == "yes"
 			config.RedirectHTTP = &b
-			validRootKeys["redirect_http"] = true
 		}
-		if _, ok := ini.Get("", "redirect_https"); ok {
-			b := ini.GetBool("", "redirect_https", false)
+		if val, ok := ini.Get("", "redirect_https"); ok {
+			b := val == "true" || val == "1" || val == "yes"
 			config.RedirectHTTPS = &b
-			validRootKeys["redirect_https"] = true
 		}
 
-		// Validate root section keys
-		for key := range rootSection {
-			if !validRootKeys[key] {
-				config.ConfigErrors = append(config.ConfigErrors, "Unknown key '"+key+"' in root section")
-			}
+		// Validate root section - anything left is unknown
+		for key := range ini.GetSection("") {
+			config.ConfigErrors = append(config.ConfigErrors, "Unknown key '"+key+"' in root section")
 		}
 
-		// Load environment variables
-		envSection := ini.GetSection("environment")
-		for key, val := range envSection {
-			if str, ok := val.(string); ok {
-				config.Environment[key] = str
+		// Load environment variables (all keys are valid, consume them all)
+		var envKeys []string
+		for key := range ini.GetSection("environment") {
+			envKeys = append(envKeys, key)
+		}
+		for _, key := range envKeys {
+			if val, ok := ini.Get("environment", key); ok {
+				config.Environment[key] = val
 			}
 		}
 
 		// Load Docker configuration
 		if ini.HasSection("docker") {
-			dockerSection := ini.GetSection("docker")
-			validDockerKeys := map[string]bool{}
-
 			dockerConfig := &DockerConfig{
 				Base:        "alpine",
 				HTTPPort:    8000,
@@ -341,40 +329,21 @@ func LoadProjectConfig(dir string) (*ProjectConfig, error) {
 
 			if base, ok := ini.Get("docker", "base"); ok {
 				dockerConfig.Base = base
-				validDockerKeys["base"] = true
 			}
-			if packages := ini.GetArray("docker", "packages"); packages != nil {
-				dockerConfig.Packages = packages
-				validDockerKeys["packages"] = true
-			}
-			if commands := ini.GetArray("docker", "commands"); commands != nil {
-				dockerConfig.Commands = commands
-				validDockerKeys["commands"] = true
-			}
+			dockerConfig.Packages = ini.GetArray("docker", "packages")
+			dockerConfig.Commands = ini.GetArray("docker", "commands")
 			dockerConfig.HTTPPort = ini.GetInt("docker", "http_port", 8000)
-			if dockerConfig.HTTPPort != 8000 {
-				validDockerKeys["http_port"] = true
-			}
 			if appDir, ok := ini.Get("docker", "app_dir"); ok {
 				dockerConfig.AppDir = appDir
-				validDockerKeys["app_dir"] = true
 			}
 			dockerConfig.MountAppDir = ini.GetBool("docker", "mount_app_dir", true)
-			if !dockerConfig.MountAppDir {
-				validDockerKeys["mount_app_dir"] = true
-			}
-			if mounts := ini.GetArray("docker", "mounts"); mounts != nil {
-				dockerConfig.Mounts = mounts
-				validDockerKeys["mounts"] = true
-			}
+			dockerConfig.Mounts = ini.GetArray("docker", "mounts")
 
 			config.Docker = dockerConfig
 
-			// Validate docker section keys
-			for key := range dockerSection {
-				if !validDockerKeys[key] {
-					config.ConfigErrors = append(config.ConfigErrors, "Unknown key '"+key+"' in [docker] section")
-				}
+			// Validate docker section - anything left is unknown
+			for key := range ini.GetSection("docker") {
+				config.ConfigErrors = append(config.ConfigErrors, "Unknown key '"+key+"' in [docker] section")
 			}
 		}
 
@@ -383,43 +352,32 @@ func LoadProjectConfig(dir string) (*ProjectConfig, error) {
 			Timeout: 300,
 		}
 		if ini.HasSection("reload") {
-			reloadSection := ini.GetSection("reload")
-			validReloadKeys := map[string]bool{}
-
 			reloadConfig.Timeout = ini.GetInt("reload", "timeout", 300)
-			if reloadConfig.Timeout != 300 {
-				validReloadKeys["timeout"] = true
-			}
-			if include := ini.GetArray("reload", "include"); include != nil {
-				reloadConfig.Include = include
-				validReloadKeys["include"] = true
-			}
-			if exclude := ini.GetArray("reload", "exclude"); exclude != nil {
-				reloadConfig.Exclude = exclude
-				validReloadKeys["exclude"] = true
-			}
+			reloadConfig.Include = ini.GetArray("reload", "include")
+			reloadConfig.Exclude = ini.GetArray("reload", "exclude")
 
-			// Validate reload section keys
-			for key := range reloadSection {
-				if !validReloadKeys[key] {
-					config.ConfigErrors = append(config.ConfigErrors, "Unknown key '"+key+"' in [reload] section")
-				}
+			// Validate reload section - anything left is unknown
+			for key := range ini.GetSection("reload") {
+				config.ConfigErrors = append(config.ConfigErrors, "Unknown key '"+key+"' in [reload] section")
 			}
 		}
 		config.Reload = reloadConfig
 
-		// Load rewrites
-		rewriteSection := ini.GetSection("rewrite")
-		for pattern, target := range rewriteSection {
-			if str, ok := target.(string); ok {
-				config.Rewrites[pattern] = str
+		// Load rewrites (all keys are valid, consume them all)
+		var rewriteKeys []string
+		for key := range ini.GetSection("rewrite") {
+			rewriteKeys = append(rewriteKeys, key)
+		}
+		for _, pattern := range rewriteKeys {
+			if target, ok := ini.Get("rewrite", pattern); ok {
+				config.Rewrites[pattern] = target
 			}
 		}
 
 		// Validate for unrecognized sections
-		validSections := map[string]bool{"": true, "environment": true, "docker": true, "reload": true, "rewrite": true}
+		knownSections := map[string]bool{"": true, "environment": true, "docker": true, "reload": true, "rewrite": true}
 		for section := range ini.sections {
-			if !validSections[section] {
+			if !knownSections[section] {
 				config.ConfigErrors = append(config.ConfigErrors, "Unknown section ["+section+"] in webcentral.ini")
 			}
 		}

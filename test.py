@@ -204,13 +204,34 @@ class TestRunner:
         self.tests.append(func)
         return func
 
-    def run(self):
-        """Run all registered tests"""
+    def run(self, test_names=None):
+        """Run all registered tests or specific ones if test_names provided"""
+        # Filter tests if specific names provided
+        tests_to_run = self.tests
+        if test_names:
+            # Normalize test names - support both "test_name" and "name" formats
+            normalized_names = []
+            for name in test_names:
+                if not name.startswith('test_'):
+                    normalized_names.append(f'test_{name}')
+                else:
+                    normalized_names.append(name)
+
+            # Filter tests
+            tests_to_run = [t for t in self.tests if t.__name__ in normalized_names]
+
+            # Check if any test names were not found
+            found_names = {t.__name__ for t in tests_to_run}
+            for name in normalized_names:
+                if name not in found_names:
+                    print(f"{RED}Error: Test '{name}' not found{RESET}")
+                    sys.exit(1)
+
         self.setup()
 
         failed = False
         try:
-            for test_func in self.tests:
+            for test_func in tests_to_run:
                 test_name = test_func.__name__
                 try:
                     test_func(self)
@@ -224,7 +245,7 @@ class TestRunner:
                     break
 
             if not failed:
-                print(f"\n{GREEN}All {len(self.tests)} tests passed!{RESET}")
+                print(f"\n{GREEN}All {len(tests_to_run)} tests passed!{RESET}")
         finally:
             if self.webcentral_proc:
                 self.webcentral_proc.terminate()
@@ -689,4 +710,6 @@ def test_procfile_unsupported_type(t):
 
 
 if __name__ == '__main__':
-    runner.run()
+    # Parse command line arguments for test names
+    test_names = sys.argv[1:] if len(sys.argv) > 1 else None
+    runner.run(test_names)
