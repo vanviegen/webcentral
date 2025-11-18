@@ -4,12 +4,11 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use hyper::{body::Incoming, Request, Response};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::{BodyExt, Full};
 use bytes::Bytes;
-use nix::unistd::{Uid, Gid};
+use nix::unistd::Uid;
 use notify::{Watcher, RecursiveMode, Event as NotifyEvent};
 use regex::Regex;
-use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::net::TcpStream;
@@ -108,7 +107,7 @@ pub async fn stop_all_projects() {
 #[derive(Debug)]
 enum ProjectState {
     Stopped,
-    Starting { port: u16, start_time: Instant },
+    Starting { port: u16, #[allow(dead_code)] start_time: Instant },
     Running { port: u16, process: tokio::process::Child, workers: Vec<tokio::process::Child> },
 }
 
@@ -133,14 +132,16 @@ impl Project {
     }
 
     async fn handle_impl(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+        eprintln!("project.handle_impl: start");
         *self.last_activity.lock().await = Instant::now();
 
         if self.config.log_requests {
             let _ = self.logger.write("", &format!("{} {}", req.method(), req.uri().path()));
         }
 
+        eprintln!("project.handle_impl: applying rewrites");
         // Apply URL rewrites
-        let (path, redirect) = self.apply_rewrites(req.uri().path());
+        let (_path, redirect) = self.apply_rewrites(req.uri().path());
 
         if !redirect.is_empty() {
             // Handle webcentral:// URLs
@@ -154,17 +155,25 @@ impl Project {
         }
 
         // Determine handler based on configuration
-        if !self.config.redirect.is_empty() {
+        eprintln!("project.handle_impl: determining handler");
+        let result = if !self.config.redirect.is_empty() {
+            eprintln!("project.handle_impl: redirect");
             self.handle_redirect().await
         } else if !self.config.proxy.is_empty() {
+            eprintln!("project.handle_impl: proxy_remote");
             self.handle_proxy_remote(req).await
         } else if !self.config.socket_path.is_empty() || self.config.port > 0 {
+            eprintln!("project.handle_impl: forward");
             self.handle_forward(req).await
         } else if self.needs_process_management() {
+            eprintln!("project.handle_impl: application");
             self.handle_application(req).await
         } else {
+            eprintln!("project.handle_impl: static");
             self.handle_static(req).await
-        }
+        };
+        eprintln!("project.handle_impl: handler returned");
+        result
     }
 
     fn apply_rewrites(&self, path: &str) -> (String, String) {
@@ -251,48 +260,93 @@ impl Project {
     }
 
     async fn proxy_request(&self, req: Request<Incoming>, target: &str) -> Result<Response<Full<Bytes>>> {
+        // Parse target URL
+        let target_uri: hyper::Uri = target.parse()?;
+
+        // Build the full URI for the proxied request
+        let path_and_query = req.uri().path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
+
+        let uri_str = format!("{}{}", target, path_and_query);
+        let uri: hyper::Uri = uri_str.parse()?;
+
+        // Collect the incoming body first
+        let (parts, body) = req.into_parts();
+        let body_bytes = body.collect().await?.to_bytes();
+
+        // Create HTTP client
         let client = Client::builder(TokioExecutor::new()).build_http();
 
-        // Build proxied request
-        let uri = format!("{}{}", target, req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
-
+        // Build proxied request with collected body
         let mut proxy_req = hyper::Request::builder()
-            .method(req.method())
-            .uri(uri);
+            .method(&parts.method)
+            .uri(uri)
+            .version(hyper::Version::HTTP_11);
 
-        // Copy headers
-        for (name, value) in req.headers() {
-            proxy_req = proxy_req.header(name, value);
+        // Copy headers, skipping connection-related headers
+        for (name, value) in &parts.headers {
+            let name_str = name.as_str().to_lowercase();
+            if name_str != "host" && name_str != "connection" &&
+               name_str != "transfer-encoding" && name_str != "content-length" {
+                proxy_req = proxy_req.header(name, value);
+            }
+        }
+
+        // Set proper Host header
+        if let Some(host) = target_uri.host() {
+            let host_value = if let Some(port) = target_uri.port_u16() {
+                format!("{}:{}", host, port)
+            } else {
+                host.to_string()
+            };
+            proxy_req = proxy_req.header("Host", host_value);
         }
 
         // Add X-Forwarded headers
-        let proto = if req.uri().scheme_str() == Some("https") { "https" } else { "http" };
+        let proto = if parts.uri.scheme_str() == Some("https") { "https" } else { "http" };
+        let original_host = parts.headers.get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("");
+
         proxy_req = proxy_req
-            .header("X-Forwarded-Host", req.headers().get("host").map(|h| h.to_str().unwrap_or("")).unwrap_or(""))
+            .header("X-Forwarded-Host", original_host)
             .header("X-Forwarded-Proto", proto);
 
-        let proxy_req = proxy_req.body(req.into_body())?;
+        // Set Content-Length if we have a body
+        if !body_bytes.is_empty() {
+            proxy_req = proxy_req.header("Content-Length", body_bytes.len());
+        }
 
+        let proxy_req = proxy_req.body(Full::new(body_bytes))?;
+
+        // Send request
         let resp = client.request(proxy_req).await?;
 
         // Convert response
-        let (parts, body) = resp.into_parts();
-        let body_bytes = body.collect().await?.to_bytes();
+        let (resp_parts, resp_body) = resp.into_parts();
+        let resp_bytes = resp_body.collect().await?.to_bytes();
 
-        let mut response = Response::builder().status(parts.status);
-        for (name, value) in parts.headers {
+        let mut response = Response::builder()
+            .status(resp_parts.status)
+            .version(resp_parts.version);
+
+        // Copy response headers
+        for (name, value) in resp_parts.headers {
             if let Some(name) = name {
                 response = response.header(name, value);
             }
         }
 
-        Ok(response.body(Full::new(body_bytes))?)
+        Ok(response.body(Full::new(resp_bytes))?)
     }
 
     async fn handle_application(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+        eprintln!("handle_application: ensuring app started");
         // Ensure application is started
         self.ensure_started().await?;
 
+        eprintln!("handle_application: getting port");
         // Get current port
         let port = {
             let state = self.state.lock().await;
@@ -303,9 +357,12 @@ impl Project {
             }
         };
 
+        eprintln!("handle_application: port={}, proxying", port);
         // Proxy to application
         let target = format!("http://localhost:{}", port);
-        self.proxy_request(req, &target).await
+        let result = self.proxy_request(req, &target).await;
+        eprintln!("handle_application: proxy_request returned");
+        result
     }
 
     async fn ensure_started(&self) -> Result<()> {
@@ -313,7 +370,7 @@ impl Project {
 
         match *state {
             ProjectState::Running { .. } => return Ok(()),
-            ProjectState::Starting { start_time, .. } => {
+            ProjectState::Starting { .. } => {
                 // Wait for startup to complete (with timeout)
                 drop(state);
                 for _ in 0..300 {  // 30 second timeout

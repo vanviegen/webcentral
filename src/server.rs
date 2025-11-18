@@ -1,6 +1,6 @@
 use crate::config::ProjectConfig;
 use crate::project;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use dashmap::DashMap;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -8,19 +8,15 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use http_body_util::Full;
 use bytes::Bytes;
-use instant_acme::{Account, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder, OrderStatus};
 use notify::{Watcher, RecursiveMode};
 use regex::Regex;
-use rustls::ServerConfig;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tokio_rustls::TlsAcceptor;
 
 pub struct Server {
     config: crate::Config,
@@ -28,6 +24,7 @@ pub struct Server {
     bindings_file: PathBuf,
     last_scan: Arc<RwLock<Instant>>,
     cert_requests: Arc<DashMap<String, ()>>,
+    #[allow(dead_code)]
     approved_hosts: Arc<DashMap<String, ()>>,
 }
 
@@ -108,9 +105,17 @@ impl Server {
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 if let Err(e) = http1::Builder::new()
+                    .preserve_header_case(true)
+                    .title_case_headers(true)
                     .serve_connection(io, service_fn(move |req| {
                         let server = server.clone();
-                        async move { server.handle_http(req).await }
+                        async move {
+                            let result = server.handle_http(req).await;
+                            if let Err(ref e) = result {
+                                eprintln!("Handle HTTP error: {:?}", e);
+                            }
+                            result
+                        }
                     }))
                     .await
                 {
@@ -146,25 +151,30 @@ impl Server {
     }
 
     async fn handle_http(&self, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        eprintln!("handle_http: got request for {:?}", req.uri());
         let domain = match self.extract_domain(&req) {
             Some(d) => d,
             None => {
+                eprintln!("handle_http: no domain found");
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Full::new(Bytes::from("Bad Request: Missing Host header")))
                     .unwrap());
             }
         };
+        eprintln!("handle_http: domain={}", domain);
 
         let project_dir = match self.get_project_dir(&domain).await {
             Ok(dir) => dir,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("handle_http: project_dir error: {}", e);
                 return Ok(Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(Full::new(Bytes::from("Not Found")))
                     .unwrap());
             }
         };
+        eprintln!("handle_http: project_dir={}", project_dir);
 
         // Check for per-project redirect settings
         if let Ok(config) = ProjectConfig::load(&PathBuf::from(&project_dir)) {
@@ -205,7 +215,10 @@ impl Server {
             }
         }
 
-        self.route_request(req, &domain, &project_dir).await
+        eprintln!("handle_http: calling route_request");
+        let result = self.route_request(req, &domain, &project_dir).await;
+        eprintln!("handle_http: route_request returned");
+        result
     }
 
     async fn handle_https(&self, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -248,8 +261,10 @@ impl Server {
 
     async fn route_request(&self, req: Request<hyper::body::Incoming>, domain: &str, project_dir: &str)
         -> Result<Response<Full<Bytes>>, hyper::Error> {
+        eprintln!("route_request: start");
         // Check for www redirect
         if self.config.redirect_www {
+            eprintln!("route_request: checking www redirect");
             if let Some(target_domain) = domain.strip_prefix("www.") {
                 if self.get_project_dir(target_domain).await.is_ok() {
                     let proto = if req.uri().scheme_str() == Some("https") { "https" } else { "http" };
@@ -277,10 +292,15 @@ impl Server {
         }
 
         // Get or create project
+        eprintln!("route_request: getting project");
         match project::get_project(&PathBuf::from(project_dir), self.config.firejail, self.config.prune_logs).await {
             Ok(project) => {
+                eprintln!("route_request: got project, calling handle");
                 match project.handle(req).await {
-                    Ok(resp) => Ok(resp),
+                    Ok(resp) => {
+                        eprintln!("route_request: handle returned success");
+                        Ok(resp)
+                    }
                     Err(e) => {
                         eprintln!("Project handle error: {}", e);
                         Ok(Response::builder()

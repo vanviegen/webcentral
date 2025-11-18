@@ -111,6 +111,7 @@ impl Logger {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn close(&self) -> Result<()> {
         let mut file = self.file.lock().unwrap();
         *file = None;

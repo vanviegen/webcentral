@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -180,6 +180,7 @@ impl Procfile {
 
 #[derive(Debug, Clone)]
 pub struct ProjectConfig {
+    #[allow(dead_code)]
     pub dir: String,
     pub command: String,
     pub workers: HashMap<String, String>,
