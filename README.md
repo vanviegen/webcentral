@@ -246,15 +246,12 @@ Note: `webcentral.ini` is always watched, and `_webcentral_data` is always exclu
 
 ```ini
 [rewrite]
-/api/(.*) = webcentral://my-api/$1              ; Route to another project
 /blog/(.*?)/.* = /articles/$1.html              ; Simplify URLs
 /favicon.ico = /favicon.ico                     ; Passthrough
 /[^/]* = /index.html                            ; Catch-all to index.html
 ```
 
 Rules are applied in order. First match wins. Use `$1`, `$2`, etc. for captures.
-
-The special `webcentral://<project>/<path>` syntax routes requests to other projects by directory name (DNS not required).
 
 ### Environment Variables
 

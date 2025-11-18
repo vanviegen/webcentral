@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -48,7 +49,6 @@ type projectState struct {
 	port         int
 	proxy        *httputil.ReverseProxy
 	queue        []QueuedRequest
-	lastActivity time.Time
 	cancelWatch  context.CancelFunc
 	watcher      *fsnotify.Watcher
 	cancelTimer  context.CancelFunc
@@ -64,6 +64,7 @@ type Project struct {
 	gid         int
 	useFirejail bool
 	pruneLogs   int
+	lastActivity atomic.Int64
 
 	// Lifecycle management (single goroutine owns state)
 	eventCh chan *Event
@@ -113,6 +114,7 @@ func GetProject(dir string, useFirejail bool, pruneLogs int) (*Project, error) {
 		eventCh:     make(chan *Event, 10),
 		done:        make(chan struct{}),
 	}
+	p.lastActivity.Store(time.Now().UnixNano())
 
 	projects[dir] = p
 
@@ -159,7 +161,7 @@ func (p *Project) needsProcessManagement() bool {
 
 // runLifecycle is the main lifecycle management goroutine
 func (p *Project) runLifecycle() {
-	s := &projectState{phase: "stopped", lastActivity: time.Now()}
+	s := &projectState{phase: "stopped"}
 
 	// Always start file watcher (all projects watch webcentral.ini, apps watch more)
 	if err := p.startFileWatcher(s); err != nil {
@@ -178,7 +180,6 @@ func (p *Project) runLifecycle() {
 
 			if s.phase == "stopped" {
 				if e.Type == "start" {
-					s.lastActivity = time.Now()
 					if p.needsProcessManagement() {
 						if port, err := getFreePort(); err == nil {
 							s.phase, s.port = "starting", port
@@ -221,7 +222,6 @@ func (p *Project) runLifecycle() {
 			if s.phase == "running" {
 				switch e.Type {
 				case "start":
-					s.lastActivity = time.Now()
 					if e.Request != nil {
 						p.serveRequest(s, *e.Request)
 					}
@@ -230,7 +230,7 @@ func (p *Project) runLifecycle() {
 					s.phase = "stopping"
 					go p.stopProcess(s)
 				case "timeout":
-					if time.Since(s.lastActivity) > time.Duration(p.config.Reload.Timeout)*time.Second {
+					if time.Since(time.Unix(0, p.lastActivity.Load())) > time.Duration(p.config.Reload.Timeout)*time.Second {
 						p.logger.Write("", "stopping due to inactivity")
 						s.phase = "stopping"
 						go p.stopProcess(s)
@@ -263,7 +263,11 @@ func (p *Project) runLifecycle() {
 						} else {
 							// Send queued requests to fresh project's event loop
 							for _, req := range s.queue {
-								freshProject.eventCh <- &Event{Type: "start", Request: &req}
+								// Create a separate goroutine for each request in queue
+								go func(req QueuedRequest) {
+									freshProject.dispatchRequest(req.r, req.w)
+									close(req.done)
+								}(req)
 							}
 						}
 					}
@@ -359,12 +363,6 @@ func (p *Project) findProjectByName(name string) (string, error) {
 }
 
 func (p *Project) Handle(w http.ResponseWriter, r *http.Request) {
-	// Track activity for inactivity timeout (non-blocking)
-	select {
-	case p.eventCh <- &Event{Type: "start"}:
-	default:
-	}
-
 	if p.config.LogRequests {
 		p.logger.Write("", fmt.Sprintf("%s %s", r.Method, r.URL.Path))
 	}
@@ -409,6 +407,14 @@ func (p *Project) Handle(w http.ResponseWriter, r *http.Request) {
 		r.URL.Path = newPath
 		r.RequestURI = newPath
 	}
+
+
+	p.dispatchRequest(r, w)
+}
+
+func (p *Project) dispatchRequest(r *http.Request, w http.ResponseWriter) {
+	// Track activity for inactivity timeout
+	p.lastActivity.Store(time.Now().UnixNano())
 
 	// Determine handler based on configuration
 	if p.config.Redirect != "" {

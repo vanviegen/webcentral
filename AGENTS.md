@@ -9,7 +9,7 @@ A reverse proxy that runs multiple web applications on a single server. Just put
 
 `server.go` - HTTP/HTTPS listeners, ACME certificate management, domain routing, www/HTTPS redirects, directory watching
 
-`project.go` - Per-domain lifecycle manager supporting: applications (Firejail/Docker), static files, redirects, proxies, forwards. Handles file watching, auto-reload, inactivity timeouts, URL rewrites, cross-project routing (`webcentral://`)
+`project.go` - Per-domain lifecycle manager supporting: applications (Firejail/Docker), static files, redirects, proxies, forwards. Handles file watching, auto-reload, inactivity timeouts, URL rewrites
 
 `logger.go` - Daily-rotated logs with configurable retention
 
@@ -67,5 +67,6 @@ Events sent via buffered channel (`eventCh`): `start`, `process_started`, `ready
 
 - Keep AGENTS.md up-to-date when making architectural changes. Be succinct—no repetition, no code examples, bullet points over paragraphs.
 - Build using `go build`.
-- Run `./test.py` to execute the test suite. For new features, add tests in `test.py`. Don't create ad-hoc test scripts.
+- Run `./test.py` to execute the test suite. For new features, add tests in `test.py`. Don't create ad-hoc test scripts. When writing tests, you should not need to sleep (except in test-apps being run by webcentral to simulate loading times) - use `await_log` and/or `assert_http` instead. If a test fails, don't just work around it in the test code, but investigate deeply if there may be an actual bug (or unexpected behavior) in webcentral.
+- When you notice unexpected behavior or a like bug at any time, create an issue on your todo-list for later investigation. Never let bugs uninvestigated nor work around them.
 - Add code comments only for explaining non-obvious logic, why things are done a certain way, and how thread-safety is ensured. Don't add comments describing what you're changing and why, as comments should reflect the final code, not the change history.

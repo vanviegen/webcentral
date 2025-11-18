@@ -10,6 +10,7 @@ import http.client
 import socket
 import signal
 import atexit
+import traceback
 from pathlib import Path
 from datetime import datetime
 from functools import wraps
@@ -301,6 +302,14 @@ class TestRunner:
                 except Exception as e:
                     print(f"{CLEAR_LINE}{RED}{CROSSMARK}{RESET} {test_name}")
                     print(f"{RED}Error: {e}{RESET}")
+                    
+                    # Extract and show location from traceback
+                    # Find the frame for the test function itself
+                    tb = traceback.extract_tb(e.__traceback__)
+                    for frame in tb:
+                        if frame.name == test_func.__name__:
+                            print(f"At: {frame.filename}:{frame.lineno}")
+                            break
 
                     # Show all new log content
                     self.show_all_new_logs()
@@ -1045,6 +1054,302 @@ def test_edit_broken_ini_triggers_reload(t):
 
     # Should still serve static files after reload
     t.assert_http('editini.test', '/', check_body='Version 1')
+
+
+@test
+def test_ini_disappearing_app_becomes_static(t):
+    """Removing webcentral.ini converts app to static site"""
+    # Start with an application
+    t.write_file('disappear.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT')
+    t.write_file('disappear.test/index.html', '<h1>App Content</h1>')
+    t.write_file('disappear.test/public/index.html', '<h1>Static Content</h1>')
+
+    # Start the app
+    t.assert_http('disappear.test', '/', check_body='App Content')
+    t.assert_log('disappear.test', 'reachable on port', count=1)
+    t.mark_log_read('disappear.test')
+
+    # Remove the ini file
+    os.remove(os.path.join(t.tmpdir, 'disappear.test/webcentral.ini'))
+
+    # Should trigger reload and stop the process
+    t.await_log('disappear.test', 'process exited', timeout=3)
+
+    # Now should serve static files from public/
+    t.assert_http('disappear.test', '/', check_body='Static Content')
+    t.await_log('disappear.test', 'starting static file server', timeout=4)
+
+
+@test
+def test_ini_appearing_static_becomes_app(t):
+    """Adding webcentral.ini converts static site to app"""
+    # Start with static site
+    t.write_file('appear.test/public/index.html', '<h1>Static Only</h1>')
+    t.write_file('appear.test/index.html', '<h1>App Will Serve This</h1>')
+
+    # Access static site
+    t.assert_http('appear.test', '/', check_body='Static Only')
+    t.mark_log_read('appear.test')
+
+    # Add ini file to make it an app
+    t.write_file('appear.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT')
+
+    # Should trigger reload
+    t.await_log('appear.test', 'stopping due to change', timeout=2)
+
+    # Now should serve via app
+    t.assert_http('appear.test', '/', check_body='App Will Serve This')
+    t.assert_log('appear.test', 'reachable on port', count=1)
+
+
+@test
+def test_ini_broken_to_valid(t):
+    """Fixing broken ini starts the application"""
+    # Start with broken ini
+    t.write_file('fixini.test/webcentral.ini', 'broken syntax!!!\n###')
+    t.write_file('fixini.test/public/index.html', '<h1>Static</h1>')
+    t.write_file('fixini.test/index.html', '<h1>App Content</h1>')
+
+    # Access as static (broken ini means no app)
+    t.assert_http('fixini.test', '/', check_body='Static')
+    t.assert_log('fixini.test', 'Invalid syntax in webcentral.ini', count=1)
+    t.mark_log_read('fixini.test')
+
+    # Fix the ini
+    t.write_file('fixini.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT')
+
+    # Should trigger reload
+    t.await_log('fixini.test', 'stopping due to change', timeout=2)
+
+    # Now should work as app
+    t.assert_http('fixini.test', '/', check_body='App Content')
+    t.assert_log('fixini.test', 'reachable on port', count=1)
+
+
+@test
+def test_ini_valid_to_broken(t):
+    """Breaking ini converts app back to static"""
+    # Start with valid ini
+    t.write_file('breakini.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT')
+    t.write_file('breakini.test/index.html', '<h1>App</h1>')
+    t.write_file('breakini.test/public/index.html', '<h1>Static</h1>')
+
+    # Start the app
+    t.assert_http('breakini.test', '/', check_body='App')
+    t.assert_log('breakini.test', 'reachable on port', count=1)
+    t.mark_log_read('breakini.test')
+
+    # Break the ini
+    t.write_file('breakini.test/webcentral.ini', 'invalid!!!\ngarbage')
+
+    # Should trigger reload
+    t.await_log('breakini.test', 'stopping due to change', timeout=2)
+
+    # Now should serve static
+    t.assert_http('breakini.test', '/', check_body='Static')
+    t.assert_log('breakini.test', 'Invalid syntax in webcentral.ini', count=1)
+
+
+@test
+def test_command_changing(t):
+    """Changing command in ini restarts with new command"""
+    # Start with simple server
+    t.write_file('cmdchange.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT')
+    t.write_file('cmdchange.test/index.html', '<h1>HTTP Server</h1>')
+
+    # Start the app
+    t.assert_http('cmdchange.test', '/', check_body='HTTP Server')
+    t.assert_log('cmdchange.test', 'reachable on port', count=1)
+    t.mark_log_read('cmdchange.test')
+
+    # Change to a different server command
+    t.write_file('cmdchange.test/server.py', '''
+import os
+import http.server
+import socketserver
+
+class CustomHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        self.wfile.write(b"<h1>Custom Server</h1>")
+
+PORT = int(os.environ.get('PORT', 8000))
+with socketserver.TCPServer(("", PORT), CustomHandler) as httpd:
+    print(f"Custom server on {PORT}", flush=True)
+    httpd.serve_forever()
+''')
+
+    t.write_file('cmdchange.test/webcentral.ini',
+                 'command=python3 -u server.py')
+
+    # Should trigger reload
+    t.await_log('cmdchange.test', 'stopping due to change', timeout=2)
+
+    # Should start with new command
+    t.assert_http('cmdchange.test', '/', check_body='Custom Server')
+    t.await_log('cmdchange.test', 'Custom server on')
+
+
+@test
+def test_environment_variables_changing(t):
+    """Changing environment variables triggers reload with new values"""
+    t.write_file('envchange.test/server.py', '''
+import os
+import http.server
+import socketserver
+
+class EnvHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        env_value = os.environ.get('MY_VAR', 'not set')
+        self.wfile.write(f"MY_VAR={env_value}".encode())
+
+PORT = int(os.environ.get('PORT', 8000))
+with socketserver.TCPServer(("", PORT), EnvHandler) as httpd:
+    httpd.serve_forever()
+''')
+
+    t.write_file('envchange.test/webcentral.ini',
+                 'command=python3 -u server.py\n\n[environment]\nMY_VAR=value1')
+
+    # Start the app
+    t.assert_http('envchange.test', '/', check_body='MY_VAR=value1')
+    t.assert_log('envchange.test', 'reachable on port', count=1)
+    t.mark_log_read('envchange.test')
+
+    # Change environment variable
+    t.write_file('envchange.test/webcentral.ini',
+                 'command=python3 -u server.py\n\n[environment]\nMY_VAR=value2')
+
+    # Should trigger reload
+    t.await_log('envchange.test', 'stopping due to change', timeout=2)
+
+    # Should have new value
+    t.assert_http('envchange.test', '/', check_body='MY_VAR=value2')
+
+
+@test
+def test_workers_added_via_config_change(t):
+    """Adding workers to ini starts them on reload"""
+    # Start without workers
+    t.write_file('addworker.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT')
+    t.write_file('addworker.test/index.html', '<h1>Test</h1>')
+    t.write_file('addworker.test/worker.py', '''
+import time
+print("New worker started", flush=True)
+time.sleep(100)
+''')
+
+    # Start the app
+    t.assert_http('addworker.test', '/', check_body='Test')
+    t.assert_log('addworker.test', 'reachable on port', count=1)
+    t.mark_log_read('addworker.test')
+
+    # Add worker to config
+    t.write_file('addworker.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT\n'
+                 'worker=python3 -u worker.py')
+
+    # Should trigger reload
+    t.await_log('addworker.test', 'stopping due to change', timeout=2)
+
+    # Should start with worker
+    t.assert_http('addworker.test', '/', check_body='Test')
+    t.assert_log('addworker.test', 'starting 1 worker(s)', count=1)
+    t.await_log('addworker.test', 'New worker started')
+
+
+@test
+def test_workers_removed_via_config_change(t):
+    """Removing workers from ini stops them on reload"""
+    # Start with worker
+    t.write_file('rmworker.test/worker.py', '''
+import time
+print("Worker running", flush=True)
+time.sleep(100)
+''')
+    t.write_file('rmworker.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT\n'
+                 'worker=python3 -u worker.py')
+    t.write_file('rmworker.test/index.html', '<h1>Test</h1>')
+
+    # Start the app
+    t.assert_http('rmworker.test', '/', check_body='Test')
+    t.await_log('rmworker.test', 'Worker running')
+    t.mark_log_read('rmworker.test')
+
+    # Remove worker from config
+    t.write_file('rmworker.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT')
+
+    # Should trigger reload
+    t.await_log('rmworker.test', 'stopping due to change', timeout=2)
+
+    # Should not log about workers anymore
+    t.mark_log_read('rmworker.test')
+    t.assert_http('rmworker.test', '/', check_body='Test')
+    # No "starting N worker(s)" message in new logs
+    new_logs = t.get_log_content('rmworker.test', t.log_positions['rmworker.test'])
+    if 'starting 1 worker(s)' in new_logs:
+        raise AssertionError("Workers should not be started after removal from config")
+
+
+@test
+def test_redirect_changes_to_app(t):
+    """Changing from redirect to app restarts as application"""
+    # Start as redirect
+    t.write_file('redir2app.test/webcentral.ini',
+                 'redirect=https://example.com/')
+    t.write_file('redir2app.test/index.html', '<h1>App Content</h1>')
+
+    # Should redirect
+    t.assert_http('redir2app.test', '/', check_code=301)
+    t.mark_log_read('redir2app.test')
+
+    # Change to app
+    t.write_file('redir2app.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT')
+
+    # Should trigger reload
+    t.await_log('redir2app.test', 'stopping due to change', timeout=2)
+
+    # Should now serve app
+    t.assert_http('redir2app.test', '/', check_body='App Content')
+    t.assert_log('redir2app.test', 'reachable on port', count=1)
+
+
+@test
+def test_app_changes_to_redirect(t):
+    """Changing from app to redirect stops app and redirects"""
+    # Start as app
+    t.write_file('app2redir.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT')
+    t.write_file('app2redir.test/index.html', '<h1>App</h1>')
+
+    # Start the app
+    t.assert_http('app2redir.test', '/', check_body='App')
+    t.assert_log('app2redir.test', 'reachable on port', count=1)
+    t.mark_log_read('app2redir.test')
+
+    # Change to redirect
+    t.write_file('app2redir.test/webcentral.ini',
+                 'redirect=https://example.org/')
+
+    # Should trigger reload
+    t.await_log('app2redir.test', 'stopping due to change', timeout=2)
+
+    # Should now redirect
+    t.assert_http('app2redir.test', '/', check_code=301)
 
 
 if __name__ == '__main__':
