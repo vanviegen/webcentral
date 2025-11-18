@@ -43,7 +43,7 @@ type Event struct {
 
 // projectState holds all mutable state for a project (owned by lifecycle goroutine)
 type projectState struct {
-	phase       string // "stopped", "starting", "running", "stopping"
+	phase       string // "initial", "starting", "running", "stopping"
 	process     *exec.Cmd
 	workers     []*exec.Cmd
 	port        int
@@ -86,9 +86,11 @@ func GetProject(dir string, useFirejail bool, pruneLogs int) (*Project, error) {
 	projectsMu.Lock()
 	defer projectsMu.Unlock()
 
+	println("GetProject called for dir:", dir)
 	if p, ok := projects[dir]; ok {
 		return p, nil
 	}
+	println("Creating:", dir)
 
 	config, err := LoadProjectConfig(dir)
 	if err != nil {
@@ -117,6 +119,7 @@ func GetProject(dir string, useFirejail bool, pruneLogs int) (*Project, error) {
 	p.lastActivity.Store(time.Now().UnixNano())
 
 	projects[dir] = p
+	println("Project added to projects map:", dir)
 
 	// Log what type of handler this is
 	if p.config.Redirect != "" {
@@ -163,7 +166,7 @@ func (p *Project) needsProcessManagement() bool {
 func (p *Project) runLifecycle() {
 	phase := "running"
 	if p.needsProcessManagement() {
-		phase = "stopped"
+		phase = "initial"
 	}
 	s := &projectState{phase: phase}
 
@@ -182,21 +185,20 @@ func (p *Project) runLifecycle() {
 		select {
 		case e := <-p.eventCh:
 
-			if s.phase == "stopped" {
+			if s.phase == "initial" {
 				if e.Type == "start" {
-					if p.needsProcessManagement() {
-						if port, err := getFreePort(); err == nil {
-							s.phase, s.port = "starting", port
-							p.logger.Write("", fmt.Sprintf("starting on port %d", port))
-							go p.startProcess(port)
-							// Adding to queue happens in 'starting' phase
-						} else {
-							p.logger.Write("", fmt.Sprintf("failed to allocate port: %v", err))
-							http.Error(e.Request.w, "Failed to allocate port", http.StatusServiceUnavailable)
-							close(e.Request.done)
-						}
+					// "initial" implies: needsProcessManagement
+					if port, err := getFreePort(); err == nil {
+						s.phase, s.port = "starting", port
+						p.logger.Write("", fmt.Sprintf("starting on port %d", port))
+						go p.startProcess(port)
+						// Adding to queue happens in 'starting' phase
 					} else {
-						s.phase = "running"
+						p.logger.Write("", fmt.Sprintf("failed to allocate port: %v", err))
+						http.Error(e.Request.w, "Failed to allocate port", http.StatusServiceUnavailable)
+						close(e.Request.done)
+						destroyProject(p, s)
+						return
 					}
 				}
 			}
@@ -217,7 +219,8 @@ func (p *Project) runLifecycle() {
 				case "exit":
 					p.logger.Write("", fmt.Sprintf("process exited during startup: %s", e.Reason))
 					p.flushQueue(s.queue, "Application failed to start")
-					s.phase, s.queue = "stopped", nil
+					destroyProject(p, s)
+					return
 				case "file_changed":
 					p.logger.Write("", fmt.Sprintf("file changed during startup: %s", e.Path))
 				}
@@ -227,7 +230,7 @@ func (p *Project) runLifecycle() {
 				switch e.Type {
 				case "start":
 					if e.Request != nil {
-						p.serveRequest(s, *e.Request)
+						s.proxy.ServeHTTP(e.Request.w, e.Request.r)
 					}
 				case "file_changed":
 					p.logger.Write("", fmt.Sprintf("stopping due to change for %s", e.Path))
@@ -241,7 +244,8 @@ func (p *Project) runLifecycle() {
 					}
 				case "exit":
 					p.logger.Write("", fmt.Sprintf("process exited unexpectedly: %s", e.Reason))
-					s.phase, s.proxy = "stopped", nil
+					destroyProject(p, s)
+					return
 				}
 			}
 
@@ -253,31 +257,7 @@ func (p *Project) runLifecycle() {
 					}
 				case "stop_complete":
 					// Remove project from map so it will be recreated fresh
-					projectsMu.Lock()
-					delete(projects, p.dir)
-					projectsMu.Unlock()
-
-					// If there are queued requests, create fresh project and serve them
-					if len(s.queue) > 0 {
-						// Create fresh project with new config
-						freshProject, err := GetProject(p.dir, p.useFirejail, p.pruneLogs)
-						if err != nil {
-							p.logger.Write("", fmt.Sprintf("failed to create fresh project: %v", err))
-							p.flushQueue(s.queue, "Failed to reload project")
-						} else {
-							// Send queued requests to fresh project's event loop
-							for _, req := range s.queue {
-								// Create a separate goroutine for each request in queue
-								go func(req QueuedRequest) {
-									freshProject.dispatchRequest(req.r, req.w)
-									close(req.done)
-								}(req)
-							}
-						}
-					}
-
-					// Cleanup and exit lifecycle
-					p.cleanup(s)
+					destroyProject(p, s)
 					return
 				}
 			}
@@ -289,19 +269,34 @@ func (p *Project) runLifecycle() {
 	}
 }
 
-// serveRequest serves a single request using the proxy
-func (p *Project) serveRequest(s *projectState, req QueuedRequest) {
-	defer close(req.done)
+func destroyProject(p *Project, s *projectState) {
+	p.logger.Write("", "cleaning up project")
+	projectsMu.Lock()
+	delete(projects, p.dir)
+	projectsMu.Unlock()
 
-	if req.ctx.Err() != nil {
-		return // Request cancelled
+	// If there are queued requests, create fresh project and serve them
+	if len(s.queue) > 0 {
+		p.logger.Write("", fmt.Sprintf("reloading project to serve %d queued request(s)", len(s.queue)))
+		// Create fresh project with new config
+		freshProject, err := GetProject(p.dir, p.useFirejail, p.pruneLogs)
+		if err != nil {
+			p.logger.Write("", fmt.Sprintf("failed to create fresh project: %v", err))
+			p.flushQueue(s.queue, "Failed to reload project")
+		} else {
+			// Send queued requests to fresh project's event loop
+			for _, req := range s.queue {
+				// Create a separate goroutine for each request in queue
+				go func(req QueuedRequest) {
+					freshProject.dispatchRequest(req.r, req.w)
+					close(req.done)
+				}(req)
+			}
+		}
 	}
 
-	if s.proxy != nil {
-		s.proxy.ServeHTTP(req.w, req.r)
-	} else {
-		http.Error(req.w, "Service Unavailable", http.StatusServiceUnavailable)
-	}
+	// Cleanup and exit lifecycle
+	p.cleanup(s)
 }
 
 // Helper functions
@@ -319,7 +314,7 @@ func (p *Project) serveQueue(s *projectState) {
 	queue := s.queue
 	s.queue = nil
 	for _, req := range queue {
-		p.serveRequest(s, req)
+		s.proxy.ServeHTTP(req.w, req.r)
 	}
 }
 
@@ -580,16 +575,21 @@ func (p *Project) handleApplication(w http.ResponseWriter, r *http.Request) {
 }
 
 // setupCommand configures a command with environment, dir, uid/gid, and logging
-func (p *Project) setupCommand(cmd *exec.Cmd, port int, label string) {
+func (p *Project) setupCommand(cmd *exec.Cmd, port int, label string, isDockerCmd bool) {
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env, fmt.Sprintf("PORT=%d", port))
-	for key, val := range p.config.Environment {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, val))
+
+	// For Docker commands, don't add environment variables here - they're passed via --env flags
+	if !isDockerCmd {
+		for key, val := range p.config.Environment {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", key, val))
+		}
 	}
 
 	cmd.Dir = p.dir
 
-	if os.Geteuid() == 0 {
+	// For Docker commands, don't set uid/gid here - Docker handles it via --user flag
+	if !isDockerCmd && os.Geteuid() == 0 {
 		cmd.SysProcAttr = &syscall.SysProcAttr{
 			Credential: &syscall.Credential{Uid: uint32(p.uid), Gid: uint32(p.gid)},
 		}
@@ -604,9 +604,11 @@ func (p *Project) setupCommand(cmd *exec.Cmd, port int, label string) {
 func (p *Project) startProcess(port int) {
 	var cmd *exec.Cmd
 	var err error
+	isDockerCmd := false
 
 	if p.config.Docker != nil {
 		cmd, err = p.buildDockerCommand(port)
+		isDockerCmd = true
 	} else {
 		cmd, err = p.buildShellCommand(p.config.Command), nil
 	}
@@ -617,7 +619,9 @@ func (p *Project) startProcess(port int) {
 		return
 	}
 
-	p.setupCommand(cmd, port, "out")
+	p.setupCommand(cmd, port, "out", isDockerCmd)
+
+	p.logger.Write("", fmt.Sprintf("starting command: %s", strings.Join(cmd.Args, " ")))
 
 	if err := cmd.Start(); err != nil {
 		p.logger.Write("", fmt.Sprintf("failed to start process: %v", err))
@@ -664,7 +668,7 @@ func (p *Project) startWorkers(port int) []*exec.Cmd {
 		// Build worker command
 		cmd := p.buildShellCommand(workerCmd)
 
-		p.setupCommand(cmd, port, fmt.Sprintf("worker-%s", name))
+		p.setupCommand(cmd, port, fmt.Sprintf("worker-%s", name), false)
 
 		if err := cmd.Start(); err != nil {
 			p.logger.Write("", fmt.Sprintf("failed to start worker %s: %v", name, err))
@@ -721,7 +725,13 @@ func (p *Project) buildDockerCommand(port int) (*exec.Cmd, error) {
 	dockerfile := fmt.Sprintf("FROM %s\n", dc.Base)
 
 	if len(dc.Packages) > 0 {
-		dockerfile += "RUN apk add --no-cache " + strings.Join(dc.Packages, " ") + "\n"
+		packages := strings.Join(dc.Packages, " ")
+		// Auto-detect package manager and install packages
+		dockerfile += "RUN if command -v apk > /dev/null ; then apk update && apk add --no-cache " + packages + " ; " +
+			"elif command -v apt-get > /dev/null ; then apt-get update && apt-get install --no-install-recommends --yes " + packages + " ; " +
+			"elif command -v dnf > /dev/null ; then dnf install -y " + packages + " ; " +
+			"elif command -v yum > /dev/null ; then yum install -y " + packages + " ; " +
+			"else echo 'No supported package manager found' && exit 1 ; fi\n"
 	}
 
 	if dc.MountAppDir {
@@ -734,7 +744,6 @@ func (p *Project) buildDockerCommand(port int) (*exec.Cmd, error) {
 		}
 	}
 
-	dockerfile += fmt.Sprintf("ENV PORT=%d\n", port)
 	dockerfile += fmt.Sprintf("EXPOSE %d\n", dc.HTTPPort)
 
 	// Write Dockerfile to temp location
@@ -742,7 +751,7 @@ func (p *Project) buildDockerCommand(port int) (*exec.Cmd, error) {
 	os.MkdirAll(filepath.Dir(dockerfilePath), 0755)
 	os.WriteFile(dockerfilePath, []byte(dockerfile), 0644)
 
-	// Build the image
+	// Build the image (as root, not as the project user)
 	buildCmd := exec.Command("docker", "build", "-t", imageName, "-f", dockerfilePath, p.dir)
 	buildCmd.Dir = p.dir
 	if output, err := buildCmd.CombinedOutput(); err != nil {
@@ -753,35 +762,60 @@ func (p *Project) buildDockerCommand(port int) (*exec.Cmd, error) {
 	// Prepare run arguments
 	args := []string{"run", "--rm", "--name", containerName}
 
+	// Mount /etc/passwd and /etc/group for user resolution
+	args = append(args, "--mount", "type=bind,src=/etc/passwd,dst=/etc/passwd")
+	args = append(args, "--mount", "type=bind,ro,src=/etc/group,dst=/etc/group")
+
 	// Port mapping
 	args = append(args, "-p", fmt.Sprintf("%d:%d", port, dc.HTTPPort))
 
-	// Volume mounts
+	uid := 0
+	gid := 0
+
 	if dc.MountAppDir {
+		// User (Docker will handle setuid, not the Go process)
+		uid := p.uid
+		gid := p.gid
+		if uid == 0 {
+			uid = os.Getuid()
+			gid = os.Getgid()
+		}
+		args = append(args, "--user", fmt.Sprintf("%d:%d", uid, gid))
+
+		// App directory mount
 		args = append(args, "-v", fmt.Sprintf("%s:%s", p.dir, dc.AppDir))
 	}
 
 	for _, mount := range dc.Mounts {
-		hostPath := filepath.Join(p.dir, "_webcentral_data", "mounts", mount)
-		os.MkdirAll(hostPath, 0755)
-		containerPath := filepath.Join(dc.AppDir, mount)
+		// Determine container path - if mount doesn't start with /, it's relative to appDir
+		containerPath := mount
+		if mount[0] != '/' {
+			containerPath = filepath.Join(dc.AppDir, mount)
+		}
+		hostPath := filepath.Join(p.dir, "_webcentral_data", "mounts", containerPath)
+		makeDirWithOwnership(hostPath, uid, gid)
 		args = append(args, "-v", fmt.Sprintf("%s:%s", hostPath, containerPath))
 	}
 
 	// Home directory mount
-	homePath := filepath.Join(p.dir, "_webcentral_data", "home")
-	os.MkdirAll(homePath, 0755)
-	args = append(args, "-v", fmt.Sprintf("%s:/home", homePath))
-	args = append(args, "-e", "HOME=/home")
-
-	// Environment variables
-	for key, val := range p.config.Environment {
-		args = append(args, "-e", fmt.Sprintf("%s=%s", key, val))
+	homeDir := "/tmp"
+	if dc.MountAppDir {
+		homePath := filepath.Join(p.dir, "_webcentral_data", "home")
+		makeDirWithOwnership(homePath, uid, gid)
+		homeDir = filepath.Join(dc.AppDir, "_webcentral_data", "home")
 	}
 
-	// User
-	if p.uid > 0 {
-		args = append(args, "-u", fmt.Sprintf("%d:%d", p.uid, p.gid))
+	// Environment variables
+	// Set PORT to the container's HTTP port if not already set
+	if _, hasPort := p.config.Environment["PORT"]; !hasPort {
+		args = append(args, "-e", fmt.Sprintf("PORT=%d", dc.HTTPPort))
+	}
+	// Set HOME if not already set
+	if _, hasHome := p.config.Environment["HOME"]; !hasHome {
+		args = append(args, "-e", fmt.Sprintf("HOME=%s", homeDir))
+	}
+	for key, val := range p.config.Environment {
+		args = append(args, "-e", fmt.Sprintf("%s=%s", key, val))
 	}
 
 	// Command
@@ -1217,4 +1251,14 @@ func getUserHome(uid int) string {
 	}
 
 	return "/tmp"
+}
+
+func makeDirWithOwnership(path string, uid, gid int) error {
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return err
+	}
+	if uid > 0 && os.Geteuid() == 0 {
+		return os.Chown(path, uid, gid)
+	}
+	return nil
 }

@@ -106,6 +106,8 @@ Runs a server process in a Docker container. The process should start an HTTP se
 **Docker containerization:**
 - Completely isolated environment
 - Higher memory usage, slower startup
+- Runs as the project owner (uid/gid passed via `--user` flag)
+- Automatically mounts `/etc/passwd` and `/etc/group` for user resolution
 - More configuration options
 
 **Example:**
@@ -120,12 +122,19 @@ commands[] = composer install
 
 **Docker Configuration Options:**
 - `base` - Base Docker image (default: `alpine`)
-- `commands` - Build commands (strings or arrays)
-- `packages` - Packages to install via `apt-get` or `apk`
-- `mounts` - Persistent directories (stored in `_webcentral_data/mounts/`)
+- `commands` - Build commands (strings or arrays) - run during image build
+- `packages` - Packages to install (auto-detects `apk`, `apt-get`, `dnf`, or `yum`)
+- `mounts` - Persistent directories (stored in `_webcentral_data/mounts/<path>`, owned by project user)
+  - Relative paths (e.g., `data`) are mounted relative to `app_dir`
+  - Absolute paths (e.g., `/var/lib/data`) are mounted at that exact location in container
 - `http_port` - Container HTTP port (default: 8000)
 - `app_dir` - Mount point for project directory (default: `/app`)
-- `mount_app_dir` - Set to `false` to skip mounting project directory
+- `mount_app_dir` - Set to `false` to skip mounting project directory and to run as root instead of your user (default: `true`)
+
+**Volume mounts:**
+- Project directory is mounted at `app_dir` (if `mount_app_dir` is not `false`)
+- Home directory is mounted at `_webcentral_data/home` (if `mount_app_dir` is `true`)
+- Custom mounts are created in `_webcentral_data/mounts/` with correct ownership
 
 **Real-world example (Trilium Notes):**
 ```ini
@@ -133,6 +142,16 @@ command = node /usr/src/app/src/www
 [docker]
 base = zadam/trilium:0.47.6
 http_port = 8080
+```
+
+**Example with persistent data:**
+```ini
+command = ./server
+[docker]
+base = alpine
+packages = nodejs npm
+mounts[] = data              ; Mounted at /app/data
+mounts[] = /var/cache/app    ; Mounted at /var/cache/app
 ```
 
 ### 3. Forward
