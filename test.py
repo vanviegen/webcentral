@@ -67,8 +67,7 @@ class TestRunner:
              '-projects', self.tmpdir,
              '-http', str(self.port),
              '-https', '0',
-             '-bindings-file', bindings_file,
-             '-firejail=false'],
+             '-bindings-file', bindings_file],
             stdout=stdout_f,
             stderr=stderr_f,
             cwd='/opt/webcentral'

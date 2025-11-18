@@ -582,7 +582,7 @@ func (p *Project) startProcess(port int) {
 	if p.config.Docker != nil {
 		cmd, err = p.buildDockerCommand(port)
 	} else {
-		cmd, err = p.buildCommand(port)
+		cmd, err= p.buildShellCommand(p.config.Command), nil
 	}
 
 	if err != nil {
@@ -636,31 +636,7 @@ func (p *Project) startWorkers(port int) []*exec.Cmd {
 
 	for name, workerCmd := range p.config.Workers {
 		// Build worker command
-		var cmd *exec.Cmd
-
-		if p.useFirejail && p.config.Docker == nil {
-			homeDir := p.dir
-			if os.Geteuid() == 0 {
-				homeDir = getUserHome(p.uid)
-			}
-
-			args := []string{
-				"--quiet",
-				"--noprofile",
-				"--private-tmp",
-				"--private-dev",
-				fmt.Sprintf("--private=%s", homeDir),
-				fmt.Sprintf("--whitelist=%s", p.dir),
-				"--read-only=/",
-				fmt.Sprintf("--read-write=%s", p.dir),
-				"--",
-				"/bin/sh", "-c", workerCmd,
-			}
-
-			cmd = exec.Command("firejail", args...)
-		} else {
-			cmd = exec.Command("/bin/sh", "-c", workerCmd)
-		}
+		cmd := p.buildShellCommand(workerCmd)
 
 		p.setupCommand(cmd, port, fmt.Sprintf("worker-%s", name))
 
@@ -681,26 +657,17 @@ func (p *Project) startWorkers(port int) []*exec.Cmd {
 	return workers
 }
 
-func (p *Project) buildCommand(port int) (*exec.Cmd, error) {
-	command := p.config.Command
-	if command == "" {
-		return nil, fmt.Errorf("no command specified in configuration")
-	}
-
-	var cmd *exec.Cmd
-
+// buildShellCommand creates an exec.Cmd for running a shell command,
+// optionally wrapped in a Firejail sandbox
+func (p *Project) buildShellCommand(command string) *exec.Cmd {
 	if p.useFirejail && p.config.Docker == nil {
-		homeDir := p.dir
-		if os.Geteuid() == 0 {
-			homeDir = getUserHome(p.uid)
-		}
 
 		args := []string{
 			"--quiet",
 			"--noprofile",
 			"--private-tmp",
 			"--private-dev",
-			fmt.Sprintf("--private=%s", homeDir),
+			fmt.Sprintf("--private=%s", getUserHome(p.uid)),
 			fmt.Sprintf("--whitelist=%s", p.dir),
 			"--read-only=/",
 			fmt.Sprintf("--read-write=%s", p.dir),
@@ -708,12 +675,10 @@ func (p *Project) buildCommand(port int) (*exec.Cmd, error) {
 			"/bin/sh", "-c", command,
 		}
 
-		cmd = exec.Command("firejail", args...)
-	} else {
-		cmd = exec.Command("/bin/sh", "-c", command)
+		return exec.Command("firejail", args...)
 	}
 
-	return cmd, nil
+	return exec.Command("/bin/sh", "-c", command)
 }
 
 func (p *Project) buildDockerCommand(port int) (*exec.Cmd, error) {

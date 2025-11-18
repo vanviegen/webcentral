@@ -1,73 +1,71 @@
-# Webcentral Go Architecture
+# Webcentral
 
-This Go implementation of Webcentral is a reverse proxy and application host that routes incoming HTTP/HTTPS requests to domain-specific projects based on directory names.
+A reverse proxy that runs multiple web applications on a single server. Just put your apps in directories named after their domains (like `myapp.example.com`), point its DNS at the server, and you're done! The apps will start (and shutdown) on-demand, and reload when their files change.
 
-## Core Components
 
-### Server (`server.go`)
-- Manages HTTP/HTTPS listeners
-- Handles TLS certificate acquisition via ACME (Let's Encrypt)
-- Routes requests to projects based on domain
-- Implements www redirection and HTTP-to-HTTPS redirects
-- Caches domain-to-directory mappings
-- Watches for new project directories to proactively acquire certificates
+## Architecture
 
-### Project (`project.go`)
-- Represents a single domain/application
-- Manages application lifecycle (start, stop, reload)
-- Supports multiple deployment types:
-  - **Applications**: Executes commands in Firejail sandbox or Docker
-  - **Static files**: Serves from `public/` directory
-  - **Redirects**: HTTP 301 redirects
-  - **Proxies**: Reverse proxy to remote URLs or local sockets
-  - **Forwards**: Forwards to local ports/sockets without header rewriting
-- Handles file watching for auto-reload on changes
-- Manages inactivity timeouts
-- Implements URL rewriting and cross-project routing (`webcentral://`)
+### Files
 
-### Logger (`logger.go`)
-- Writes project output to dated log files (`YYYY-MM-DD.log`)
-- Automatically rotates logs daily
-- Prunes old logs based on retention policy (configurable via `--prune-logs`)
-- Formats multi-line output with proper indentation
+`server.go` - HTTP/HTTPS listeners, ACME certificate management, domain routing, www/HTTPS redirects, directory watching
 
-### Config (`config.go`)
-- Parses INI files (`webcentral.ini`) for project configuration
-- Parses `package.json` for Node.js projects
-- Supports Docker configuration, environment variables, reload settings, and URL rewrites
+`project.go` - Per-domain lifecycle manager supporting: applications (Firejail/Docker), static files, redirects, proxies, forwards. Handles file watching, auto-reload, inactivity timeouts, URL rewrites, cross-project routing (`webcentral://`)
 
-## Request Flow
+`logger.go` - Daily-rotated logs with configurable retention
 
-1. **Incoming Request** → Server extracts domain from Host header
-2. **Domain Resolution** → Server finds project directory matching domain
-3. **Project Routing** → Server creates/retrieves Project instance
-4. **Request Handling** → Project applies rewrites, then:
-   - Static: Serves files from `public/`
-   - Redirect: Returns HTTP 301
-   - Proxy/Forward: Proxies to configured target
-   - Application: Starts process if needed, proxies to allocated port
-5. **Process Management** → If application, monitors for file changes and inactivity
+`config.go` - Parses `webcentral.ini` and `package.json`
 
-## Key Features
+`main.go` - Entry point, command-line args, starts server
 
-- **Sandboxing**: Firejail for system-level isolation, Docker for containerized environments
-- **Zero-downtime Updates**: Automatic restart on file changes
-- **Multi-user Support**: Runs applications with directory owner's UID/GID when started as root
-- **Automatic HTTPS**: Transparent Let's Encrypt certificate acquisition and renewal
-- **WebSocket Support**: Transparent WebSocket proxying
-- **Resource Management**: Automatic shutdown after inactivity period
+`test.py` - Test suite and harness
 
-## File Structure
+### State Machine
 
-```
-/opt/webcentral/go/
-├── main.go          # Entry point, CLI argument parsing
-├── server.go        # HTTP/HTTPS server, routing, ACME
-├── project.go       # Project lifecycle management
-├── logger.go        # Log rotation and pruning
-└── config.go        # Configuration file parsing
-```
+Each Project has one lifecycle goroutine owning all mutable state. Four phases:
 
-## Configuration
+- **stopped** → `starting` (apps) or `running` (static/proxy)
+- **starting** → `running` (port ready) or `stopped` (failure), queues requests
+- **running** → `stopping` (file change/timeout)
+- **stopping** → `stopped` (after SIGTERM/SIGKILL), queues requests, auto-restarts if queued
 
-Projects are configured via `webcentral.ini` in each project directory. The server itself is configured via command-line flags (see `--help`).
+Events sent via buffered channel (`eventCh`): `start`, `process_started`, `ready`, `exit`, `file_changed`, `timeout`, `stop_complete`
+
+### Goroutines
+
+**Per-project:**
+1. **Lifecycle** - Sole owner of state, processes events from `eventCh`
+2. **Process monitors** - Wait on `cmd.Wait()`, send `exit` events
+3. **Port waiter** - Polls port availability (30s timeout), sends `ready`/`exit`
+4. **Stop handler** - Sends `stop_complete` after 2.5s grace period
+5. **File watcher** - One-shot: sends `file_changed` then exits (recreated on restart)
+6. **Inactivity timer** - Periodic `timeout` events (if configured)
+7. **Log streamers** - 2 per process (stdout/stderr)
+8. **Request handlers** - HTTP server managed, stateless, block on completion channels
+
+**Server-level:**
+- HTTP/HTTPS listeners
+- Certificate acquisition
+- Directory watcher
+
+### Locking
+
+**Project-level: None needed**
+- Actor model: lifecycle goroutine owns all mutable state
+- Other goroutines use message passing via `eventCh`
+- Immutable fields (`dir`, `config`, `logger`, `uid`, `gid`, `useFirejail`, `pruneLogs`) safe to read anywhere
+
+**Server-level: Four mutexes for shared caches**
+1. `projectsMu` - Protects `projects` map (domain → Project)
+2. `bindingsMu` (RWMutex) - Domain → directory cache with double-checked locking
+3. `certRequestsMu` - Deduplicates certificate requests
+4. `approvedHostsMu` (RWMutex) - ACME approval cache
+
+**Logger:** Internal locking for concurrent writes
+
+
+## Developers notes
+
+- Keep AGENTS.md up-to-date when making architectural changes. Be succinct—no repetition, no code examples, bullet points over paragraphs.
+- Build using `go build`.
+- Run `./test.py` to execute the test suite. For new features, add tests in `test.py`. Don't create ad-hoc test scripts.
+- Add code comments only for explaining non-obvious logic, why things are done a certain way, and how thread-safety is ensured. Don't add comments describing what you're changing and why, as comments should reflect the final code, not the change history.
