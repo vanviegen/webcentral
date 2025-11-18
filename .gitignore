@@ -7,3 +7,5 @@ webcentral
 *.out
 go.work
 .claude
+target/
+webcentral

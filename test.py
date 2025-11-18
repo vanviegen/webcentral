@@ -67,13 +67,13 @@ class TestRunner:
         bindings_file = f"{self.tmpdir}/_bindings.json"
         self.webcentral_proc = subprocess.Popen(
             ['./webcentral',
-             '-projects', self.tmpdir,
-             '-http', str(self.port),
-             '-https', '0',
-             '-bindings-file', bindings_file],
+             '--projects', self.tmpdir,
+             '--http', str(self.port),
+             '--https', '0',
+             '--bindings-file', bindings_file],
             stdout=stdout_f,
             stderr=stderr_f,
-            cwd='/opt/webcentral'
+            cwd=os.path.dirname(os.path.abspath(__file__))
         )
 
         # Store file handles so they don't get closed
