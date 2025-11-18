@@ -154,9 +154,7 @@ func StopAllProjects() {
 }
 
 func (p *Project) needsProcessManagement() bool {
-	return p.config.Command != "" || p.config.Docker != nil ||
-		(p.config.Redirect == "" && p.config.Proxy == "" &&
-			p.config.Port == 0 && p.config.SocketPath == "")
+	return p.config.Command != "" || p.config.Docker != nil
 }
 
 // runLifecycle is the main lifecycle management goroutine
@@ -246,13 +244,15 @@ func (p *Project) runLifecycle() {
 			if s.phase == "stopping" {
 				switch e.Type {
 				case "start":
-					s.queue = append(s.queue, *e.Request)
+					if e.Request != nil {
+						s.queue = append(s.queue, *e.Request)
+					}
 				case "stop_complete":
 					s.phase, s.process, s.workers, s.proxy, s.port = "stopped", nil, nil, nil, 0
 					if len(s.queue) > 0 {
 						p.logger.Write("", "restarting due to queued requests")
-						// Re-inject first request to trigger restart
-						p.eventCh <- &Event{Type: "start", Request: &s.queue[0]}
+						// Trigger restart (queued requests will be served when ready)
+						p.eventCh <- &Event{Type: "start"}
 					}
 				}
 			}
@@ -403,8 +403,6 @@ func (p *Project) Handle(w http.ResponseWriter, r *http.Request) {
 	} else if p.config.Port > 0 {
 		p.handleForward(w, r)
 	} else if p.config.Command != "" || p.config.Docker != nil {
-		p.handleApplication(w, r)
-	} else if _, err := os.Stat(filepath.Join(p.dir, "package.json")); err == nil {
 		p.handleApplication(w, r)
 	} else {
 		p.handleStatic(w, r)
@@ -640,9 +638,6 @@ func (p *Project) startWorkers(port int) []*exec.Cmd {
 		// Build worker command
 		var cmd *exec.Cmd
 
-		// Substitute $PORT in worker command
-		workerCmd = strings.ReplaceAll(workerCmd, "$PORT", strconv.Itoa(port))
-
 		if p.useFirejail && p.config.Docker == nil {
 			homeDir := p.dir
 			if os.Geteuid() == 0 {
@@ -689,11 +684,8 @@ func (p *Project) startWorkers(port int) []*exec.Cmd {
 func (p *Project) buildCommand(port int) (*exec.Cmd, error) {
 	command := p.config.Command
 	if command == "" {
-		command = "npm start"
+		return nil, fmt.Errorf("no command specified in configuration")
 	}
-
-	// Substitute $PORT
-	command = strings.ReplaceAll(command, "$PORT", strconv.Itoa(port))
 
 	var cmd *exec.Cmd
 
@@ -804,8 +796,7 @@ func (p *Project) buildDockerCommand(port int) (*exec.Cmd, error) {
 	// Command
 	args = append(args, imageName)
 	if p.config.Command != "" {
-		command := strings.ReplaceAll(p.config.Command, "$PORT", strconv.Itoa(dc.HTTPPort))
-		args = append(args, "/bin/sh", "-c", command)
+		args = append(args, "/bin/sh", "-c", p.config.Command)
 	}
 
 	return exec.Command("docker", args...), nil
@@ -992,8 +983,8 @@ func (p *Project) startInactivityTimer(state *projectState) {
 	}
 
 	interval := time.Duration(p.config.Reload.Timeout/10) * time.Second
-	if interval < 10*time.Second {
-		interval = 10 * time.Second
+	if interval < 1*time.Second {
+		interval = 1 * time.Second
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
