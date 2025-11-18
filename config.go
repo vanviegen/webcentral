@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,10 +15,10 @@ type INIConfig struct {
 	sections map[string]map[string]interface{}
 }
 
-func ParseINI(path string) (*INIConfig, error) {
+func ParseINI(path string) (*INIConfig, []string) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, []string{fmt.Sprintf("Failed to open webcentral.ini: %v", err)}
 	}
 	defer file.Close()
 
@@ -26,12 +27,15 @@ func ParseINI(path string) (*INIConfig, error) {
 	}
 	config.sections[""] = make(map[string]interface{})
 
+	var parseErrors []string
 	currentSection := ""
 	scanner := bufio.NewScanner(file)
 	lineRegex := regexp.MustCompile(`^\s*([^=]+?)\s*=\s*(.*)$`)
 	sectionRegex := regexp.MustCompile(`^\s*\[([^\]]+)\]\s*$`)
 
+	lineNum := 0
 	for scanner.Scan() {
+		lineNum++
 		line := scanner.Text()
 		line = strings.TrimSpace(line)
 
@@ -66,14 +70,17 @@ func ParseINI(path string) (*INIConfig, error) {
 			} else {
 				config.sections[currentSection][key] = value
 			}
+		} else {
+			// Line doesn't match any known pattern
+			parseErrors = append(parseErrors, fmt.Sprintf("Invalid syntax in webcentral.ini at line %d: %s", lineNum, line))
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		parseErrors = append(parseErrors, fmt.Sprintf("Error reading webcentral.ini: %v", err))
 	}
 
-	return config, nil
+	return config, parseErrors
 }
 
 func (c *INIConfig) Get(section, key string) (string, bool) {
@@ -242,12 +249,14 @@ func LoadProjectConfig(dir string) (*ProjectConfig, error) {
 	// Try to load webcentral.ini
 	iniPath := filepath.Join(dir, "webcentral.ini")
 	if _, err := os.Stat(iniPath); err == nil {
-		ini, err := ParseINI(iniPath)
-		if err != nil {
-			return nil, err
-		}
+		ini, parseErrors := ParseINI(iniPath)
 
-		// Load root section
+		// Add parse errors to config errors
+		config.ConfigErrors = append(config.ConfigErrors, parseErrors...)
+
+		// If ini parsing failed completely, skip loading config values
+		if ini != nil {
+			// Load root section
 		if cmd, ok := ini.Get("", "command"); ok {
 			config.Command = cmd
 		}
@@ -374,12 +383,18 @@ func LoadProjectConfig(dir string) (*ProjectConfig, error) {
 			}
 		}
 
-		// Validate for unrecognized sections
-		knownSections := map[string]bool{"": true, "environment": true, "docker": true, "reload": true, "rewrite": true}
-		for section := range ini.sections {
-			if !knownSections[section] {
-				config.ConfigErrors = append(config.ConfigErrors, "Unknown section ["+section+"] in webcentral.ini")
+			// Validate for unrecognized sections
+			knownSections := map[string]bool{"": true, "environment": true, "docker": true, "reload": true, "rewrite": true}
+			for section := range ini.sections {
+				if !knownSections[section] {
+					config.ConfigErrors = append(config.ConfigErrors, "Unknown section ["+section+"] in webcentral.ini")
+				}
 			}
+		}
+
+		// Set default reload config if not set
+		if config.Reload == nil {
+			config.Reload = &ReloadConfig{Timeout: 300}
 		}
 	} else {
 		// No webcentral.ini, use defaults for reload

@@ -248,12 +248,29 @@ func (p *Project) runLifecycle() {
 						s.queue = append(s.queue, *e.Request)
 					}
 				case "stop_complete":
-					s.phase, s.process, s.workers, s.proxy, s.port = "stopped", nil, nil, nil, 0
+					// Remove project from map so it will be recreated fresh
+					projectsMu.Lock()
+					delete(projects, p.dir)
+					projectsMu.Unlock()
+
+					// If there are queued requests, create fresh project and serve them
 					if len(s.queue) > 0 {
-						p.logger.Write("", "restarting due to queued requests")
-						// Trigger restart (queued requests will be served when ready)
-						p.eventCh <- &Event{Type: "start"}
+						// Create fresh project with new config
+						freshProject, err := GetProject(p.dir, p.useFirejail, p.pruneLogs)
+						if err != nil {
+							p.logger.Write("", fmt.Sprintf("failed to create fresh project: %v", err))
+							p.flushQueue(s.queue, "Failed to reload project")
+						} else {
+							// Send queued requests to fresh project's event loop
+							for _, req := range s.queue {
+								freshProject.eventCh <- &Event{Type: "start", Request: &req}
+							}
+						}
 					}
+
+					// Cleanup and exit lifecycle
+					p.cleanup(s)
+					return
 				}
 			}
 		

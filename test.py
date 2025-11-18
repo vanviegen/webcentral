@@ -18,9 +18,11 @@ from functools import wraps
 GREEN = '\033[92m'
 RED = '\033[91m'
 YELLOW = '\033[93m'
+GRAY = '\033[90m'
 RESET = '\033[0m'
 CHECKMARK = '✓'
 CROSSMARK = '✗'
+CLEAR_LINE = '\033[2K\r'
 
 
 class TestRunner:
@@ -210,6 +212,8 @@ class TestRunner:
 
     def await_log(self, project, text, timeout=2):
         """Wait for text to appear in log"""
+        print(f"{CLEAR_LINE}{GRAY}→ Waiting for log: {text[:50]}...{RESET}", end='', flush=True)
+
         start_pos = self.log_positions.get(project, 0)
         start_time = time.time()
 
@@ -219,15 +223,18 @@ class TestRunner:
                 return
             time.sleep(0.05)
 
+        print()  # Clear the progress line
         content = self.get_log_content(project, start_pos)
         raise TimeoutError(
             f"Timeout waiting for '{text}' in {project} logs after {timeout}s.\n"
             f"Log content:\n{content}"
         )
 
-    def assert_http(self, host, path, check_body=None, check_code=200, method='GET', data=None):
+    def assert_http(self, host, path, check_body=None, check_code=200, method='GET', data=None, timeout=5):
         """Make HTTP request and assert response"""
-        conn = http.client.HTTPConnection('localhost', self.port)
+        print(f"{CLEAR_LINE}{GRAY}→ HTTP {method} {host}{path}{RESET}", end='', flush=True)
+
+        conn = http.client.HTTPConnection('localhost', self.port, timeout=timeout)
         headers = {'Host': host}
 
         try:
@@ -248,6 +255,7 @@ class TestRunner:
 
             return body
         finally:
+            print(CLEAR_LINE, end='', flush=True)
             conn.close()
 
     def register_test(self, func):
@@ -289,9 +297,9 @@ class TestRunner:
                     self.mark_all_logs_read()
 
                     test_func(self)
-                    print(f"{GREEN}{CHECKMARK}{RESET} {test_name}")
+                    print(f"{CLEAR_LINE}{GREEN}{CHECKMARK}{RESET} {test_name}")
                 except Exception as e:
-                    print(f"{RED}{CROSSMARK}{RESET} {test_name}")
+                    print(f"{CLEAR_LINE}{RED}{CROSSMARK}{RESET} {test_name}")
                     print(f"{RED}Error: {e}{RESET}")
 
                     # Show all new log content
@@ -804,6 +812,239 @@ def test_procfile_unsupported_type(t):
     t.assert_http('procfile.test', '/', check_body='Procfile Test')
     t.assert_log('procfile.test', "Procfile process type 'clock' is not supported", count=1)
     t.assert_log('procfile.test', 'reachable on port', count=1)
+
+
+@test
+def test_procfile_web_only(t):
+    """Procfile with only web process starts successfully"""
+    t.write_file('procweb.test/Procfile',
+                 'web: python3 -u -m http.server $PORT')
+    t.write_file('procweb.test/index.html', '<h1>Procfile Web</h1>')
+
+    # Make HTTP request to trigger app start
+    t.assert_http('procweb.test', '/', check_body='Procfile Web')
+    t.assert_log('procweb.test', 'reachable on port', count=1)
+
+
+@test
+def test_procfile_with_worker(t):
+    """Procfile with web + worker processes"""
+    # Create a worker script that writes to a file
+    t.write_file('procworker.test/worker.py', '''
+import time
+import os
+print("Worker starting...", flush=True)
+time.sleep(0.5)
+with open("worker_output.txt", "w") as f:
+    f.write("Worker was here")
+print("Worker task complete", flush=True)
+time.sleep(100)  # Keep running
+''')
+
+    t.write_file('procworker.test/Procfile',
+                 'web: python3 -u -m http.server $PORT\nworker: python3 -u worker.py')
+    t.write_file('procworker.test/index.html', '<h1>Procfile with Worker</h1>')
+
+    # Make HTTP request to trigger app start
+    t.assert_http('procworker.test', '/', check_body='Procfile with Worker')
+    t.assert_log('procworker.test', 'reachable on port', count=1)
+
+    # Verify worker started
+    t.assert_log('procworker.test', 'starting 1 worker(s)', count=1)
+    t.await_log('procworker.test', 'Worker starting...')
+    t.await_log('procworker.test', 'Worker task complete')
+
+    # Verify worker output file was created
+    time.sleep(0.2)
+    worker_output = os.path.join(t.tmpdir, 'procworker.test/worker_output.txt')
+    if not os.path.exists(worker_output):
+        raise AssertionError("Worker output file was not created")
+
+
+@test
+def test_procfile_multiple_workers(t):
+    """Procfile with multiple worker processes"""
+    t.write_file('procmulti.test/worker1.py', '''
+import time
+print("Worker 1 starting", flush=True)
+time.sleep(100)
+''')
+
+    t.write_file('procmulti.test/worker2.py', '''
+import time
+print("Worker 2 starting", flush=True)
+time.sleep(100)
+''')
+
+    t.write_file('procmulti.test/Procfile',
+                 'web: python3 -u -m http.server $PORT\n'
+                 'worker: python3 -u worker1.py\n'
+                 'urgentworker: python3 -u worker2.py')
+    t.write_file('procmulti.test/index.html', '<h1>Multiple Workers</h1>')
+
+    # Make HTTP request to trigger app start
+    t.assert_http('procmulti.test', '/', check_body='Multiple Workers')
+    t.assert_log('procmulti.test', 'reachable on port', count=1)
+
+    # Verify both workers started
+    t.assert_log('procmulti.test', 'starting 2 worker(s)', count=1)
+    t.await_log('procmulti.test', 'Worker 1 starting')
+    t.await_log('procmulti.test', 'Worker 2 starting')
+
+
+@test
+def test_ini_single_worker(t):
+    """webcentral.ini with single worker process"""
+    t.write_file('iniworker.test/worker.py', '''
+import time
+print("INI Worker running", flush=True)
+time.sleep(100)
+''')
+
+    t.write_file('iniworker.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT\n'
+                 'worker=python3 -u worker.py')
+    t.write_file('iniworker.test/index.html', '<h1>INI Worker</h1>')
+
+    # Make HTTP request to trigger app start
+    t.assert_http('iniworker.test', '/', check_body='INI Worker')
+    t.assert_log('iniworker.test', 'reachable on port', count=1)
+
+    # Verify worker started
+    t.assert_log('iniworker.test', 'starting 1 worker(s)', count=1)
+    t.await_log('iniworker.test', 'INI Worker running')
+
+
+@test
+def test_ini_multiple_named_workers(t):
+    """webcentral.ini with multiple named worker processes"""
+    t.write_file('inimulti.test/email_worker.py', '''
+import time
+print("Email worker active", flush=True)
+time.sleep(100)
+''')
+
+    t.write_file('inimulti.test/task_worker.py', '''
+import time
+print("Task worker active", flush=True)
+time.sleep(100)
+''')
+
+    t.write_file('inimulti.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT\n'
+                 'worker:email=python3 -u email_worker.py\n'
+                 'worker:tasks=python3 -u task_worker.py')
+    t.write_file('inimulti.test/index.html', '<h1>Multiple Named Workers</h1>')
+
+    # Make HTTP request to trigger app start
+    t.assert_http('inimulti.test', '/', check_body='Multiple Named Workers')
+    t.assert_log('inimulti.test', 'reachable on port', count=1)
+
+    # Verify workers started
+    t.assert_log('inimulti.test', 'starting 2 worker(s)', count=1)
+    t.await_log('inimulti.test', 'Email worker active')
+    t.await_log('inimulti.test', 'Task worker active')
+
+
+@test
+def test_workers_restart_on_file_change(t):
+    """Workers restart when files change"""
+    t.write_file('workerreload.test/worker.py', '''
+import time
+print("Worker v1", flush=True)
+time.sleep(100)
+''')
+
+    t.write_file('workerreload.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT\n'
+                 'worker=python3 -u worker.py')
+    t.write_file('workerreload.test/index.html', '<h1>Version 1</h1>')
+
+    # Make HTTP request to trigger app start
+    t.assert_http('workerreload.test', '/', check_body='Version 1')
+    t.assert_log('workerreload.test', 'reachable on port', count=1)
+    t.await_log('workerreload.test', 'Worker v1')
+
+    # Mark logs as read before making changes
+    t.mark_log_read('workerreload.test')
+
+    # Modify worker file to trigger reload
+    t.write_file('workerreload.test/worker.py', '''
+import time
+print("Worker v2", flush=True)
+time.sleep(100)
+''')
+
+    # Wait for stop
+    t.await_log('workerreload.test', 'stopping due to change')
+
+    # Make HTTP request to trigger restart
+    t.assert_http('workerreload.test', '/', check_body='Version 1')
+    t.assert_log('workerreload.test', 'reachable on port', count=1)
+    t.await_log('workerreload.test', 'Worker v2')
+
+
+@test
+def test_workers_stop_on_inactivity(t):
+    """Workers stop with main process on inactivity timeout"""
+    t.write_file('workertimeout.test/worker.py', '''
+import time
+print("Worker running", flush=True)
+time.sleep(100)
+''')
+
+    t.write_file('workertimeout.test/webcentral.ini',
+                 'command=python3 -u -m http.server $PORT\n'
+                 'worker=python3 -u worker.py\n\n'
+                 '[reload]\ntimeout=1')
+    t.write_file('workertimeout.test/index.html', '<h1>Worker Timeout</h1>')
+
+    # Make HTTP request to trigger app start
+    t.assert_http('workertimeout.test', '/', check_body='Worker Timeout')
+    t.assert_log('workertimeout.test', 'reachable on port', count=1)
+    t.await_log('workertimeout.test', 'Worker running')
+
+    t.mark_log_read('workertimeout.test')
+
+    # Wait for timeout
+    t.await_log('workertimeout.test', 'stopping due to inactivity', timeout=3)
+
+
+@test
+def test_broken_ini_syntax_error(t):
+    """Broken webcentral.ini shows error in log"""
+    # Create a completely broken ini file (just nonsense)
+    t.write_file('brokenini.test/webcentral.ini', 'asdfasdf\n!!@@##\ngarbage\n')
+    t.write_file('brokenini.test/public/index.html', '<h1>Static Content</h1>')
+
+    # Should still serve static files
+    t.assert_http('brokenini.test', '/', check_body='Static Content')
+
+    # Should log errors about the invalid syntax
+    t.assert_log('brokenini.test', 'Invalid syntax in webcentral.ini at line 1: asdfasdf', count=1)
+    t.assert_log('brokenini.test', 'Invalid syntax in webcentral.ini at line 2: !!@@##', count=1)
+    t.assert_log('brokenini.test', 'Invalid syntax in webcentral.ini at line 3: garbage', count=1)
+
+
+@test
+def test_edit_broken_ini_triggers_reload(t):
+    """Editing webcentral.ini triggers reload even if broken"""
+    # Start with a broken ini
+    t.write_file('editini.test/webcentral.ini', 'garbage nonsense\n!!!')
+    t.write_file('editini.test/public/index.html', '<h1>Version 1</h1>')
+
+    # Make initial request
+    t.assert_http('editini.test', '/', check_body='Version 1')
+    t.mark_log_read('editini.test')
+
+    # Edit the ini file (still broken)
+    t.write_file('editini.test/webcentral.ini', 'different garbage\n###')
+
+    # Should trigger a reload/restart
+    t.await_log('editini.test', 'stopping due to change', timeout=2)
+
+    # Should still serve static files after reload
+    t.assert_http('editini.test', '/', check_body='Version 1')
 
 
 if __name__ == '__main__':

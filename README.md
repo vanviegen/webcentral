@@ -2,9 +2,6 @@
 
 A reverse proxy that runs multiple web applications on a single server. Just put your apps in directories named after their domains (like `myapp.example.com`), point its DNS at the server, and you're done! The apps will start (and shutdown) on-demand, and reload when their files change.
 
-> **Note:** This is an AI-driven Go reimplementation of the [original Node.js version](https://github.com/vanviegen/webcentral/tree/nodejs). It was born out of Node.js dependency rot frustration.
-
----
 
 ## Features
 
@@ -94,11 +91,11 @@ You can run background worker processes alongside the main command:
 
 ```ini
 command = python app.py --port $PORT
-worker[] = python background_tasks.py
-worker[] = python email_processor.py
+worker = python background_tasks.py
+worker:email = python email_processor.py
 ```
 
-Workers share the same lifecycle as the main process and have access to the same environment variables.
+Use `worker` for a single unnamed worker, or `worker:name` for multiple named workers. Workers share the same lifecycle as the main process and have access to the same environment variables.
 
 ### 2. Dockerized Command
 
@@ -349,31 +346,23 @@ Make sure no other services are using ports 80 or 443.
 
 ---
 
-## Differences from Node.js Version
+## Changelog
 
-The Go implementation provides:
+2025-11-16:
+ - Added a test suite, mostly for catching configuration-change race conditions.
+ - Configurable log retention (`--prune-logs`)
+ - Proactive certificate acquisition for new projects
+ - Added Procfile support (though no `release:` yet)
+ - Added support for worker processes alongside main app process (not for Docker yet)
 
-- **Single static binary** - No runtime dependencies or npm packages
-- **Better performance** - Lower memory footprint and faster startup
-- **Native concurrency** - Goroutines handle requests more efficiently
-- **Enhanced features:**
-  - Configurable log retention (`--prune-logs`)
-  - Proactive certificate acquisition for new projects
+2025-11-16:
+ - Initial AI-driven Go reimplementation of the [original Node.js version](https://github.com/vanviegen/webcentral/tree/nodejs). It was born out of Node.js dependency rot frustration. It also adds multi-threading.
+ - Should be fully compatible with original configuration format and project structure.
 
-Fully compatible with the Node.js version's configuration format and project structure.
+See `git log` for further changes.
 
----
-
-## Dependencies
-
-**Build time:**
-- Go 1.16 or later
-
-**Runtime (optional):**
-- Firejail (for sandboxing)
-- Docker (for containerized applications)
-
-The compiled binary is self-contained with no runtime dependencies.
+2018-09-14:
+  - Initial release.
 
 ---
 
