@@ -161,7 +161,11 @@ func (p *Project) needsProcessManagement() bool {
 
 // runLifecycle is the main lifecycle management goroutine
 func (p *Project) runLifecycle() {
-	s := &projectState{phase: "stopped"}
+	phase := "running"
+	if p.needsProcessManagement() {
+		phase = "stopped"
+	}
+	s := &projectState{phase: phase}
 
 	// Always start file watcher (all projects watch webcentral.ini, apps watch more)
 	if err := p.startFileWatcher(s); err != nil {
@@ -814,34 +818,49 @@ func (p *Project) waitForPort(port int, timeout time.Duration) bool {
 }
 
 func (p *Project) stopProcess(s *projectState) {
-	hasProcess := false
+	var processes []*exec.Cmd
 
 	// Stop workers
 	for i, worker := range s.workers {
 		if worker != nil && worker.Process != nil {
-			hasProcess = true
 			p.logger.Write("", fmt.Sprintf("stopping worker %d", i+1))
 			worker.Process.Signal(syscall.SIGTERM)
 			time.AfterFunc(2*time.Second, func() { worker.Process.Kill() })
+			processes = append(processes, worker)
 		}
 	}
 
 	// Stop main process
 	if s.process != nil && s.process.Process != nil {
-		hasProcess = true
 		s.process.Process.Signal(syscall.SIGTERM)
 		time.AfterFunc(2*time.Second, func() { s.process.Process.Kill() })
+		processes = append(processes, s.process)
 	}
 
 	// Fast-path for non-apps: signal completion immediately
-	if !hasProcess {
+	if len(processes) == 0 {
 		p.eventCh <- &Event{Type: "stop_complete"}
 		return
 	}
 
-	// Wait a bit then signal completion for apps
+	// Wait for all processes to exit, with 2.5s timeout
 	go func() {
-		time.Sleep(2500 * time.Millisecond)
+		done := make(chan struct{})
+		
+		go func() {
+			for _, proc := range processes {
+				proc.Wait()
+			}
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			// All processes exited
+		case <-time.After(2500 * time.Millisecond):
+			// Timeout
+		}
+		
 		p.eventCh <- &Event{Type: "stop_complete"}
 	}()
 }
@@ -899,11 +918,8 @@ func (p *Project) startFileWatcher(state *projectState) error {
 		includes = []string{"**/*"}
 	}
 
-	// Always watch webcentral.ini
-	iniPath := filepath.Join(p.dir, "webcentral.ini")
-	if _, err := os.Stat(iniPath); err == nil {
-		watcher.Add(iniPath)
-	}
+	// Always watch the project directory to detect webcentral.ini creation/changes
+	watcher.Add(p.dir)
 
 	// Only watch other files if this project runs processes
 	if p.needsProcessManagement() {

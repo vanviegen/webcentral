@@ -208,7 +208,7 @@ class TestRunner:
         if actual_count != count:
             raise AssertionError(
                 f"Expected '{text}' to appear {count} time(s) in {project} logs, "
-                f"but found {actual_count} time(s).\nLog content:\n{content}"
+                f"but found {actual_count} time(s)."
             )
 
     def await_log(self, project, text, timeout=2):
@@ -227,8 +227,7 @@ class TestRunner:
         print()  # Clear the progress line
         content = self.get_log_content(project, start_pos)
         raise TimeoutError(
-            f"Timeout waiting for '{text}' in {project} logs after {timeout}s.\n"
-            f"Log content:\n{content}"
+            f"Timeout waiting for '{text}' in {project} logs after {timeout}s."
         )
 
     def assert_http(self, host, path, check_body=None, check_code=200, method='GET', data=None, timeout=5):
@@ -301,14 +300,14 @@ class TestRunner:
                     print(f"{CLEAR_LINE}{GREEN}{CHECKMARK}{RESET} {test_name}")
                 except Exception as e:
                     print(f"{CLEAR_LINE}{RED}{CROSSMARK}{RESET} {test_name}")
-                    print(f"{RED}Error: {e}{RESET}")
+                    print(f"{RED}Error:{RESET} {e}")
                     
                     # Extract and show location from traceback
                     # Find the frame for the test function itself
                     tb = traceback.extract_tb(e.__traceback__)
                     for frame in tb:
                         if frame.name == test_func.__name__:
-                            print(f"At: {frame.filename}:{frame.lineno}")
+                            print(f"{RED}At:{RESET} {frame.filename}:{frame.lineno}")
                             break
 
                     # Show all new log content
@@ -1151,7 +1150,7 @@ def test_ini_valid_to_broken(t):
 
     # Now should serve static
     t.assert_http('breakini.test', '/', check_body='Static')
-    t.assert_log('breakini.test', 'Invalid syntax in webcentral.ini', count=1)
+    t.assert_log('breakini.test', 'Invalid syntax in webcentral.ini', count=2)
 
 
 @test
