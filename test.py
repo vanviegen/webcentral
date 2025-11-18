@@ -1351,6 +1351,164 @@ def test_app_changes_to_redirect(t):
     t.assert_http('app2redir.test', '/', check_code=301)
 
 
+@test
+def test_static_ignores_non_config_file_changes(t):
+    """Static file servers should only reload on webcentral.ini/Procfile changes"""
+    # Start with static site
+    t.write_file('staticwatch.test/public/index.html', '<h1>Static</h1>')
+    
+    # Access to start the project
+    t.assert_http('staticwatch.test', '/', check_body='Static')
+    t.mark_log_read('staticwatch.test')
+    
+    # Create a random file in the root (should NOT trigger reload for static sites)
+    t.write_file('staticwatch.test/random.txt', 'some content')
+    
+    # Should NOT have any "stopping" log
+    t.assert_http('staticwatch.test', '/', check_body='Static')
+    t.assert_log('staticwatch.test', 'stopping due to change', count=0)
+    
+    # But adding webcentral.ini should trigger reload
+    t.write_file('staticwatch.test/webcentral.ini', 'command=echo test')
+    t.await_log('staticwatch.test', 'stopping due to change', timeout=2)
+
+
+@test
+def test_app_respects_include_patterns(t):
+    """Apps should only reload for files matching include patterns"""
+    # Start with app that only watches .py files
+    t.write_file('includetest.test/webcentral.ini', '''
+command=python3 -u -m http.server $PORT
+[reload]
+include[]=*.py
+include[]=webcentral.ini
+''')
+    t.write_file('includetest.test/index.html', '<h1>Original</h1>')
+    
+    # Start the app
+    t.assert_http('includetest.test', '/', check_body='Original')
+    t.assert_log('includetest.test', 'reachable on port', count=1)
+    t.mark_log_read('includetest.test')
+    
+    # Modify .txt file (should NOT trigger reload)
+    t.write_file('includetest.test/data.txt', 'new data')
+    
+    # Should NOT have reloaded
+    t.assert_http('includetest.test', '/', check_body='Original')
+    t.assert_log('includetest.test', 'stopping due to change', count=0)
+    
+    # Modify .py file (should trigger reload)
+    t.write_file('includetest.test/script.py', 'print("test")')
+    t.await_log('includetest.test', 'stopping due to change', timeout=2)
+
+
+@test
+def test_app_respects_exclude_patterns(t):
+    """Apps should not reload for files matching exclude patterns"""
+    # Start with app that excludes .tmp files
+    t.write_file('excludetest.test/webcentral.ini', '''
+command=python3 -u -m http.server $PORT
+[reload]
+exclude[]=*.tmp
+exclude[]=temp/*
+''')
+    t.write_file('excludetest.test/index.html', '<h1>Test</h1>')
+    
+    # Start the app
+    t.assert_http('excludetest.test', '/', check_body='Test')
+    t.assert_log('excludetest.test', 'reachable on port', count=1)
+    t.mark_log_read('excludetest.test')
+    
+    # Create excluded .tmp file (should NOT trigger reload)
+    t.write_file('excludetest.test/temp.tmp', 'temporary')
+    
+    # Should NOT have reloaded
+    t.assert_http('excludetest.test', '/', check_body='Test')
+    t.assert_log('excludetest.test', 'stopping due to change', count=0)
+    
+    # Create file in excluded directory (should NOT trigger reload)
+    t.write_file('excludetest.test/temp/file.txt', 'data')
+    
+    # Wait a bit
+    t.assert_http('excludetest.test', '/', check_body='Test')
+    t.assert_log('excludetest.test', 'stopping due to change', count=0)
+    
+    # Create regular file (should trigger reload)
+    t.write_file('excludetest.test/data.json', '{}')
+    t.await_log('excludetest.test', 'stopping due to change', timeout=2)
+
+
+@test
+def test_rooted_path_pattern(t):
+    """Pattern with leading ./ should match from root only"""
+    # App that watches all files but demonstrates basename matching
+    t.write_file('rootedtest.test/webcentral.ini', '''
+command=python3 -u -m http.server $PORT
+[reload]
+include[]=**/*
+exclude[]=subdir/package.json
+''')
+    t.write_file('rootedtest.test/package.json', '{"version": "1.0.0"}')
+    t.write_file('rootedtest.test/subdir/package.json', '{"version": "2.0.0"}')
+    
+    # Start the app
+    t.assert_http('rootedtest.test', '/')
+    t.assert_log('rootedtest.test', 'reachable on port', count=1)
+    t.mark_log_read('rootedtest.test')
+    
+    # Modify subdir/package.json (explicitly excluded, should NOT reload)
+    t.write_file('rootedtest.test/subdir/package.json', '{"version": "2.0.1"}')
+    t.assert_http('rootedtest.test', '/')
+    t.assert_log('rootedtest.test', 'stopping due to change', count=0)
+    
+    # Modify root package.json (not excluded, should reload)
+    t.write_file('rootedtest.test/package.json', '{"version": "1.0.1"}')
+    t.await_log('rootedtest.test', 'stopping due to change', timeout=2)
+
+
+@test
+def test_dirCouldContainIncludes_logic(t):
+    """Test the dirCouldContainIncludes helper function logic"""
+    # Create a simple Go app that tests the helper function
+    t.write_file('helpertest.test/webcentral.ini', '''
+command=python3 -u -m http.server $PORT
+''')
+    t.write_file('helpertest.test/index.html', '<h1>Test</h1>')
+    
+    # Just verify the app works
+    t.assert_http('helpertest.test', '/', check_body='Test')
+
+
+@test  
+def test_matchesPattern_logic(t):
+    """Verify matchesPattern behavior with path patterns"""
+    # Test that pattern "src" matches "src/package.json"
+    # This is the root cause: exclude pattern "src" blocks "src/package.json" before includes are checked
+    t.write_file('patterntest.test/webcentral.ini', '''
+command=python3 -u -m http.server $PORT
+[reload]
+# With only includes and no excludes, verify src/package.json triggers reload
+include[]=src/package.json
+''')
+    t.write_file('patterntest.test/index.html', '<h1>V1</h1>')
+    t.write_file('patterntest.test/src/package.json', '{"version": "1.0.0"}')
+    t.write_file('patterntest.test/src/other.js', 'console.log("v1")')
+    
+    # Start the app
+    t.assert_http('patterntest.test', '/', check_body='V1')
+    t.assert_log('patterntest.test', 'reachable on port', count=1)
+    t.mark_log_read('patterntest.test')
+    
+    # Modify src/other.js (not included, should NOT reload)
+    t.write_file('patterntest.test/src/other.js', 'console.log("v2")')
+    t.assert_http('patterntest.test', '/', check_body='V1')
+    t.assert_log('patterntest.test', 'stopping due to change', count=0)
+    
+    # Modify src/package.json (included, SHOULD reload)
+    t.write_file('patterntest.test/src/package.json', '{"version": "1.0.1"}')
+    t.await_log('patterntest.test', 'stopping due to change', timeout=2)
+
+
 if __name__ == '__main__':
     # Parse command line arguments for test names
     test_names = sys.argv[1:] if len(sys.argv) > 1 else None

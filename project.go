@@ -43,27 +43,27 @@ type Event struct {
 
 // projectState holds all mutable state for a project (owned by lifecycle goroutine)
 type projectState struct {
-	phase        string // "stopped", "starting", "running", "stopping"
-	process      *exec.Cmd
-	workers      []*exec.Cmd
-	port         int
-	proxy        *httputil.ReverseProxy
-	queue        []QueuedRequest
-	cancelWatch  context.CancelFunc
-	watcher      *fsnotify.Watcher
-	cancelTimer  context.CancelFunc
+	phase       string // "stopped", "starting", "running", "stopping"
+	process     *exec.Cmd
+	workers     []*exec.Cmd
+	port        int
+	proxy       *httputil.ReverseProxy
+	queue       []QueuedRequest
+	cancelWatch context.CancelFunc
+	watcher     *fsnotify.Watcher
+	cancelTimer context.CancelFunc
 }
 
 // Project represents a single domain/application
 type Project struct {
 	// Immutable configuration (safe to read from any goroutine)
-	dir         string
-	config      *ProjectConfig
-	logger      *Logger
-	uid         int
-	gid         int
-	useFirejail bool
-	pruneLogs   int
+	dir          string
+	config       *ProjectConfig
+	logger       *Logger
+	uid          int
+	gid          int
+	useFirejail  bool
+	pruneLogs    int
 	lastActivity atomic.Int64
 
 	// Lifecycle management (single goroutine owns state)
@@ -281,7 +281,7 @@ func (p *Project) runLifecycle() {
 					return
 				}
 			}
-		
+
 		case <-p.done:
 			p.cleanup(s)
 			return
@@ -411,7 +411,6 @@ func (p *Project) Handle(w http.ResponseWriter, r *http.Request) {
 		r.URL.Path = newPath
 		r.RequestURI = newPath
 	}
-
 
 	p.dispatchRequest(r, w)
 }
@@ -609,7 +608,7 @@ func (p *Project) startProcess(port int) {
 	if p.config.Docker != nil {
 		cmd, err = p.buildDockerCommand(port)
 	} else {
-		cmd, err= p.buildShellCommand(p.config.Command), nil
+		cmd, err = p.buildShellCommand(p.config.Command), nil
 	}
 
 	if err != nil {
@@ -846,7 +845,7 @@ func (p *Project) stopProcess(s *projectState) {
 	// Wait for all processes to exit, with 2.5s timeout
 	go func() {
 		done := make(chan struct{})
-		
+
 		go func() {
 			for _, proc := range processes {
 				proc.Wait()
@@ -860,7 +859,7 @@ func (p *Project) stopProcess(s *projectState) {
 		case <-time.After(2500 * time.Millisecond):
 			// Timeout
 		}
-		
+
 		p.eventCh <- &Event{Type: "stop_complete"}
 	}()
 }
@@ -910,38 +909,43 @@ func (p *Project) startFileWatcher(state *projectState) error {
 
 	state.watcher = watcher
 
-	// Add directories to watch
-	includes := p.config.Reload.Include
-	excludes := append(p.config.Reload.Exclude, "_webcentral_data", "node_modules", "**/*.log", "**/.*", "data", "log", "logs")
+	// Default exclude patterns (always applied)
+	defaultExcludes := []string{"_webcentral_data/**", "node_modules/**", "**/*.log", "**/.*", "data/**", "log/**", "logs/**"}
 
+	// Combine with user excludes
+	excludes := append(defaultExcludes, p.config.Reload.Exclude...)
+
+	// Prepare include patterns
+	includes := p.config.Reload.Include
 	if len(includes) == 0 {
-		includes = []string{"**/*"}
+		// For static sites, only watch config files
+		if p.needsProcessManagement() {
+			includes = []string{"**/*"}
+		} else {
+			includes = []string{"webcentral.ini", "Procfile"}
+		}
 	}
 
-	// Always watch the project directory to detect webcentral.ini creation/changes
+	// Always watch the project directory itself
 	watcher.Add(p.dir)
 
-	// Only watch other files if this project runs processes
+	// For apps, also watch subdirectories (respecting excludes)
 	if p.needsProcessManagement() {
-		// Watch directories based on include/exclude patterns
 		filepath.Walk(p.dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
+			if err != nil || path == p.dir {
 				return nil
 			}
 
 			relPath, _ := filepath.Rel(p.dir, path)
 
-			// Check excludes
-			for _, pattern := range excludes {
-				if matched, _ := filepath.Match(pattern, relPath); matched {
-					if info.IsDir() {
-						return filepath.SkipDir
-					}
-					return nil
-				}
-			}
-
+			// Check if directory should be excluded
 			if info.IsDir() {
+				// Only skip if directory matches exclude AND no include pattern could match inside it
+				matchesExclude := dirMatchesExclude(relPath, excludes)
+				couldContainIncludes := dirCouldContainIncludes(relPath, includes)
+				if matchesExclude && !couldContainIncludes {
+					return filepath.SkipDir
+				}
 				watcher.Add(path)
 			}
 
@@ -962,8 +966,13 @@ func (p *Project) startFileWatcher(state *projectState) error {
 				}
 
 				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove) != 0 {
-					p.eventCh <- &Event{Type: "file_changed", Path: event.Name}
-					return
+					relPath, _ := filepath.Rel(p.dir, event.Name)
+
+					// Check if file should trigger reload based on include/exclude patterns
+					if p.shouldReloadForFile(relPath, includes, excludes) {
+						p.eventCh <- &Event{Type: "file_changed", Path: event.Name}
+						return
+					}
 				}
 
 			case err, ok := <-watcher.Errors:
@@ -979,6 +988,144 @@ func (p *Project) startFileWatcher(state *projectState) error {
 	}()
 
 	return nil
+}
+
+// shouldReloadForFile checks if a file path matches include patterns and doesn't match exclude patterns
+func (p *Project) shouldReloadForFile(relPath string, includes, excludes []string) bool {
+	// Check excludes first
+	for _, pattern := range excludes {
+		if matchesPattern(relPath, pattern) {
+			return false
+		}
+	}
+
+	// Check includes
+	for _, pattern := range includes {
+		if matchesPattern(relPath, pattern) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// dirMatchesExclude checks if a directory path matches any exclude pattern
+func dirMatchesExclude(dirPath string, excludes []string) bool {
+	for _, pattern := range excludes {
+		if matchesPattern(dirPath, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// dirCouldContainIncludes checks if any include pattern could match files inside this directory
+func dirCouldContainIncludes(dirPath string, includes []string) bool {
+	for _, pattern := range includes {
+		// Strip leading ./ if present
+		pattern = strings.TrimPrefix(pattern, "./")
+		pattern = strings.TrimSuffix(pattern, "/")
+
+		// Pattern "**/*" or "**" matches everything
+		if pattern == "**/*" || pattern == "**" {
+			return true
+		}
+
+		// Pattern like "src/package.json" - check if dirPath is a prefix
+		if strings.Contains(pattern, "/") {
+			// If pattern starts with or contains dirPath, it could match inside
+			if strings.HasPrefix(pattern, dirPath+"/") {
+				return true
+			}
+			if pattern == dirPath {
+				return true
+			}
+		}
+
+		// Pattern like "**/foo" could match inside any directory
+		if strings.HasPrefix(pattern, "**/") {
+			return true
+		}
+
+		// Pattern like "foo/**" - check if it matches this dir
+		if strings.HasSuffix(pattern, "/**") {
+			base := strings.TrimSuffix(pattern, "/**")
+			if dirPath == base || strings.HasPrefix(dirPath, base+"/") || strings.HasSuffix(dirPath, "/"+base) || strings.Contains(dirPath, "/"+base+"/") {
+				return true
+			}
+		}
+
+		// Simple pattern like "package.json" or "*.js" could match files inside any directory
+		if !strings.Contains(pattern, "/") {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesPattern checks if a path matches a glob pattern, following gitignore-style rules:
+// - "foo" matches "foo" and "foo/**" (file or directory and its contents)
+// - "foo/" same as "foo"
+// - "foo/*" matches direct children only
+// - "**/foo" matches "foo" anywhere
+// - "foo/**" or "foo/**/*" matches everything under "foo"
+func matchesPattern(path, pattern string) bool {
+	pattern = strings.TrimSuffix(pattern, "/")
+
+	// Convert gitignore-style patterns to prefix/suffix matching
+	if strings.Contains(pattern, "**") {
+		// Split on first occurrence of **
+		parts := strings.SplitN(pattern, "**", 2)
+		prefix := strings.TrimSuffix(parts[0], "/")
+		suffix := strings.TrimPrefix(parts[1], "/")
+
+		// Check prefix
+		if prefix != "" && path != prefix && !strings.HasPrefix(path, prefix+"/") {
+			return false
+		}
+
+		// Check suffix
+		if suffix != "" {
+			if prefix != "" {
+				path = strings.TrimPrefix(path, prefix+"/")
+			}
+			if path != suffix && !strings.HasSuffix(path, "/"+suffix) && !strings.Contains(path, "/"+suffix+"/") {
+				matched, _ := filepath.Match(suffix, filepath.Base(path))
+				return matched
+			}
+		}
+		return true
+	}
+
+	// Pattern "foo/*" matches only direct children
+	if strings.HasSuffix(pattern, "/*") {
+		dir := strings.TrimSuffix(pattern, "/*")
+		if path == dir {
+			return true
+		}
+		if strings.HasPrefix(path, dir+"/") {
+			return !strings.Contains(strings.TrimPrefix(path, dir+"/"), "/")
+		}
+		return false
+	}
+
+	// Pattern with "/" is a path pattern
+	if strings.Contains(pattern, "/") {
+		matched, _ := filepath.Match(pattern, path)
+		return matched || path == pattern || strings.HasPrefix(path, pattern+"/")
+	}
+
+	// Simple pattern "foo" matches the name anywhere and everything under it
+	if path == pattern || strings.HasPrefix(path, pattern+"/") {
+		return true
+	}
+	parts := strings.Split(path, "/")
+	for _, part := range parts {
+		if matched, _ := filepath.Match(pattern, part); matched {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Project) startInactivityTimer(state *projectState) {
