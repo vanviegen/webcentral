@@ -8,8 +8,6 @@ import subprocess
 import shutil
 import http.client
 import socket
-import signal
-import atexit
 import traceback
 from pathlib import Path
 from datetime import datetime
@@ -33,6 +31,7 @@ class TestRunner:
         self.webcentral_proc = None
         self.port = None
         self.log_positions = {}  # project -> position in log file
+        self.use_firejail = True
 
     def find_free_port(self):
         """Find a random free port"""
@@ -65,12 +64,15 @@ class TestRunner:
         stderr_f = open(stderr_log, 'w')
 
         bindings_file = f"{self.tmpdir}/_bindings.json"
+        cmd = ['target/debug/webcentral',
+               '--projects', self.tmpdir,
+               '--http', str(self.port),
+               '--https', '0',
+               '--bindings-file', bindings_file,
+               '--firejail', "true" if self.use_firejail else "false"]
+        print(" ".join(cmd))
         self.webcentral_proc = subprocess.Popen(
-            ['./webcentral',
-             '--projects', self.tmpdir,
-             '--http', str(self.port),
-             '--https', '0',
-             '--bindings-file', bindings_file],
+            cmd,
             stdout=stdout_f,
             stderr=stderr_f,
             cwd=os.path.dirname(os.path.abspath(__file__))
@@ -339,6 +341,7 @@ class TestRunner:
 
         if failed:
             sys.exit(1)
+
 
 
 # Global test runner
@@ -1510,6 +1513,18 @@ include[]=src/package.json
 
 
 if __name__ == '__main__':
-    # Parse command line arguments for test names
-    test_names = sys.argv[1:] if len(sys.argv) > 1 else None
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Run webcentral tests')
+    parser.add_argument('--firejail', type=str, choices=['true', 'false'], default='true',
+                        help='Enable or disable Firejail sandboxing (default: true)')
+    parser.add_argument('test_names', nargs='*', help='Specific test names to run')
+    
+    args = parser.parse_args()
+    
+    # Convert firejail argument to boolean and update the global runner
+    runner.use_firejail = args.firejail == 'true'
+    
+    # Run tests
+    test_names = args.test_names if args.test_names else None
     runner.run(test_names)

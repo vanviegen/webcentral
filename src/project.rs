@@ -113,7 +113,7 @@ enum ProjectState {
 
 pub struct Project {
     dir: String,
-    config: Arc<ProjectConfig>,
+    pub config: Arc<ProjectConfig>,
     logger: Arc<Logger>,
     uid: u32,
     gid: u32,
@@ -480,7 +480,6 @@ impl Project {
         };
 
         if let Some(pid) = child_id {
-            let proj_dir = self.dir.clone();
             let logger = self.logger.clone();
             let state_clone = self.state.clone();
 
@@ -492,7 +491,7 @@ impl Project {
                     // Check if process still exists
                     #[cfg(unix)]
                     {
-                        use nix::sys::signal::{kill, Signal};
+                        use nix::sys::signal::{kill};
                         use nix::unistd::Pid;
 
                         if kill(Pid::from_raw(pid as i32), None).is_err() {
@@ -588,8 +587,6 @@ impl Project {
         let mut cmd = if self.use_firejail && self.config.docker.is_none() {
             let home = get_user_home(self.uid);
             let mut c = Command::new("firejail");
-            // Use exec to replace the shell with the command, ensuring signals reach the process
-            let exec_command = format!("exec {}", command);
             c.args(&[
                 "--quiet",
                 "--noprofile",
@@ -600,13 +597,12 @@ impl Project {
                 "--read-only=/",
                 &format!("--read-write={}", self.dir),
                 "--",
-                "/bin/sh", "-c", &exec_command,
+                "/bin/sh", "-c", &command,
             ]);
             c
         } else {
             let mut c = Command::new("/bin/sh");
-            let exec_command = format!("exec {}", command);
-            c.args(&["-c", &exec_command]);
+            c.args(&["-c", &command]);
             c
         };
 
@@ -794,29 +790,6 @@ impl Project {
         }
 
         false
-    }
-
-    async fn reload(&self) -> Result<()> {
-        self.logger.write("", "reloading...")?;
-
-        // Stop the process and wait for it to fully exit
-        self.stop().await;
-
-        // Ensure state is fully reset
-        {
-            let mut state = self.state.lock().await;
-            *state = ProjectState::Stopped;
-        }
-
-        // Give a moment for OS-level cleanup
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        // Remove from projects map so it will be recreated
-        PROJECTS.remove(&self.dir);
-
-        self.logger.write("", "reload complete, project removed from map")?;
-
-        Ok(())
     }
 
     async fn inactivity_timer(&self) {

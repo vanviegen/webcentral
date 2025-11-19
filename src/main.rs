@@ -32,13 +32,13 @@ pub struct Config {
     #[arg(long, default_value = "80", help = "HTTP port (0 to disable)")]
     pub http: u16,
 
-    #[arg(long, help = "Redirect HTTP to HTTPS")]
+    #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_missing_value = "true", help = "Redirect HTTP to HTTPS")]
     pub redirect_http: Option<bool>,
 
-    #[arg(long, default_value = "true", help = "Auto-redirect www variants")]
+    #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value = "true", default_missing_value = "true", help = "Auto-redirect www variants")]
     pub redirect_www: bool,
 
-    #[arg(long, default_value = "true", help = "Use Firejail sandboxing")]
+    #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value = "true", default_missing_value = "true", help = "Use Firejail sandboxing")]
     pub firejail: bool,
 
     #[arg(long, default_value = "https://acme-v02.api.letsencrypt.org/directory", help = "ACME service endpoint")]

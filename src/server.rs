@@ -1,5 +1,4 @@
 use crate::acme::CertManager;
-use crate::config::ProjectConfig;
 use crate::project;
 use anyhow::Result;
 use dashmap::DashMap;
@@ -196,162 +195,108 @@ impl Server {
                         .unwrap());
                 }
             }
-            return Ok(Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Full::new(Bytes::from("Challenge not found")))
-                .unwrap());
+            return Ok(Self::error_response(StatusCode::NOT_FOUND, "Challenge not found"));
         }
 
-        let domain = match self.extract_domain(&req) {
-            Some(d) => d,
-            None => {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Full::new(Bytes::from("Bad Request: Missing Host header")))
-                    .unwrap());
-            }
-        };
-
-        let project_dir = match self.get_project_dir(&domain).await {
-            Ok(dir) => dir,
-            Err(_) => {
-                return Ok(Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Full::new(Bytes::from("Not Found")))
-                    .unwrap());
-            }
-        };
-
-        // Check for per-project redirect settings
-        if let Ok(config) = ProjectConfig::load(&PathBuf::from(&project_dir)) {
-            // Check redirect_https
-            if config.redirect_https == Some(true) {
-                let redirect_url = format!("https://{}{}",
-                    req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or(&domain),
-                    req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
-                return Ok(Response::builder()
-                    .status(StatusCode::MOVED_PERMANENTLY)
-                    .header("Location", redirect_url)
-                    .body(Full::new(Bytes::new()))
-                    .unwrap());
-            }
-
-            // Check redirect_http
-            if let Some(redirect_http) = config.redirect_http {
-                if redirect_http && self.config.https > 0 {
-                    let redirect_url = format!("https://{}{}",
-                        req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or(&domain),
-                        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
-                    return Ok(Response::builder()
-                        .status(StatusCode::MOVED_PERMANENTLY)
-                        .header("Location", redirect_url)
-                        .body(Full::new(Bytes::new()))
-                        .unwrap());
-                }
-            } else if self.config.redirect_http() {
-                // Global redirect
-                let redirect_url = format!("https://{}{}",
-                    req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or(&domain),
-                    req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
-                return Ok(Response::builder()
-                    .status(StatusCode::MOVED_PERMANENTLY)
-                    .header("Location", redirect_url)
-                    .body(Full::new(Bytes::new()))
-                    .unwrap());
-            }
-        }
-
-        self.route_request(req, &domain, &project_dir).await
+        self.route_request(req, false).await
     }
 
     async fn handle_https(&self, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        self.route_request(req, true).await
+    }
+
+    fn redirect_to(url: String) -> Response<Full<Bytes>> {
+        Response::builder()
+            .status(StatusCode::MOVED_PERMANENTLY)
+            .header("Location", url)
+            .body(Full::new(Bytes::new()))
+            .unwrap()
+    }
+
+    fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+        Response::builder()
+            .status(status)
+            .body(Full::new(Bytes::from(message.to_string())))
+            .unwrap()
+    }
+
+    async fn route_request(&self, req: Request<hyper::body::Incoming>, from_https: bool)
+        -> Result<Response<Full<Bytes>>, hyper::Error> {
+
         let domain = match self.extract_domain(&req) {
             Some(d) => d,
             None => {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Full::new(Bytes::from("Bad Request: Missing Host header")))
-                    .unwrap());
+                return Ok(Self::error_response(StatusCode::BAD_REQUEST, 
+                    "Bad Request: Missing Host header"));
             }
         };
 
         let project_dir = match self.get_project_dir(&domain).await {
             Ok(dir) => dir,
             Err(_) => {
-                return Ok(Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Full::new(Bytes::from("Not Found")))
-                    .unwrap());
+                // Check for www redirect
+                if self.config.redirect_www {
+                    let alt_domain = if let Some(stripped) = domain.strip_prefix("www.") {
+                        stripped.to_string()
+                    } else {
+                        format!("www.{}", domain)
+                    };
+
+                    if self.get_project_dir(&alt_domain).await.is_ok() {
+                        let proto = if from_https { "https" } else { "http" };
+                        let redirect_url = format!("{}://{}{}", proto, domain,
+                        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+                        return Ok(Self::redirect_to(redirect_url));
+                    }
+                }
+                return Ok(Self::error_response(StatusCode::NOT_FOUND, "Not Found"));
             }
         };
 
-        // Check for per-project redirect_https (HTTPS to HTTP)
-        if let Ok(config) = ProjectConfig::load(&PathBuf::from(&project_dir)) {
-            if config.redirect_https == Some(true) {
+        // Get or create project first to access its config
+        let project = match project::get_project(&PathBuf::from(project_dir), self.config.firejail, self.config.prune_logs).await {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to get project: {}", e);
+                return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, 
+                    "Internal Server Error"));
+            }
+        };
+
+        // Check for HTTP/HTTPS redirect based on project config first, then server config
+        if from_https {
+            // HTTPS request - check if we should redirect to HTTP
+            if project.config.redirect_https == Some(true) {
                 let redirect_url = format!("http://{}{}",
                     req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or(&domain),
                     req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
-                return Ok(Response::builder()
-                    .status(StatusCode::MOVED_PERMANENTLY)
-                    .header("Location", redirect_url)
-                    .body(Full::new(Bytes::new()))
-                    .unwrap());
+                return Ok(Self::redirect_to(redirect_url));
             }
-        }
-
-        self.route_request(req, &domain, &project_dir).await
-    }
-
-    async fn route_request(&self, req: Request<hyper::body::Incoming>, domain: &str, project_dir: &str)
-        -> Result<Response<Full<Bytes>>, hyper::Error> {
-        // Check for www redirect
-        if self.config.redirect_www {
-            if let Some(target_domain) = domain.strip_prefix("www.") {
-                if self.get_project_dir(target_domain).await.is_ok() {
-                    let proto = if req.uri().scheme_str() == Some("https") { "https" } else { "http" };
-                    let redirect_url = format!("{}://{}{}", proto, target_domain,
-                        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
-                    return Ok(Response::builder()
-                        .status(StatusCode::MOVED_PERMANENTLY)
-                        .header("Location", redirect_url)
-                        .body(Full::new(Bytes::new()))
-                        .unwrap());
-                }
+        } else {
+            // HTTP request - check if we should redirect to HTTPS
+            let should_redirect = if let Some(redirect_http) = project.config.redirect_http {
+                // Project config takes precedence
+                redirect_http && self.config.https > 0
             } else {
-                let target_domain = format!("www.{}", domain);
-                if self.get_project_dir(&target_domain).await.is_ok() {
-                    let proto = if req.uri().scheme_str() == Some("https") { "https" } else { "http" };
-                    let redirect_url = format!("{}://{}{}", proto, target_domain,
-                        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
-                    return Ok(Response::builder()
-                        .status(StatusCode::MOVED_PERMANENTLY)
-                        .header("Location", redirect_url)
-                        .body(Full::new(Bytes::new()))
-                        .unwrap());
-                }
+                // Fall back to server config
+                self.config.redirect_http() && self.config.https > 0
+            };
+
+            if should_redirect {
+                let redirect_url = format!("https://{}{}",
+                    req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or(&domain),
+                    req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+                return Ok(Self::redirect_to(redirect_url));
             }
         }
 
-        // Get or create project
-        match project::get_project(&PathBuf::from(project_dir), self.config.firejail, self.config.prune_logs).await {
-            Ok(project) => {
-                match project.handle(req).await {
-                    Ok(resp) => Ok(resp),
-                    Err(e) => {
-                        eprintln!("Project handle error: {}", e);
-                        Ok(Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .body(Full::new(Bytes::from("Internal Server Error")))
-                            .unwrap())
-                    }
-                }
-            }
+        // Handle request with project
+        match project.handle(req).await {
+            Ok(resp) => Ok(resp),
             Err(e) => {
-                eprintln!("Failed to get project: {}", e);
-                Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::new(Bytes::from("Internal Server Error")))
-                    .unwrap())
+                eprintln!("Project handle error: {}", e);
+                Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, 
+                    "Internal Server Error"))
             }
         }
     }

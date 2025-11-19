@@ -5,29 +5,38 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug)]
-pub struct IniConfig {
-    sections: HashMap<String, HashMap<String, IniValue>>,
-}
-
 #[derive(Debug, Clone)]
 enum IniValue {
     String(String),
     Array(Vec<String>),
 }
 
+impl IniValue {
+    fn as_string(self) -> String {
+        match self {
+            IniValue::String(s) => s,
+            IniValue::Array(mut arr) => arr.pop().unwrap_or_default(),
+        }
+    }
+
+    fn as_array(self) -> Vec<String> {
+        match self {
+            IniValue::String(s) => vec![s],
+            IniValue::Array(arr) => arr,
+        }
+    }
+}
+
+struct IniConfig;
+
 impl IniConfig {
-    pub fn parse(path: &Path) -> Result<(Self, Vec<String>)> {
+    pub fn parse(path: &Path, config: &mut ProjectConfig) -> Result<Vec<String>> {
         let content = fs::read_to_string(path)
             .context("Failed to open webcentral.ini")?;
 
-        let mut config = IniConfig {
-            sections: HashMap::new(),
-        };
-        config.sections.insert(String::new(), HashMap::new());
-
         let mut parse_errors = Vec::new();
         let mut current_section = String::new();
+        let mut docker = None::<DockerConfig>;
 
         let line_regex = Regex::new(r"^\s*([^=]+?)\s*=\s*(.*)$").unwrap();
         let section_regex = Regex::new(r"^\s*\[([^\]]+)\]\s*$").unwrap();
@@ -43,95 +52,104 @@ impl IniConfig {
             // Check for section header
             if let Some(caps) = section_regex.captures(line) {
                 current_section = caps[1].to_string();
-                config.sections.entry(current_section.clone()).or_insert_with(HashMap::new);
+                if current_section == "docker" {
+                    docker = Some(DockerConfig {
+                        base: "alpine".to_string(),
+                        packages: Vec::new(),
+                        commands: Vec::new(),
+                        http_port: 8000,
+                        app_dir: "/app".to_string(),
+                        mount_app_dir: true,
+                        mounts: Vec::new(),
+                    });
+                }
                 continue;
             }
 
             // Parse key=value
             if let Some(caps) = line_regex.captures(line) {
-                let mut key = caps[1].to_string();
+                let key = caps[1].to_string();
                 let value = caps[2].to_string();
 
-                // Handle array keys (key[] = value)
-                if key.ends_with("[]") {
-                    key = key.trim_end_matches("[]").to_string();
-                    let section = config.sections.get_mut(&current_section).unwrap();
-                    match section.get_mut(&key) {
-                        Some(IniValue::Array(arr)) => {
-                            arr.push(value);
-                        }
-                        _ => {
-                            section.insert(key, IniValue::Array(vec![value]));
-                        }
-                    }
+                let (actual_key, ini_value) = if key.ends_with("[]") {
+                    (key.trim_end_matches("[]").to_string(), IniValue::Array(vec![value]))
                 } else {
-                    let section = config.sections.get_mut(&current_section).unwrap();
-                    section.insert(key, IniValue::String(value));
+                    (key, IniValue::String(value))
+                };
+
+                // Combine section and key with a dot
+                let full_key = if current_section.is_empty() {
+                    actual_key.clone()
+                } else {
+                    format!("{}.{}", current_section, actual_key)
+                };
+
+                let known = Self::handle_key(config, &mut docker, &full_key, ini_value);
+
+                if !known {
+                    let location = if current_section.is_empty() {
+                        "root section".to_string()
+                    } else {
+                        format!("[{}] section", current_section)
+                    };
+                    parse_errors.push(format!("Unknown key '{}' in {}", actual_key, location));
                 }
             } else {
                 parse_errors.push(format!("Invalid syntax in webcentral.ini at line {}: {}", line_num + 1, line));
             }
         }
 
-        Ok((config, parse_errors))
+        if let Some(d) = docker {
+            config.docker = Some(d);
+        }
+
+        Ok(parse_errors)
     }
 
-    pub fn get(&mut self, section: &str, key: &str) -> Option<String> {
-        self.sections.get_mut(section)?.remove(key).and_then(|v| match v {
-            IniValue::String(s) => Some(s),
-            _ => None,
-        })
-    }
-
-    pub fn get_array(&mut self, section: &str, key: &str) -> Vec<String> {
-        self.sections
-            .get_mut(section)
-            .and_then(|sec| sec.remove(key))
-            .map(|v| match v {
-                IniValue::Array(arr) => arr,
-                IniValue::String(s) => vec![s],
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn get_bool(&mut self, section: &str, key: &str, default: bool) -> bool {
-        self.get(section, key)
-            .map(|v| {
-                let v = v.to_lowercase();
-                v == "true" || v == "1" || v == "yes"
-            })
-            .unwrap_or(default)
-    }
-
-    pub fn get_int(&mut self, section: &str, key: &str, default: i32) -> i32 {
-        self.get(section, key)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default)
-    }
-
-    pub fn get_section(&self, section: &str) -> HashMap<String, String> {
-        self.sections
-            .get(section)
-            .map(|sec| {
-                sec.iter()
-                    .filter_map(|(k, v)| match v {
-                        IniValue::String(s) => Some((k.clone(), s.clone())),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn has_section(&self, section: &str) -> bool {
-        self.sections.contains_key(section)
-    }
-
-    pub fn remaining_keys(&self, section: &str) -> Vec<String> {
-        self.sections
-            .get(section)
-            .map(|sec| sec.keys().cloned().collect())
-            .unwrap_or_default()
+    fn handle_key(config: &mut ProjectConfig, docker: &mut Option<DockerConfig>, key: &str, value: IniValue) -> bool {
+        match key {
+            "command" => config.command = value.as_string(),
+            "worker" => { config.workers.insert("default".to_string(), value.as_string()); }
+            key if key.starts_with("worker:") => { config.workers.insert(key[7..].to_string(), value.as_string()); }
+            "port" => config.port = value.as_string().parse().unwrap_or(0),
+            "host" => config.host = value.as_string(),
+            "socket_path" => config.socket_path = value.as_string(),
+            "redirect" => config.redirect = value.as_string(),
+            "proxy" => config.proxy = value.as_string(),
+            "log_requests" => {
+                let v = value.as_string().to_lowercase();
+                config.log_requests = v == "true" || v == "1" || v == "yes";
+            }
+            "redirect_http" => {
+                let v = value.as_string().to_lowercase();
+                config.redirect_http = Some(v == "true" || v == "1" || v == "yes");
+            }
+            "redirect_https" => {
+                let v = value.as_string().to_lowercase();
+                config.redirect_https = Some(v == "true" || v == "1" || v == "yes");
+            }
+            key if key.starts_with("environment.") => {
+                config.environment.insert(key[12..].to_string(), value.as_string());
+            }
+            "docker.base" => { docker.as_mut().map(|d| d.base = value.as_string()); }
+            "docker.packages" => { docker.as_mut().map(|d| d.packages = value.as_array()); }
+            "docker.commands" => { docker.as_mut().map(|d| d.commands = value.as_array()); }
+            "docker.http_port" => { docker.as_mut().map(|d| d.http_port = value.as_string().parse().unwrap_or(8000)); }
+            "docker.app_dir" => { docker.as_mut().map(|d| d.app_dir = value.as_string()); }
+            "docker.mount_app_dir" => {
+                let v = value.as_string().to_lowercase();
+                docker.as_mut().map(|d| d.mount_app_dir = v == "true" || v == "1" || v == "yes");
+            }
+            "docker.mounts" => { docker.as_mut().map(|d| d.mounts = value.as_array()); }
+            "reload.timeout" => config.reload.timeout = value.as_string().parse().unwrap_or(300),
+            "reload.include" => config.reload.include = value.as_array(),
+            "reload.exclude" => config.reload.exclude = value.as_array(),
+            key if key.starts_with("rewrite.") => {
+                config.rewrites.insert(key[8..].to_string(), value.as_string());
+            }
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -245,132 +263,9 @@ impl ProjectConfig {
         // Try to load webcentral.ini
         let ini_path = dir.join("webcentral.ini");
         if ini_path.exists() {
-            match IniConfig::parse(&ini_path) {
-                Ok((mut ini, parse_errors)) => {
-                    config.config_errors.extend(parse_errors);
-
-                    // Load root section
-                    if let Some(cmd) = ini.get("", "command") {
-                        config.command = cmd;
-                    }
-
-                    // Load workers
-                    let root_keys: Vec<_> = ini.get_section("").keys()
-                        .filter(|k| k.as_str() == "worker" || k.starts_with("worker:"))
-                        .cloned()
-                        .collect();
-
-                    for key in root_keys {
-                        if let Some(val) = ini.get("", &key) {
-                            if key == "worker" {
-                                config.workers.insert("default".to_string(), val);
-                            } else if let Some(name) = key.strip_prefix("worker:") {
-                                config.workers.insert(name.to_string(), val);
-                            }
-                        }
-                    }
-
-                    config.port = ini.get_int("", "port", 0);
-                    if let Some(host) = ini.get("", "host") {
-                        config.host = host;
-                    }
-                    if let Some(socket_path) = ini.get("", "socket_path") {
-                        config.socket_path = socket_path;
-                    }
-                    if let Some(redirect) = ini.get("", "redirect") {
-                        config.redirect = redirect;
-                    }
-                    if let Some(proxy) = ini.get("", "proxy") {
-                        config.proxy = proxy;
-                    }
-
-                    config.log_requests = ini.get_bool("", "log_requests", false);
-
-                    if let Some(val) = ini.get("", "redirect_http") {
-                        let b = val == "true" || val == "1" || val == "yes";
-                        config.redirect_http = Some(b);
-                    }
-                    if let Some(val) = ini.get("", "redirect_https") {
-                        let b = val == "true" || val == "1" || val == "yes";
-                        config.redirect_https = Some(b);
-                    }
-
-                    // Validate root section
-                    for key in ini.remaining_keys("") {
-                        config.config_errors.push(format!("Unknown key '{}' in root section", key));
-                    }
-
-                    // Load environment variables
-                    let env_keys: Vec<_> = ini.get_section("environment").keys().cloned().collect();
-                    for key in env_keys {
-                        if let Some(val) = ini.get("environment", &key) {
-                            config.environment.insert(key, val);
-                        }
-                    }
-
-                    // Load Docker configuration
-                    if ini.has_section("docker") {
-                        let mut docker = DockerConfig {
-                            base: "alpine".to_string(),
-                            packages: Vec::new(),
-                            commands: Vec::new(),
-                            http_port: 8000,
-                            app_dir: "/app".to_string(),
-                            mount_app_dir: true,
-                            mounts: Vec::new(),
-                        };
-
-                        if let Some(base) = ini.get("docker", "base") {
-                            docker.base = base;
-                        }
-                        docker.packages = ini.get_array("docker", "packages");
-                        docker.commands = ini.get_array("docker", "commands");
-                        docker.http_port = ini.get_int("docker", "http_port", 8000);
-                        if let Some(app_dir) = ini.get("docker", "app_dir") {
-                            docker.app_dir = app_dir;
-                        }
-                        docker.mount_app_dir = ini.get_bool("docker", "mount_app_dir", true);
-                        docker.mounts = ini.get_array("docker", "mounts");
-
-                        config.docker = Some(docker);
-
-                        // Validate docker section
-                        for key in ini.remaining_keys("docker") {
-                            config.config_errors.push(format!("Unknown key '{}' in [docker] section", key));
-                        }
-                    }
-
-                    // Load reload configuration
-                    if ini.has_section("reload") {
-                        config.reload.timeout = ini.get_int("reload", "timeout", 300) as i64;
-                        config.reload.include = ini.get_array("reload", "include");
-                        config.reload.exclude = ini.get_array("reload", "exclude");
-
-                        // Validate reload section
-                        for key in ini.remaining_keys("reload") {
-                            config.config_errors.push(format!("Unknown key '{}' in [reload] section", key));
-                        }
-                    }
-
-                    // Load rewrites
-                    let rewrite_keys: Vec<_> = ini.get_section("rewrite").keys().cloned().collect();
-                    for pattern in rewrite_keys {
-                        if let Some(target) = ini.get("rewrite", &pattern) {
-                            config.rewrites.insert(pattern, target);
-                        }
-                    }
-
-                    // Validate for unrecognized sections
-                    let known_sections = ["", "environment", "docker", "reload", "rewrite"];
-                    for section in ini.sections.keys() {
-                        if !known_sections.contains(&section.as_str()) {
-                            config.config_errors.push(format!("Unknown section [{}] in webcentral.ini", section));
-                        }
-                    }
-                }
-                Err(e) => {
-                    config.config_errors.push(format!("Failed to parse webcentral.ini: {}", e));
-                }
+            match IniConfig::parse(&ini_path, &mut config) {
+                Ok(errors) => config.config_errors.extend(errors),
+                Err(e) => config.config_errors.push(format!("Failed to parse webcentral.ini: {}", e)),
             }
         }
 

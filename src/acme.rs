@@ -154,7 +154,7 @@ impl CertManager {
 
         // Generate key pair and CSR
         let key_pair = rcgen::KeyPair::generate()?;
-        let mut params = CertificateParams::new(vec![domain.to_string()])?;
+        let params = CertificateParams::new(vec![domain.to_string()])?;
         let csr = params.serialize_request(&key_pair)?;
         let csr_der = csr.der();
 
