@@ -732,7 +732,16 @@ impl Project {
                 // Check if should reload
                 if self.should_reload_for_file(rel_path) {
                     self.logger.write("", &format!("stopping due to change for {}", rel_path.display()))?;
-                    self.reload().await?;
+
+                    // Stop process in background (non-blocking)
+                    let project_clone = self.clone();
+                    let dir = self.dir.clone();
+                    tokio::spawn(async move {
+                        project_clone.stop().await;
+                        // Remove from projects map so it will be recreated
+                        PROJECTS.remove(&dir);
+                    });
+
                     break; // Stop watching, will be recreated on reload
                 }
             }
@@ -785,13 +794,24 @@ impl Project {
     }
 
     async fn reload(&self) -> Result<()> {
+        self.logger.write("", "reloading...")?;
+
+        // Stop the process and wait for it to fully exit
         self.stop().await;
 
-        // Give a brief moment for cleanup to complete
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Ensure state is fully reset
+        {
+            let mut state = self.state.lock().await;
+            *state = ProjectState::Stopped;
+        }
+
+        // Give a moment for OS-level cleanup
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Remove from projects map so it will be recreated
         PROJECTS.remove(&self.dir);
+
+        self.logger.write("", "reload complete, project removed from map")?;
 
         Ok(())
     }
@@ -813,60 +833,22 @@ impl Project {
     }
 
     pub async fn stop(&self) {
-        let pids = {
-            let state = self.state.lock().await;
-            match &*state {
-                ProjectState::Running { process, workers, .. } => {
-                    let mut pids = vec![];
-                    // Collect PIDs while we have the lock
-                    if let Some(pid) = process.id() {
-                        pids.push(("main", pid));
-                    }
-                    for worker in workers {
-                        if let Some(pid) = worker.id() {
-                            pids.push(("worker", pid));
-                        }
-                    }
-                    Some(pids)
+        // Force kill immediately
+        let mut state = self.state.lock().await;
+        match &mut *state {
+            ProjectState::Running { process, workers, .. } => {
+                // Kill workers
+                for worker in workers {
+                    let _ = worker.kill().await;
                 }
-                _ => None
+                // Kill main process
+                let _ = process.kill().await;
+                let _ = self.logger.write("", "stopped");
+                *state = ProjectState::Stopped;
             }
-        };
-
-        if let Some(pids) = pids {
-            // Send SIGTERM for graceful shutdown
-            #[cfg(unix)]
-            {
-                use nix::sys::signal::{kill, Signal};
-                use nix::unistd::Pid;
-
-                for (_label, pid) in &pids {
-                    let _ = kill(Pid::from_raw(*pid as i32), Signal::SIGTERM);
-                }
+            _ => {
+                *state = ProjectState::Stopped;
             }
-
-            // Wait up to 2.5 seconds for graceful shutdown
-            tokio::time::sleep(Duration::from_millis(2500)).await;
-
-            // Force kill if still running
-            let mut state = self.state.lock().await;
-            match &mut *state {
-                ProjectState::Running { process, workers, .. } => {
-                    for worker in workers {
-                        let _ = worker.kill().await;
-                    }
-                    let _ = process.kill().await;
-                    self.logger.write("", "stopped").unwrap();
-                    *state = ProjectState::Stopped;
-                }
-                _ => {
-                    // Already stopped by process monitor
-                }
-            }
-        } else {
-            // Already stopped
-            let mut state = self.state.lock().await;
-            *state = ProjectState::Stopped;
         }
     }
 }
