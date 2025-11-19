@@ -1,30 +1,26 @@
 mod acme;
-mod config;
+mod project_config;
 mod logger;
 mod project;
 mod server;
 
 use anyhow::Result;
 use clap::Parser;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "webcentral")]
 #[command(about = "A reverse proxy that runs multiple web applications on a single server")]
-pub struct Config {
+pub struct GlobalConfig {
     #[arg(long, help = "Email for LetsEncrypt certificate registration")]
     pub email: Option<String>,
 
     #[arg(long, default_value_t = default_projects(), help = "Projects directory pattern")]
     pub projects: String,
 
-    #[arg(long, default_value_t = default_config(), help = "Config and certificate storage directory")]
-    pub config: String,
-
-    #[arg(long, help = "Bindings cache file (defaults to <config>/bindings.json)")]
-    pub bindings_file: Option<String>,
+    #[arg(long, default_value_t = default_config(), help = "Certificates and bindings storage directory (defaults to ~/.config/webcentral/)")]
+    pub data_dir: String,
 
     #[arg(long, default_value = "443", help = "HTTPS port (0 to disable)")]
     pub https: u16,
@@ -67,15 +63,9 @@ fn default_config() -> String {
     }
 }
 
-impl Config {
+impl GlobalConfig {
     pub fn redirect_http(&self) -> bool {
         self.redirect_http.unwrap_or(self.https > 0 && self.http > 0)
-    }
-
-    pub fn bindings_file(&self) -> PathBuf {
-        self.bindings_file.clone()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&self.config).join("bindings.json"))
     }
 }
 
@@ -83,7 +73,7 @@ impl Config {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let config = Config::parse();
+    let config = GlobalConfig::parse();
 
     if config.https > 0 && config.email.is_none() {
         anyhow::bail!("--email is required when HTTPS is enabled");

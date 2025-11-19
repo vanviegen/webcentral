@@ -1,4 +1,4 @@
-use crate::config::{DockerConfig, ProjectConfig, ProjectType};
+use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
 use crate::logger::Logger;
 use anyhow::Result;
 use hyper::{body::Incoming, Request, Response};

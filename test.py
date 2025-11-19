@@ -63,12 +63,11 @@ class TestRunner:
         stdout_f = open(stdout_log, 'w')
         stderr_f = open(stderr_log, 'w')
 
-        bindings_file = f"{self.tmpdir}/_bindings.json"
         cmd = ['target/debug/webcentral',
                '--projects', self.tmpdir,
                '--http', str(self.port),
                '--https', '0',
-               '--bindings-file', bindings_file,
+               '--data-dir', self.tmpdir,
                '--firejail', "true" if self.use_firejail else "false"]
         print(" ".join(cmd))
         self.webcentral_proc = subprocess.Popen(

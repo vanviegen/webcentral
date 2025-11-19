@@ -11,7 +11,9 @@ use bytes::Bytes;
 use notify::{Watcher, RecursiveMode};
 use regex::Regex;
 use rustls::ServerConfig;
+use std::collections::HashSet;
 use std::fs;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +44,7 @@ impl DomainInfo {
 
 lazy_static::lazy_static! {
     static ref DOMAINS: DashMap<String, DomainInfo> = DashMap::new();
+    static ref VALID_DOMAIN: Regex = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$").unwrap();
 }
 
 // Called by Project when it shuts down to remove itself from DOMAINS
@@ -61,17 +64,17 @@ pub async fn stop_all_projects() {
 }
 
 pub struct Server {
-    config: crate::Config,
+    config: crate::GlobalConfig,
     cert_manager: Option<Arc<CertManager>>,
 }
 
 impl Server {
-    pub async fn new(config: crate::Config) -> Result<Self> {
+    pub async fn new(config: crate::GlobalConfig) -> Result<Self> {
         // Create certificate manager if HTTPS is enabled
         let cert_manager = if config.https > 0 {
             let email = config.email.clone().expect("Email required for HTTPS");
             Some(Arc::new(CertManager::new(
-                PathBuf::from(&config.config),
+                PathBuf::from(&config.data_dir),
                 email,
                 config.acme_url.clone(),
             )))
@@ -83,6 +86,56 @@ impl Server {
             config,
             cert_manager,
         })
+    }
+
+    // Read bindings.list file containing authorized project directories
+    fn read_bindings(data_dir: &str) -> Result<HashSet<String>> {
+        let bindings_path = PathBuf::from(data_dir).join("bindings.list");
+        let mut bindings = HashSet::new();
+        
+        if bindings_path.exists() {
+            let file = fs::File::open(&bindings_path)?;
+            let reader = std::io::BufReader::new(file);
+            
+            for line in reader.lines() {
+                if let Ok(path) = line {
+                    let path = path.trim();
+                    if !path.is_empty() {
+                        bindings.insert(path.to_string());
+                    }
+                }
+            }
+            println!("Loaded {} authorized bindings from {}", bindings.len(), bindings_path.display());
+        }
+        
+        Ok(bindings)
+    }
+
+    // Write current DOMAINS mapping to bindings.list
+    fn write_bindings(&self) -> Result<()> {
+        let bindings_path = PathBuf::from(&self.config.data_dir).join("bindings.list");
+        
+        // Ensure data directory exists
+        fs::create_dir_all(&self.config.data_dir)?;
+        
+        // Collect all unique directories from DOMAINS
+        let mut directories = HashSet::new();
+        for entry in DOMAINS.iter() {
+            directories.insert(entry.directory.clone());
+        }
+        
+        // Convert to sorted vector for deterministic output
+        let mut sorted_dirs: Vec<_> = directories.into_iter().collect();
+        sorted_dirs.sort();
+        
+        // Write to file
+        let mut file = fs::File::create(&bindings_path)?;
+        for dir in sorted_dirs {
+            writeln!(file, "{}", dir)?;
+        }
+        
+        println!("Wrote {} bindings to {}", DOMAINS.len(), bindings_path.display());
+        Ok(())
     }
 
     pub async fn start(self: Arc<Self>) -> Result<()> {
@@ -352,41 +405,63 @@ impl Server {
         Ok(project)
     }
 
-    fn add_domain(&self, domain: String, directory: String) {
-        // Add to DOMAINS if not already present
-        DOMAINS.entry(domain).or_insert_with(|| {
-            DomainInfo::new(directory)
-        });
+    async fn add_domain(&self, domain: String, directory: String, bindings: Option<&HashSet<String>>) {
+        if let Some(existing) = DOMAINS.get(&domain) {
+            // Domain exists - check if transfer is allowed
+            let existing_dir_gone = !std::path::Path::new(&existing.directory).exists();
+            let authorized = bindings.map_or(false, |b| b.contains(&directory));
+            if !existing_dir_gone && !authorized {
+                println!("Rejecting domain override attempt for {} from unauthorized directory {}", domain, directory);
+                return
+            }
+            println!("Overriding domain {} from {} to {}{}", domain, existing.directory, directory, if authorized { " (authorized)" } else { " (directory gone)" });
+        }
+        DOMAINS.insert(domain, DomainInfo::new(directory));
+    }
+
+    // Process a directory path, validating domain and setting up project + certificate
+    async fn process_project_directory(self: &Arc<Self>, path: &std::path::Path, bindings: Option<&HashSet<String>>) {
+        if !path.is_dir() {
+            return;
+        }
+        
+        if let Some(domain) = path.file_name().and_then(|n| n.to_str()) {
+            if VALID_DOMAIN.is_match(domain) {
+                let directory = path.to_string_lossy().to_string();
+                let domain = domain.to_lowercase();
+                self.add_domain(domain.clone(), directory, bindings).await;
+
+                // Start certificate acquisition in background if HTTPS enabled
+                if self.cert_manager.is_some() {
+                    let server = self.clone();
+                    let domain = domain.clone();
+                    tokio::spawn(async move {
+                        server.acquire_certificate_for_domain(&domain).await;
+                    });
+                }
+            }
+        }
     }
 
     async fn scan_all_project_directories(self: Arc<Self>) {
-        let valid_domain = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$").unwrap();
+        // Read authorized bindings from previous run
+        let bindings = Self::read_bindings(&self.config.data_dir).unwrap_or_else(|_e| {
+            HashSet::new()
+        });
 
         for entry in glob::glob(&self.config.projects).unwrap() {
             if let Ok(base_path) = entry {
                 if let Ok(entries) = fs::read_dir(base_path) {
                     for entry in entries.flatten() {
-                        if entry.path().is_dir() {
-                            if let Some(domain) = entry.file_name().to_str() {
-                                if valid_domain.is_match(domain) {
-                                    let directory = entry.path().to_string_lossy().to_string();
-                                    let domain = domain.to_lowercase();
-                                    self.add_domain(domain.clone(), directory);
-
-                                    // Start certificate acquisition in background
-                                    if self.cert_manager.is_some() {
-                                        let server = self.clone();
-                                        let domain = domain.clone();
-                                        tokio::spawn(async move {
-                                            server.acquire_certificate_for_domain(&domain).await;
-                                        });
-                                    }
-                                }
-                            }
-                        }
+                        self.process_project_directory(&entry.path(), Some(&bindings)).await;
                     }
                 }
             }
+        }
+        
+        // Write current bindings to file
+        if let Err(e) = self.write_bindings() {
+            eprintln!("Failed to write bindings: {}", e);
         }
     }
 
@@ -406,43 +481,27 @@ impl Server {
             println!("Watching for new projects in {}", base_path.display());
         }
 
-        let valid_domain = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$").unwrap();
-
         while let Some(event) = rx.recv().await {
+            let mut changed = false;
+            
             match event.kind {
                 notify::EventKind::Create(_) => {
                     for path in event.paths {
-                        if path.is_dir() {
-                            if let Some(domain) = path.file_name().and_then(|n| n.to_str()) {
-                                if valid_domain.is_match(domain) {
-                                    let directory = path.to_string_lossy().to_string();
-                                    let domain = domain.to_lowercase();
-                                    
-                                    println!("New project directory detected: {}", domain);
-                                    self.add_domain(domain.clone(), directory);
-
-                                    // Acquire certificate in background if HTTPS enabled
-                                    if self.cert_manager.is_some() {
-                                        let server = self.clone();
-                                        let domain = domain.clone();
-                                        tokio::spawn(async move {
-                                            server.acquire_certificate_for_domain(&domain).await;
-                                        });
-                                    }
-                                }
-                            }
-                        }
+                        println!("New project directory detected: {}", path.display());
+                        self.process_project_directory(&path, None).await;
+                        changed = true;
                     }
                 },
                 notify::EventKind::Remove(_) => {
                     for path in event.paths {
                         if let Some(domain) = path.file_name().and_then(|n| n.to_str()) {
-                            if valid_domain.is_match(domain) {
+                            if VALID_DOMAIN.is_match(domain) {
                                 let domain = domain.to_lowercase();
                                 println!("Project directory removed: {}", domain);
                                 
                                 // Remove from DOMAINS
                                 DOMAINS.remove(&domain);
+                                changed = true;
                                 
                                 // Note: Certificate removal from ACME client would go here
                                 // For now, we just keep the certificate files
@@ -451,6 +510,13 @@ impl Server {
                     }
                 },
                 _ => {}
+            }
+            
+            // Write bindings after any changes
+            if changed {
+                if let Err(e) = self.write_bindings() {
+                    eprintln!("Failed to write bindings: {}", e);
+                }
             }
         }
 
