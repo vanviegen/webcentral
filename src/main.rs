@@ -71,8 +71,6 @@ impl GlobalConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
-
     let config = GlobalConfig::parse();
 
     if config.https > 0 && config.email.is_none() {
