@@ -62,12 +62,14 @@ pub async fn create_project(dir: &Path, domain: String, use_firejail: bool, prun
     let project = Arc::new(Project {
         domain: domain.clone(),
         dir: dir.to_string_lossy().to_string(),
-        config: Arc::new(config),
+        config: Arc::new(config.clone()),
         logger: logger.clone(),
         uid,
         gid,
         use_firejail,
-        state: Arc::new(Mutex::new(ProjectState::Stopped)),
+        port: Arc::new(Mutex::new(None)),
+        process: Arc::new(Mutex::new(None)),
+        workers: Arc::new(Mutex::new(Vec::new())),
         last_activity: Arc::new(Mutex::new(Instant::now())),
     });
 
@@ -87,14 +89,17 @@ pub async fn create_project(dir: &Path, domain: String, use_firejail: bool, prun
         });
     }
 
-    Ok(project)
-}
+    // Start application process if needed
+    if matches!(config.project_type, ProjectType::Application { .. }) {
+        let proj = project.clone();
+        tokio::spawn(async move {
+            if let Err(e) = proj.start_process().await {
+                let _ = proj.logger.write("", &format!("Failed to start process: {}", e));
+            }
+        });
+    }
 
-#[derive(Debug)]
-enum ProjectState {
-    Stopped,
-    Starting { port: u16, #[allow(dead_code)] start_time: Instant },
-    Running { port: u16, process: tokio::process::Child, workers: Vec<tokio::process::Child> },
+    Ok(project)
 }
 
 #[derive(Debug)]
@@ -106,7 +111,9 @@ pub struct Project {
     uid: u32,
     gid: u32,
     use_firejail: bool,
-    state: Arc<Mutex<ProjectState>>,
+    port: Arc<Mutex<Option<u16>>>, // None means the app is still starting
+    process: Arc<Mutex<Option<tokio::process::Child>>>,
+    workers: Arc<Mutex<Vec<tokio::process::Child>>>,
     last_activity: Arc<Mutex<Instant>>,
 }
 
@@ -323,70 +330,28 @@ impl Project {
     }
 
     async fn handle_application(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-        // Ensure application is started
-        self.ensure_started().await?;
-
-        // Get current port
-        let port = {
-            let state = self.state.lock().await;
-            match *state {
-                ProjectState::Running { port, .. } => port,
-                ProjectState::Starting { port, .. } => port,
-                _ => return Ok(Response::builder().status(503).body(Full::new(Bytes::from("Service Unavailable")))?),
-            }
-        };
+        // Wait for port to be available (with timeout)
+        let port = self.wait_for_port().await?;
 
         // Proxy to application
         let target = format!("http://localhost:{}", port);
         self.proxy_request(req, &target).await
     }
 
-    async fn ensure_started(&self) -> Result<()> {
-        let mut state = self.state.lock().await;
-
-        match *state {
-            ProjectState::Running { .. } => return Ok(()),
-            ProjectState::Starting { .. } => {
-                // Already starting, just wait
-                drop(state);
-            }
-            ProjectState::Stopped => {
-                // Start the application
-                let port = get_free_port()?;
-                self.logger.write("", &format!("Starting on port {}", port))?;
-
-                *state = ProjectState::Starting {
-                    port,
-                    start_time: Instant::now(),
-                };
-                drop(state);
-
-                // Start process in background
-                let proj = Arc::new(self.clone());
-                tokio::spawn(async move {
-                    if let Err(e) = proj.start_process(port).await {
-                        let _ = proj.logger.write("", &format!("Failed to start process: {}", e));
-                        *proj.state.lock().await = ProjectState::Stopped;
-                    }
-                });
-            }
-        }
-
-        // Wait for startup to complete (with timeout)
+    async fn wait_for_port(&self) -> Result<u16> {
         for _ in 0..300 {  // 30 second timeout
-            sleep(Duration::from_millis(100)).await;
-            let s = self.state.lock().await;
-            match *s {
-                ProjectState::Running { .. } => return Ok(()),
-                ProjectState::Stopped => anyhow::bail!("Application failed to start"),
-                _ => continue,
+            if let Some(port) = *self.port.lock().await {
+                return Ok(port);
             }
+            sleep(Duration::from_millis(100)).await;
         }
-        
         anyhow::bail!("Application startup timeout")
     }
 
-    async fn start_process(&self, port: u16) -> Result<()> {
+    async fn start_process(&self) -> Result<()> {
+        let port = get_free_port()?;
+        self.logger.write("", &format!("Starting on port {}", port))?;
+
         let (command, docker, _workers) = match &self.config.project_type {
             ProjectType::Application { command, docker, workers } => (command, docker, workers),
             _ => unreachable!("start_process called for non-Application project"),
@@ -444,7 +409,6 @@ impl Project {
         if !ready {
             child.kill().await?;
             self.logger.write("", "Application failed to start listening on port")?;
-            *self.state.lock().await = ProjectState::Stopped;
             anyhow::bail!("Port not ready");
         }
 
@@ -453,21 +417,17 @@ impl Project {
         // Start workers
         let workers = self.start_workers(port).await;
 
-        *self.state.lock().await = ProjectState::Running { port, process: child, workers };
+        // Store process, workers, and port (now that we're ready)
+        *self.process.lock().await = Some(child);
+        *self.workers.lock().await = workers;
+        *self.port.lock().await = Some(port);
 
         // Monitor process exit in background - extract process ID before spawning
-        let child_id = {
-            let state = self.state.lock().await;
-            if let ProjectState::Running { ref process, .. } = *state {
-                process.id()
-            } else {
-                None
-            }
-        };
+        let child_id = self.process.lock().await.as_ref().and_then(|p| p.id());
 
         if let Some(pid) = child_id {
             let logger = self.logger.clone();
-            let state_clone = self.state.clone();
+            let port_clone = self.port.clone();
 
             tokio::spawn(async move {
                 // Periodically check if process is still running
@@ -483,18 +443,13 @@ impl Project {
                         if kill(Pid::from_raw(pid as i32), None).is_err() {
                             // Process no longer exists
                             let _ = logger.write("", "Process exited");
-                            *state_clone.lock().await = ProjectState::Stopped;
+                            *port_clone.lock().await = None;
                             break;
                         }
                     }
 
-                    // Check if we're still in Running state
-                    let still_running = {
-                        let state = state_clone.lock().await;
-                        matches!(*state, ProjectState::Running { .. })
-                    };
-
-                    if !still_running {
+                    // Check if we still have a port (project might have been stopped)
+                    if port_clone.lock().await.is_none() {
                         break;
                     }
                 }
@@ -818,22 +773,19 @@ impl Project {
     pub async fn stop(&self) {
         // Send SIGTERM first, then force kill after delay
         let pids: Vec<u32> = {
-            let state = self.state.lock().await;
-            match &*state {
-                ProjectState::Running { process, workers, .. } => {
-                    let mut pids = vec![];
-                    if let Some(pid) = process.id() {
-                        pids.push(pid);
-                    }
-                    for worker in workers {
-                        if let Some(pid) = worker.id() {
-                            pids.push(pid);
-                        }
-                    }
-                    pids
+            let mut pids = vec![];
+            if let Some(process) = self.process.lock().await.as_ref() {
+                if let Some(pid) = process.id() {
+                    pids.push(pid);
                 }
-                _ => vec![]
             }
+            let workers = self.workers.lock().await;
+            for worker in workers.iter() {
+                if let Some(pid) = worker.id() {
+                    pids.push(pid);
+                }
+            }
+            pids
         };
 
         // Send SIGTERM to all processes
@@ -848,26 +800,24 @@ impl Project {
         }
 
         // Wait for graceful shutdown (but don't block - do it in background)
-        let state_clone = self.state.clone();
+        let process_clone = self.process.clone();
+        let workers_clone = self.workers.clone();
+        let port_clone = self.port.clone();
         let logger_clone = self.logger.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(2500)).await;
 
             // Force kill if still running
-            let mut state = state_clone.lock().await;
-            match &mut *state {
-                ProjectState::Running { process, workers, .. } => {
-                    for worker in workers {
-                        let _ = worker.kill().await;
-                    }
-                    let _ = process.kill().await;
-                    let _ = logger_clone.write("", "Stopped");
-                    *state = ProjectState::Stopped;
-                }
-                _ => {
-                    *state = ProjectState::Stopped;
-                }
+            if let Some(mut process) = process_clone.lock().await.take() {
+                let _ = process.kill().await;
             }
+            let mut workers = workers_clone.lock().await;
+            for worker in workers.iter_mut() {
+                let _ = worker.kill().await;
+            }
+            workers.clear();
+            *port_clone.lock().await = None;
+            let _ = logger_clone.write("", "Stopped");
         });
     }
 }
@@ -883,7 +833,9 @@ impl Clone for Project {
             uid: self.uid,
             gid: self.gid,
             use_firejail: self.use_firejail,
-            state: self.state.clone(),
+            port: self.port.clone(),
+            process: self.process.clone(),
+            workers: self.workers.clone(),
             last_activity: self.last_activity.clone(),
         }
     }
