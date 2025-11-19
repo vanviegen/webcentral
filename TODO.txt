@@ -13,5 +13,6 @@
 [ ] Optionally do a periodic check on that URL after the project has started, forcing a shutdown if it's no longer responding
 [ ] When a Project shuts down or after 15 minutes of running, output some stats (at least request count, but other easy-to-gather stats would be nice as well) to its log file
 [ ] Review and improve documentation for users and developers
+[ ] Do we actually need a "Stopped" state? We can just immediately start the processes? Does an enum still make sense here, or is a boolean just as good?
 
 For each of the above: update README.md (and add to its Changelog section) if needed.
