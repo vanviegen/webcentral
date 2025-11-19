@@ -787,6 +787,9 @@ impl Project {
     async fn reload(&self) -> Result<()> {
         self.stop().await;
 
+        // Give a brief moment for cleanup to complete
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
         // Remove from projects map so it will be recreated
         PROJECTS.remove(&self.dir);
 
@@ -810,24 +813,61 @@ impl Project {
     }
 
     pub async fn stop(&self) {
-        let mut state = self.state.lock().await;
-
-        match &mut *state {
-            ProjectState::Running { process, workers, .. } => {
-                // Stop workers
-                for worker in workers {
-                    let _ = worker.kill().await;
+        let pids = {
+            let state = self.state.lock().await;
+            match &*state {
+                ProjectState::Running { process, workers, .. } => {
+                    let mut pids = vec![];
+                    // Collect PIDs while we have the lock
+                    if let Some(pid) = process.id() {
+                        pids.push(("main", pid));
+                    }
+                    for worker in workers {
+                        if let Some(pid) = worker.id() {
+                            pids.push(("worker", pid));
+                        }
+                    }
+                    Some(pids)
                 }
-
-                // Stop main process
-                let _ = process.kill().await;
-
-                self.logger.write("", "stopped").unwrap();
+                _ => None
             }
-            _ => {}
-        }
+        };
 
-        *state = ProjectState::Stopped;
+        if let Some(pids) = pids {
+            // Send SIGTERM for graceful shutdown
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+
+                for (_label, pid) in &pids {
+                    let _ = kill(Pid::from_raw(*pid as i32), Signal::SIGTERM);
+                }
+            }
+
+            // Wait up to 2.5 seconds for graceful shutdown
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+
+            // Force kill if still running
+            let mut state = self.state.lock().await;
+            match &mut *state {
+                ProjectState::Running { process, workers, .. } => {
+                    for worker in workers {
+                        let _ = worker.kill().await;
+                    }
+                    let _ = process.kill().await;
+                    self.logger.write("", "stopped").unwrap();
+                    *state = ProjectState::Stopped;
+                }
+                _ => {
+                    // Already stopped by process monitor
+                }
+            }
+        } else {
+            // Already stopped
+            let mut state = self.state.lock().await;
+            *state = ProjectState::Stopped;
+        }
     }
 }
 
