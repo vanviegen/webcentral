@@ -1,3 +1,4 @@
+mod acme;
 mod config;
 mod logger;
 mod project;

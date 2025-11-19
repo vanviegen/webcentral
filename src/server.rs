@@ -1,3 +1,4 @@
+use crate::acme::CertManager;
 use crate::config::ProjectConfig;
 use crate::project;
 use anyhow::Result;
@@ -10,6 +11,7 @@ use http_body_util::Full;
 use bytes::Bytes;
 use notify::{Watcher, RecursiveMode};
 use regex::Regex;
+use rustls::ServerConfig;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+use tokio_rustls::TlsAcceptor;
 
 pub struct Server {
     config: crate::Config,
@@ -26,6 +29,7 @@ pub struct Server {
     cert_requests: Arc<DashMap<String, ()>>,
     #[allow(dead_code)]
     approved_hosts: Arc<DashMap<String, ()>>,
+    cert_manager: Option<Arc<CertManager>>,
 }
 
 impl Server {
@@ -44,6 +48,18 @@ impl Server {
             }
         }
 
+        // Create certificate manager if HTTPS is enabled
+        let cert_manager = if config.https > 0 {
+            let email = config.email.clone().expect("Email required for HTTPS");
+            Some(Arc::new(CertManager::new(
+                PathBuf::from(&config.config),
+                email,
+                config.acme_url.clone(),
+            )))
+        } else {
+            None
+        };
+
         Ok(Server {
             config,
             bindings,
@@ -51,6 +67,7 @@ impl Server {
             last_scan: Arc::new(RwLock::new(Instant::now() - Duration::from_secs(1000))),
             cert_requests: Arc::new(DashMap::new()),
             approved_hosts: Arc::new(DashMap::new()),
+            cert_manager,
         })
     }
 
@@ -123,14 +140,35 @@ impl Server {
         let addr = format!("0.0.0.0:{}", self.config.https);
         let listener = TcpListener::bind(&addr).await?;
 
+        // Create TLS config with SNI resolver
+        let cert_manager = self.cert_manager.as_ref()
+            .expect("Certificate manager required for HTTPS");
+        let cert_manager_clone = cert_manager.clone();
+
+        let tls_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(CertResolver {
+                cert_manager: cert_manager_clone,
+            }));
+
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
         loop {
             let (stream, _) = listener.accept().await?;
+            let acceptor = acceptor.clone();
             let server = self.clone();
 
             tokio::spawn(async move {
-                // Extract SNI hostname for certificate selection
-                // For now, we'll use a simple approach - in production would use proper SNI handling
-                let io = TokioIo::new(stream);
+                // Perform TLS handshake
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("TLS handshake error: {}", e);
+                        return;
+                    }
+                };
+
+                let io = TokioIo::new(tls_stream);
                 if let Err(e) = http1::Builder::new()
                     .serve_connection(io, service_fn(move |req| {
                         let server = server.clone();
@@ -145,6 +183,25 @@ impl Server {
     }
 
     async fn handle_http(&self, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        // Handle ACME HTTP-01 challenges
+        let path = req.uri().path();
+        if path.starts_with("/.well-known/acme-challenge/") {
+            if let Some(cert_manager) = &self.cert_manager {
+                let token = &path[28..]; // Skip "/.well-known/acme-challenge/"
+                if let Some(key_auth) = cert_manager.get_challenge(token).await {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "text/plain")
+                        .body(Full::new(Bytes::from(key_auth)))
+                        .unwrap());
+                }
+            }
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Full::new(Bytes::from("Challenge not found")))
+                .unwrap());
+        }
+
         let domain = match self.extract_domain(&req) {
             Some(d) => d,
             None => {
@@ -428,18 +485,27 @@ impl Server {
             return;
         }
 
+        let cert_manager = match &self.cert_manager {
+            Some(cm) => cm,
+            None => return,
+        };
+
+        // Check if certificate already exists
+        if cert_manager.has_certificate(domain) {
+            return;
+        }
+
         self.cert_requests.insert(domain.to_string(), ());
 
-        println!("Acquiring certificate for new domain: {}", domain);
-        let start = Instant::now();
-
-        // TODO: Implement actual ACME certificate acquisition using instant-acme
-        // For now, just simulate
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Acquire certificate using ACME
+        match cert_manager.acquire_certificate(domain).await {
+            Ok(_) => {},
+            Err(e) => {
+                eprintln!("Failed to acquire certificate for {}: {}", domain, e);
+            }
+        }
 
         self.cert_requests.remove(domain);
-
-        println!("  {}: acquired certificate (took {:?})", domain, start.elapsed());
     }
 
     async fn ensure_all_certificates(&self) {
@@ -476,5 +542,26 @@ impl Server {
     pub async fn stop(&self) {
         // Shutdown logic
         println!("Stopping server...");
+    }
+}
+
+// SNI certificate resolver for rustls
+#[derive(Debug)]
+struct CertResolver {
+    cert_manager: Arc<CertManager>,
+}
+
+impl rustls::server::ResolvesServerCert for CertResolver {
+    fn resolve(&self, client_hello: rustls::server::ClientHello) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let server_name = client_hello.server_name()?;
+        let domain: &str = server_name.as_ref();
+
+        // Load certificate for the requested domain
+        let (certs, key) = self.cert_manager.get_certificate(domain).ok()?;
+
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
+            .ok()?;
+
+        Some(Arc::new(rustls::sign::CertifiedKey::new(certs, signing_key)))
     }
 }
