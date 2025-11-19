@@ -1,7 +1,7 @@
 use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
 use crate::logger::Logger;
 use anyhow::Result;
-use hyper::{body::Incoming, Request, Response, StatusCode};
+use hyper::{body::Incoming, Request, Response};
 use hyper_util::{client::legacy::Client, rt::{TokioExecutor, TokioIo}};
 use http_body_util::{BodyExt, Full};
 use bytes::Bytes;
@@ -248,7 +248,6 @@ impl Project {
     }
 
     async fn proxy_request(&self, req: Request<Incoming>, target: &str) -> Result<Response<Full<Bytes>>> {
-        let _ = self.logger.write("debug", &format!("proxy_request called for {}", target));
         // Parse target URL
         let target_uri: hyper::Uri = target.parse()?;
 
@@ -262,7 +261,6 @@ impl Project {
 
         // Check if this is a WebSocket upgrade request
         let is_upgrade = is_websocket_upgrade(&req);
-        let _ = self.logger.write("debug", &format!("Request: {:?}", req));
 
         if is_upgrade {
             return self.proxy_websocket_upgrade(req, uri).await;
@@ -339,7 +337,6 @@ impl Project {
     }
 
     async fn handle_application(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-        let _ = self.logger.write("debug", "handle_application called");
         // Wait for port to be available (with timeout)
         let port = self.wait_for_port().await?;
 
@@ -835,93 +832,108 @@ impl Project {
         let host = target_uri.host().unwrap_or("localhost").to_string();
         let port = target_uri.port_u16().unwrap_or(80);
         let addr = format!("{}:{}", host, port);
-        
+
         let method = req.method().clone();
         let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
         let headers = req.headers().clone();
         let logger = self.logger.clone();
 
-        tokio::task::spawn(async move {
-            match hyper::upgrade::on(req).await {
-                Ok(upgraded) => {
-                    match tokio::net::TcpStream::connect(&addr).await {
-                        Ok(mut backend) => {
-                            let mut buf = Vec::new();
-                            use std::io::Write;
-                            
-                            write!(&mut buf, "{} {} HTTP/1.1\r\n", method, path).unwrap();
-                            for (name, value) in &headers {
-                                write!(&mut buf, "{}: ", name).unwrap();
-                                buf.extend_from_slice(value.as_bytes());
-                                buf.extend_from_slice(b"\r\n");
-                            }
-                            buf.extend_from_slice(b"\r\n");
-                            
-                            if let Err(e) = backend.write_all(&buf).await {
-                                let _ = logger.write("error", &format!("Failed to send upgrade request to backend: {}", e));
-                                return;
-                            }
-                            
-                            let req_str = String::from_utf8_lossy(&buf);
-                            let _ = logger.write("debug", &format!("Sent to backend:\n{}", req_str));
+        // Get the upgrade future before we return a response
+        let upgrade_fut = hyper::upgrade::on(req);
 
-                            // Read response headers from backend to consume the 101 response
-                            let mut response_buf = [0u8; 4096];
-                            let mut header_end = 0;
-                            let mut bytes_read = 0;
-                            
-                            loop {
-                                match backend.read(&mut response_buf[bytes_read..]).await {
-                                    Ok(0) => {
-                                        let _ = logger.write("error", "Backend closed connection during handshake");
-                                        return;
-                                    }
-                                    Ok(n) => {
-                                        bytes_read += n;
-                                        let window = &response_buf[..bytes_read];
-                                        if let Some(idx) = window.windows(4).position(|w| w == b"\r\n\r\n") {
-                                            header_end = idx + 4;
-                                            let response_str = String::from_utf8_lossy(&response_buf[..header_end]);
-                                            let _ = logger.write("debug", &format!("Backend response:\n{}", response_str));
-                                            break;
-                                        }
-                                        if bytes_read == response_buf.len() {
-                                            let _ = logger.write("error", "Response headers too long");
-                                            return;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = logger.write("error", &format!("Failed to read backend response: {}", e));
-                                        return;
-                                    }
-                                }
-                            }
-                            
-                            let mut upgraded = TokioIo::new(upgraded);
-                            
-                            if header_end < bytes_read {
-                                if let Err(e) = upgraded.write_all(&response_buf[header_end..bytes_read]).await {
-                                     eprintln!("Failed to write excess data to client: {}", e);
-                                     return;
-                                }
-                            }
-                            
-                            if let Err(e) = tokio::io::copy_bidirectional(&mut upgraded, &mut backend).await {
-                                // Connection closed
-                            }
+        // Connect to backend and send upgrade request
+        let mut backend = tokio::net::TcpStream::connect(&addr).await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to backend {}: {}", addr, e))?;
+
+        // Build and send the upgrade request to backend
+        let mut buf = Vec::new();
+        use std::io::Write;
+
+        write!(&mut buf, "{} {} HTTP/1.1\r\n", method, path).unwrap();
+        for (name, value) in &headers {
+            write!(&mut buf, "{}: ", name).unwrap();
+            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
+        buf.extend_from_slice(b"\r\n");
+
+        backend.write_all(&buf).await
+            .map_err(|e| anyhow::anyhow!("Failed to send upgrade request to backend: {}", e))?;
+
+        // Read response headers from backend
+        let mut response_buf = [0u8; 4096];
+        let mut bytes_read = 0;
+
+        let header_end = loop {
+            let n = backend.read(&mut response_buf[bytes_read..]).await
+                .map_err(|e| anyhow::anyhow!("Failed to read backend response: {}", e))?;
+
+            if n == 0 {
+                return Err(anyhow::anyhow!("Backend closed connection during handshake"));
+            }
+
+            bytes_read += n;
+            let window = &response_buf[..bytes_read];
+            if let Some(idx) = window.windows(4).position(|w| w == b"\r\n\r\n") {
+                break idx + 4;
+            }
+            if bytes_read == response_buf.len() {
+                return Err(anyhow::anyhow!("Response headers too long"));
+            }
+        };
+
+        let response_str = String::from_utf8_lossy(&response_buf[..header_end]);
+
+        // Parse backend response to extract status and headers
+        let mut response_lines = response_str.lines();
+        let status_line = response_lines.next()
+            .ok_or_else(|| anyhow::anyhow!("Empty backend response"))?;
+
+        // Extract status code from "HTTP/1.1 101 Switching Protocols"
+        let status_code = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or_else(|| anyhow::anyhow!("Invalid status line: {}", status_line))?;
+
+        // Build response with backend's headers
+        let mut response_builder = Response::builder().status(status_code);
+
+        for line in response_lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some(colon_idx) = line.find(':') {
+                let (name, value) = line.split_at(colon_idx);
+                let value = value[1..].trim();
+                response_builder = response_builder.header(name.trim(), value);
+            }
+        }
+
+        // Spawn task to pipe data bidirectionally after upgrade completes
+        tokio::task::spawn(async move {
+            match upgrade_fut.await {
+                Ok(upgraded) => {
+                    let mut upgraded = TokioIo::new(upgraded);
+
+                    // Write any excess data from the response to the client
+                    if header_end < bytes_read {
+                        if let Err(e) = upgraded.write_all(&response_buf[header_end..bytes_read]).await {
+                            let _ = logger.write("error", &format!("Failed to write excess data to client: {}", e));
+                            return;
                         }
-                        Err(e) => eprintln!("Failed to connect to backend {}: {}", addr, e),
                     }
+
+                    // Pipe data bidirectionally
+                    let _ = tokio::io::copy_bidirectional(&mut upgraded, &mut backend).await;
                 }
-                Err(e) => eprintln!("Upgrade error: {}", e),
+                Err(e) => {
+                    let _ = logger.write("error", &format!("Client upgrade failed: {}", e));
+                }
             }
         });
 
-        Ok(Response::builder()
-            .status(StatusCode::SWITCHING_PROTOCOLS)
-            .header(hyper::header::UPGRADE, "websocket")
-            .header(hyper::header::CONNECTION, "Upgrade")
-            .body(Full::new(Bytes::new()))?)
+        Ok(response_builder.body(Full::new(Bytes::new()))?)
     }
 }
 

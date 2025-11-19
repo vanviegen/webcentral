@@ -191,6 +191,7 @@ impl Server {
                         let server = server.clone();
                         async move { server.handle_http(req).await }
                     }))
+                    .with_upgrades()
                     .await
                 {
                     eprintln!("HTTP connection error: {}", e);
@@ -237,6 +238,7 @@ impl Server {
                         let server = server.clone();
                         async move { server.handle_https(req).await }
                     }))
+                    .with_upgrades()
                     .await
                 {
                     eprintln!("HTTPS connection error: {}", e);
