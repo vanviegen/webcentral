@@ -1,7 +1,6 @@
-use crate::config::{DockerConfig, ProjectConfig};
+use crate::config::{DockerConfig, ProjectConfig, ProjectType};
 use crate::logger::Logger;
-use anyhow::{Context, Result};
-use dashmap::DashMap;
+use anyhow::Result;
 use hyper::{body::Incoming, Request, Response};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use http_body_util::{BodyExt, Full};
@@ -19,27 +18,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-static PROJECTS: once_cell::sync::Lazy<DashMap<String, Arc<Project>>> =
-    once_cell::sync::Lazy::new(|| DashMap::new());
 
-static PROJECTS_PATTERN: RwLock<Option<String>> = RwLock::const_new(None);
-
-pub fn set_projects_pattern(pattern: String) {
-    tokio::spawn(async move {
-        *PROJECTS_PATTERN.write().await = Some(pattern);
-    });
-}
-
-pub async fn get_project(dir: &Path, use_firejail: bool, prune_logs: i64) -> Result<Arc<Project>> {
-    let dir_str = dir.to_string_lossy().to_string();
-
-    if let Some(project) = PROJECTS.get(&dir_str) {
-        return Ok(project.clone());
-    }
-
+pub async fn create_project(dir: &Path, domain: String, use_firejail: bool, prune_logs: i64) -> Result<Arc<Project>> {
     // Load configuration
     let config = ProjectConfig::load(dir)?;
     let (uid, gid) = get_ownership(dir);
@@ -49,25 +32,36 @@ pub async fn get_project(dir: &Path, use_firejail: bool, prune_logs: i64) -> Res
     let logger = Arc::new(Logger::new(log_dir, uid, gid, prune_logs)?);
 
     // Log project type
-    if !config.redirect.is_empty() {
-        logger.write("", &format!("starting redirect to {}", config.redirect))?;
-    } else if !config.proxy.is_empty() {
-        logger.write("", &format!("starting proxy for {}", config.proxy))?;
-    } else if !config.socket_path.is_empty() {
-        logger.write("", &format!("starting forward to socket {}", config.socket_path))?;
-    } else if config.port > 0 {
-        logger.write("", &format!("starting forward to http://{}:{}", config.host, config.port))?;
-    } else if config.command.is_empty() && config.docker.is_none() {
-        logger.write("", "starting static file server")?;
+    match &config.project_type {
+        ProjectType::Redirect { target } => {
+            logger.write("", &format!("starting redirect to {}", target))?;
+        }
+        ProjectType::Proxy { target } => {
+            logger.write("", &format!("starting proxy for {}", target))?;
+        }
+        ProjectType::Forward { socket_path, host, port } => {
+            if !socket_path.is_empty() {
+                logger.write("", &format!("starting forward to socket {}", socket_path))?;
+            } else {
+                logger.write("", &format!("starting forward to http://{}:{}", host, port))?;
+            }
+        }
+        ProjectType::Application { .. } => {
+            // Will log when process starts
+        }
+        ProjectType::Static => {
+            logger.write("", "starting static file server")?;
+        }
     }
 
     // Log configuration errors
     for err in &config.config_errors {
-        logger.write("", err)?;
+        logger.write("config", err)?;
     }
 
     let project = Arc::new(Project {
-        dir: dir_str.clone(),
+        domain: domain.clone(),
+        dir: dir.to_string_lossy().to_string(),
         config: Arc::new(config),
         logger: logger.clone(),
         uid,
@@ -76,8 +70,6 @@ pub async fn get_project(dir: &Path, use_firejail: bool, prune_logs: i64) -> Res
         state: Arc::new(Mutex::new(ProjectState::Stopped)),
         last_activity: Arc::new(Mutex::new(Instant::now())),
     });
-
-    PROJECTS.insert(dir_str, project.clone());
 
     // Start file watcher
     let proj = project.clone();
@@ -98,12 +90,6 @@ pub async fn get_project(dir: &Path, use_firejail: bool, prune_logs: i64) -> Res
     Ok(project)
 }
 
-pub async fn stop_all_projects() {
-    for entry in PROJECTS.iter() {
-        entry.value().stop().await;
-    }
-}
-
 #[derive(Debug)]
 enum ProjectState {
     Stopped,
@@ -111,7 +97,9 @@ enum ProjectState {
     Running { port: u16, process: tokio::process::Child, workers: Vec<tokio::process::Child> },
 }
 
+#[derive(Debug)]
 pub struct Project {
+    domain: String,
     dir: String,
     pub config: Arc<ProjectConfig>,
     logger: Arc<Logger>,
@@ -124,7 +112,7 @@ pub struct Project {
 
 impl Project {
     fn needs_process_management(&self) -> bool {
-        !self.config.command.is_empty() || self.config.docker.is_some()
+        matches!(self.config.project_type, ProjectType::Application { .. })
     }
 
     pub fn handle<'a>(&'a self, req: Request<Incoming>) -> Pin<Box<dyn Future<Output = Result<Response<Full<Bytes>>>> + Send + 'a>> {
@@ -142,10 +130,6 @@ impl Project {
         let (_path, redirect) = self.apply_rewrites(req.uri().path());
 
         if !redirect.is_empty() {
-            // Handle webcentral:// URLs
-            if redirect.starts_with("webcentral://") {
-                return self.handle_webcentral_redirect(&redirect, req).await;
-            }
             return Ok(Response::builder()
                 .status(301)
                 .header("Location", redirect)
@@ -153,16 +137,22 @@ impl Project {
         }
 
         // Determine handler based on configuration
-        if !self.config.redirect.is_empty() {
-            self.handle_redirect().await
-        } else if !self.config.proxy.is_empty() {
-            self.handle_proxy_remote(req).await
-        } else if !self.config.socket_path.is_empty() || self.config.port > 0 {
-            self.handle_forward(req).await
-        } else if self.needs_process_management() {
-            self.handle_application(req).await
-        } else {
-            self.handle_static(req).await
+        match &self.config.project_type {
+            ProjectType::Redirect { .. } => {
+                self.handle_redirect().await
+            }
+            ProjectType::Proxy { .. } => {
+                self.handle_proxy_remote(req).await
+            }
+            ProjectType::Forward { .. } => {
+                self.handle_forward(req).await
+            }
+            ProjectType::Application { .. } => {
+                self.handle_application(req).await
+            }
+            ProjectType::Static => {
+                self.handle_static(req).await
+            }
         }
     }
 
@@ -181,24 +171,15 @@ impl Project {
         (path.to_string(), String::new())
     }
 
-    async fn handle_webcentral_redirect(&self, redirect: &str, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-        let target_name = redirect.strip_prefix("webcentral://").unwrap();
-        let parts: Vec<&str> = target_name.splitn(2, '/').collect();
-        let project_name = parts[0];
-        let _target_path = if parts.len() == 2 { format!("/{}", parts[1]) } else { "/".to_string() };
-
-        // Find target project directory
-        let target_dir = find_project_by_name(project_name).await?;
-        let target_project = get_project(&target_dir, self.use_firejail, self.logger.prune_days).await?;
-
-        // Forward request to target project
-        target_project.handle(req).await
-    }
-
     async fn handle_redirect(&self) -> Result<Response<Full<Bytes>>> {
+        let target = match &self.config.project_type {
+            ProjectType::Redirect { target } => target,
+            _ => unreachable!("handle_redirect called for non-Redirect project"),
+        };
+        
         Ok(Response::builder()
             .status(301)
-            .header("Location", &self.config.redirect)
+            .header("Location", target)
             .body(Full::new(Bytes::new()))?)
     }
 
@@ -233,20 +214,30 @@ impl Project {
     }
 
     async fn handle_forward(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+        let (socket_path, host, port) = match &self.config.project_type {
+            ProjectType::Forward { socket_path, host, port } => (socket_path, host, port),
+            _ => unreachable!("handle_forward called for non-Forward project"),
+        };
+        
         // For forwards (static port/socket), just proxy directly
-        let target = if !self.config.socket_path.is_empty() {
-            format!("unix://{}", self.config.socket_path)
+        let target = if !socket_path.is_empty() {
+            format!("unix://{}", socket_path)
         } else {
-            format!("http://{}:{}", self.config.host, self.config.port)
+            format!("http://{}:{}", host, port)
         };
 
         self.proxy_request(req, &target).await
     }
 
     async fn handle_proxy_remote(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+        let target = match &self.config.project_type {
+            ProjectType::Proxy { target } => target,
+            _ => unreachable!("handle_proxy_remote called for non-Proxy project"),
+        };
+        
         // Simplified proxy without retry logic
         // (Retry would require request cloning which is complex with streaming bodies)
-        self.proxy_request(req, &self.config.proxy).await
+        self.proxy_request(req, target).await
     }
 
     async fn proxy_request(&self, req: Request<Incoming>, target: &str) -> Result<Response<Full<Bytes>>> {
@@ -356,18 +347,8 @@ impl Project {
         match *state {
             ProjectState::Running { .. } => return Ok(()),
             ProjectState::Starting { .. } => {
-                // Wait for startup to complete (with timeout)
+                // Already starting, just wait
                 drop(state);
-                for _ in 0..300 {  // 30 second timeout
-                    sleep(Duration::from_millis(100)).await;
-                    let s = self.state.lock().await;
-                    match *s {
-                        ProjectState::Running { .. } => return Ok(()),
-                        ProjectState::Stopped => anyhow::bail!("Application failed to start"),
-                        _ => continue,
-                    }
-                }
-                anyhow::bail!("Application startup timeout");
             }
             ProjectState::Stopped => {
                 // Start the application
@@ -388,28 +369,33 @@ impl Project {
                         *proj.state.lock().await = ProjectState::Stopped;
                     }
                 });
-
-                // Wait for port to be ready
-                for _ in 0..300 {
-                    sleep(Duration::from_millis(100)).await;
-                    let s = self.state.lock().await;
-                    match *s {
-                        ProjectState::Running { .. } => return Ok(()),
-                        ProjectState::Stopped => anyhow::bail!("Application failed to start"),
-                        _ => continue,
-                    }
-                }
-
-                anyhow::bail!("Application startup timeout");
             }
         }
+
+        // Wait for startup to complete (with timeout)
+        for _ in 0..300 {  // 30 second timeout
+            sleep(Duration::from_millis(100)).await;
+            let s = self.state.lock().await;
+            match *s {
+                ProjectState::Running { .. } => return Ok(()),
+                ProjectState::Stopped => anyhow::bail!("Application failed to start"),
+                _ => continue,
+            }
+        }
+        
+        anyhow::bail!("Application startup timeout")
     }
 
     async fn start_process(&self, port: u16) -> Result<()> {
-        let mut process = if let Some(docker) = &self.config.docker {
-            self.build_docker_command(port, docker).await?
+        let (command, docker, _workers) = match &self.config.project_type {
+            ProjectType::Application { command, docker, workers } => (command, docker, workers),
+            _ => unreachable!("start_process called for non-Application project"),
+        };
+        
+        let mut process = if let Some(docker_config) = docker {
+            self.build_docker_command(port, docker_config, command).await?
         } else {
-            self.build_shell_command(&self.config.command)?
+            self.build_shell_command(command)?
         };
 
         // Set environment
@@ -519,15 +505,20 @@ impl Project {
     }
 
     async fn start_workers(&self, port: u16) -> Vec<tokio::process::Child> {
-        if self.config.workers.is_empty() {
+        let workers_map = match &self.config.project_type {
+            ProjectType::Application { workers, .. } => workers,
+            _ => return vec![],
+        };
+        
+        if workers_map.is_empty() {
             return vec![];
         }
 
-        self.logger.write("", &format!("starting {} worker(s)", self.config.workers.len())).unwrap();
+        self.logger.write("", &format!("starting {} worker(s)", workers_map.len())).unwrap();
 
         let mut workers = vec![];
 
-        for (name, cmd) in &self.config.workers {
+        for (name, cmd) in workers_map {
             let mut process = match self.build_shell_command(cmd) {
                 Ok(p) => p,
                 Err(e) => {
@@ -584,7 +575,9 @@ impl Project {
     }
 
     fn build_shell_command(&self, command: &str) -> Result<Command> {
-        let mut cmd = if self.use_firejail && self.config.docker.is_none() {
+        let has_docker = matches!(self.config.project_type, ProjectType::Application { docker: Some(_), .. });
+        
+        let mut cmd = if self.use_firejail && !has_docker {
             let home = get_user_home(self.uid);
             let mut c = Command::new("firejail");
             c.args(&[
@@ -616,7 +609,7 @@ impl Project {
         Ok(cmd)
     }
 
-    async fn build_docker_command(&self, port: u16, dc: &DockerConfig) -> Result<Command> {
+    async fn build_docker_command(&self, port: u16, dc: &DockerConfig, command: &str) -> Result<Command> {
         // Generate container name
         let hash = md5::compute(self.dir.as_bytes());
         let container_name = format!("webcentral-{:x}", hash);
@@ -705,8 +698,8 @@ impl Project {
 
         cmd.arg(&image_name);
 
-        if !self.config.command.is_empty() {
-            cmd.args(&["/bin/sh", "-c", &self.config.command]);
+        if !command.is_empty() {
+            cmd.args(&["/bin/sh", "-c", command]);
         }
 
         Ok(cmd)
@@ -732,8 +725,8 @@ impl Project {
                 if self.should_reload_for_file(rel_path) {
                     self.logger.write("", &format!("stopping due to change for {}", rel_path.display()))?;
 
-                    // Remove from projects map immediately so new requests create a fresh instance
-                    PROJECTS.remove(&self.dir);
+                    // Remove from DOMAINS map immediately so new requests create a fresh instance
+                    crate::server::discard_project(&self.domain).await;
 
                     // Stop the old process in background
                     let project_clone = self.clone();
@@ -803,10 +796,10 @@ impl Project {
             if last.elapsed() > timeout {
                 let _ = self.logger.write("", "stopping due to inactivity");
 
-                // Stop and remove from projects map so it will be recreated on next request
-                let dir = self.dir.clone();
+                // Stop and remove from DOMAINS map so it will be recreated on next request
+                let domain = self.domain.clone();
                 self.stop().await;
-                PROJECTS.remove(&dir);
+                crate::server::discard_project(&domain).await;
                 break;
             }
         }
@@ -873,6 +866,7 @@ impl Project {
 impl Clone for Project {
     fn clone(&self) -> Self {
         Project {
+            domain: self.domain.clone(),
             dir: self.dir.clone(),
             config: self.config.clone(),
             logger: self.logger.clone(),
@@ -918,21 +912,6 @@ async fn wait_for_port(port: u16, timeout: Duration) -> bool {
     }
 
     false
-}
-
-async fn find_project_by_name(name: &str) -> Result<PathBuf> {
-    let pattern = PROJECTS_PATTERN.read().await;
-    let pattern = pattern.as_ref().context("Projects pattern not set")?;
-
-    for entry in glob::glob(pattern)? {
-        let base_path = entry?;
-        let project_path = base_path.join(name);
-        if project_path.exists() && project_path.is_dir() {
-            return Ok(project_path);
-        }
-    }
-
-    anyhow::bail!("Project not found: {}", name)
 }
 
 fn matches_pattern(path: &str, pattern: &str) -> bool {

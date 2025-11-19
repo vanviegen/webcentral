@@ -1,5 +1,5 @@
 use crate::acme::CertManager;
-use crate::project;
+use crate::project::{self, Project};
 use anyhow::Result;
 use dashmap::DashMap;
 use hyper::server::conn::http1;
@@ -11,42 +11,62 @@ use bytes::Bytes;
 use notify::{Watcher, RecursiveMode};
 use regex::Regex;
 use rustls::ServerConfig;
-use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Notify};
 use tokio_rustls::TlsAcceptor;
+
+// Domain information stored in the global DOMAINS map
+struct DomainInfo {
+    directory: String,
+    project: RwLock<Option<Arc<Project>>>,
+    // Notify when certificate becomes ready
+    cert_ready: Arc<Notify>,
+    // Track if certificate acquisition is in progress
+    cert_acquiring: AtomicBool,
+}
+
+impl DomainInfo {
+    fn new(directory: String) -> Self {
+        Self {
+            directory,
+            project: RwLock::new(None),
+            cert_ready: Arc::new(Notify::new()),
+            cert_acquiring: AtomicBool::new(false),
+        }
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref DOMAINS: DashMap<String, DomainInfo> = DashMap::new();
+}
+
+// Called by Project when it shuts down to remove itself from DOMAINS
+pub async fn discard_project(domain: &str) {
+    if let Some(domain_info) = DOMAINS.get_mut(domain) {
+        *domain_info.project.write().await = None;
+    }
+}
+
+// Stop all running projects (called during shutdown)
+pub async fn stop_all_projects() {
+    for entry in DOMAINS.iter() {
+        if let Some(project) = entry.project.read().await.as_ref() {
+            project.stop().await;
+        }
+    }
+}
 
 pub struct Server {
     config: crate::Config,
-    bindings: Arc<DashMap<String, String>>,
-    bindings_file: PathBuf,
-    last_scan: Arc<RwLock<Instant>>,
-    cert_requests: Arc<DashMap<String, ()>>,
-    #[allow(dead_code)]
-    approved_hosts: Arc<DashMap<String, ()>>,
     cert_manager: Option<Arc<CertManager>>,
 }
 
 impl Server {
     pub async fn new(config: crate::Config) -> Result<Self> {
-        project::set_projects_pattern(config.projects.clone());
-
-        let bindings_file = config.bindings_file();
-        let bindings = Arc::new(DashMap::new());
-
-        // Load bindings cache
-        if let Ok(data) = fs::read_to_string(&bindings_file) {
-            if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&data) {
-                for (k, v) in map {
-                    bindings.insert(k, v);
-                }
-            }
-        }
-
         // Create certificate manager if HTTPS is enabled
         let cert_manager = if config.https > 0 {
             let email = config.email.clone().expect("Email required for HTTPS");
@@ -61,16 +81,23 @@ impl Server {
 
         Ok(Server {
             config,
-            bindings,
-            bindings_file,
-            last_scan: Arc::new(RwLock::new(Instant::now() - Duration::from_secs(1000))),
-            cert_requests: Arc::new(DashMap::new()),
-            approved_hosts: Arc::new(DashMap::new()),
             cert_manager,
         })
     }
 
     pub async fn start(self: Arc<Self>) -> Result<()> {
+        // Do initial scan to populate DOMAINS
+        let server = self.clone();
+        server.scan_all_project_directories().await;
+
+        // Start directory watcher to maintain DOMAINS
+        let server = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server.watch_project_directories().await {
+                eprintln!("Directory watcher error: {}", e);
+            }
+        });
+
         // Start HTTP server
         if self.config.http > 0 {
             let server = self.clone();
@@ -91,20 +118,6 @@ impl Server {
                 }
             });
             println!("HTTPS server listening on port {}", self.config.https);
-
-            // Watch for new project directories
-            let server = self.clone();
-            tokio::spawn(async move {
-                if let Err(e) = server.watch_project_directories().await {
-                    eprintln!("Directory watcher error: {}", e);
-                }
-            });
-
-            // Acquire certificates for existing domains
-            let server = self.clone();
-            tokio::spawn(async move {
-                server.ensure_all_certificates().await;
-            });
         }
 
         Ok(())
@@ -231,8 +244,8 @@ impl Server {
             }
         };
 
-        let project_dir = match self.get_project_dir(&domain).await {
-            Ok(dir) => dir,
+        let project = match self.get_project_for_domain(&domain).await {
+            Ok(p) => p,
             Err(_) => {
                 // Check for www redirect
                 if self.config.redirect_www {
@@ -242,24 +255,14 @@ impl Server {
                         format!("www.{}", domain)
                     };
 
-                    if self.get_project_dir(&alt_domain).await.is_ok() {
+                    if let Ok(_) = self.get_project_for_domain(&alt_domain).await {
                         let proto = if from_https { "https" } else { "http" };
-                        let redirect_url = format!("{}://{}{}", proto, domain,
+                        let redirect_url = format!("{}://{}{}", proto, alt_domain,
                         req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
                         return Ok(Self::redirect_to(redirect_url));
                     }
                 }
                 return Ok(Self::error_response(StatusCode::NOT_FOUND, "Not Found"));
-            }
-        };
-
-        // Get or create project first to access its config
-        let project = match project::get_project(&PathBuf::from(project_dir), self.config.firejail, self.config.prune_logs).await {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Failed to get project: {}", e);
-                return Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, 
-                    "Internal Server Error"));
             }
         };
 
@@ -319,68 +322,71 @@ impl Server {
         Some(host)
     }
 
-    async fn get_project_dir(&self, domain: &str) -> Result<String> {
-        // Check cache first
+    async fn get_project_for_domain(&self, domain: &str) -> Result<Arc<Project>> {
+        // Look up domain in DOMAINS map
+        let domain_info = DOMAINS.get(domain)
+            .ok_or_else(|| anyhow::anyhow!("Domain not found: {}", domain))?;
+
+        // Check if project already exists
         {
-            let last_scan = *self.last_scan.read().await;
-            if last_scan.elapsed() < Duration::from_secs(10) {
-                if let Some(dir) = self.bindings.get(domain) {
-                    // Verify directory still exists
-                    if Path::new(dir.value()).exists() {
-                        return Ok(dir.value().clone());
+            let project_guard = domain_info.project.read().await;
+            if let Some(project) = project_guard.as_ref() {
+                return Ok(project.clone());
+            }
+        }
+
+        // Create or recreate project
+        let project = project::create_project(
+            &PathBuf::from(&domain_info.directory),
+            domain.to_string(),
+            self.config.firejail,
+            self.config.prune_logs
+        ).await?;
+
+        // Store in domain info
+        {
+            let mut project_guard = domain_info.project.write().await;
+            *project_guard = Some(project.clone());
+        }
+
+        Ok(project)
+    }
+
+    fn add_domain(&self, domain: String, directory: String) {
+        // Add to DOMAINS if not already present
+        DOMAINS.entry(domain).or_insert_with(|| {
+            DomainInfo::new(directory)
+        });
+    }
+
+    async fn scan_all_project_directories(self: Arc<Self>) {
+        let valid_domain = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$").unwrap();
+
+        for entry in glob::glob(&self.config.projects).unwrap() {
+            if let Ok(base_path) = entry {
+                if let Ok(entries) = fs::read_dir(base_path) {
+                    for entry in entries.flatten() {
+                        if entry.path().is_dir() {
+                            if let Some(domain) = entry.file_name().to_str() {
+                                if valid_domain.is_match(domain) {
+                                    let directory = entry.path().to_string_lossy().to_string();
+                                    let domain = domain.to_lowercase();
+                                    self.add_domain(domain.clone(), directory);
+
+                                    // Start certificate acquisition in background
+                                    if self.cert_manager.is_some() {
+                                        let server = self.clone();
+                                        let domain = domain.clone();
+                                        tokio::spawn(async move {
+                                            server.acquire_certificate_for_domain(&domain).await;
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
-                    // Directory no longer exists, will rescan
-                    drop(dir);
-                    self.bindings.remove(domain);
                 }
             }
-        }
-
-        // Scan for project directory
-        let mut last_scan = self.last_scan.write().await;
-
-        // Double-check after acquiring write lock
-        if last_scan.elapsed() < Duration::from_secs(10) {
-            if let Some(dir) = self.bindings.get(domain) {
-                if Path::new(dir.value()).exists() {
-                    return Ok(dir.value().clone());
-                }
-                drop(dir);
-                self.bindings.remove(domain);
-            }
-        }
-
-        // Scan directories
-        let dir = self.scan_for_project(domain).await?;
-        self.bindings.insert(domain.to_string(), dir.clone());
-        *last_scan = Instant::now();
-
-        self.save_bindings();
-
-        Ok(dir)
-    }
-
-    async fn scan_for_project(&self, domain: &str) -> Result<String> {
-        for entry in glob::glob(&self.config.projects)? {
-            let base_path = entry?;
-            let project_path = base_path.join(domain);
-
-            if project_path.exists() && project_path.is_dir() {
-                return Ok(project_path.to_string_lossy().to_string());
-            }
-        }
-
-        anyhow::bail!("Project not found for domain: {}", domain)
-    }
-
-    fn save_bindings(&self) {
-        let map: HashMap<String, String> = self.bindings.iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect();
-
-        if let Ok(data) = serde_json::to_string_pretty(&map) {
-            let _ = fs::create_dir_all(self.bindings_file.parent().unwrap());
-            let _ = fs::write(&self.bindings_file, data);
         }
     }
 
@@ -400,24 +406,51 @@ impl Server {
             println!("Watching for new projects in {}", base_path.display());
         }
 
+        let valid_domain = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$").unwrap();
+
         while let Some(event) = rx.recv().await {
-            if event.kind.is_create() {
-                for path in event.paths {
-                    if path.is_dir() {
-                        if let Some(domain) = path.file_name().and_then(|n| n.to_str()) {
-                            let valid_domain = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$").unwrap();
-                            if valid_domain.is_match(domain) {
-                                println!("New project directory detected: {}", domain);
-                                // Acquire certificate in background
-                                let domain = domain.to_string();
-                                let server = self.clone();
-                                tokio::spawn(async move {
-                                    server.acquire_certificate_for_domain(&domain).await;
-                                });
+            match event.kind {
+                notify::EventKind::Create(_) => {
+                    for path in event.paths {
+                        if path.is_dir() {
+                            if let Some(domain) = path.file_name().and_then(|n| n.to_str()) {
+                                if valid_domain.is_match(domain) {
+                                    let directory = path.to_string_lossy().to_string();
+                                    let domain = domain.to_lowercase();
+                                    
+                                    println!("New project directory detected: {}", domain);
+                                    self.add_domain(domain.clone(), directory);
+
+                                    // Acquire certificate in background if HTTPS enabled
+                                    if self.cert_manager.is_some() {
+                                        let server = self.clone();
+                                        let domain = domain.clone();
+                                        tokio::spawn(async move {
+                                            server.acquire_certificate_for_domain(&domain).await;
+                                        });
+                                    }
+                                }
                             }
                         }
                     }
-                }
+                },
+                notify::EventKind::Remove(_) => {
+                    for path in event.paths {
+                        if let Some(domain) = path.file_name().and_then(|n| n.to_str()) {
+                            if valid_domain.is_match(domain) {
+                                let domain = domain.to_lowercase();
+                                println!("Project directory removed: {}", domain);
+                                
+                                // Remove from DOMAINS
+                                DOMAINS.remove(&domain);
+                                
+                                // Note: Certificate removal from ACME client would go here
+                                // For now, we just keep the certificate files
+                            }
+                        }
+                    }
+                },
+                _ => {}
             }
         }
 
@@ -425,63 +458,52 @@ impl Server {
     }
 
     async fn acquire_certificate_for_domain(&self, domain: &str) {
-        // Check if already being requested
-        if self.cert_requests.contains_key(domain) {
+        // Check if already being acquired using compare-and-swap
+        let domain_info = match DOMAINS.get(domain) {
+            Some(info) => info,
+            None => return,
+        };
+        
+        // Try to set cert_acquiring from false to true atomically
+        if domain_info.cert_acquiring.compare_exchange(
+            false, 
+            true, 
+            Ordering::SeqCst, 
+            Ordering::SeqCst
+        ).is_err() {
+            // Already being acquired
             return;
         }
 
         let cert_manager = match &self.cert_manager {
             Some(cm) => cm,
-            None => return,
+            None => {
+                domain_info.cert_acquiring.store(false, Ordering::SeqCst);
+                return;
+            }
         };
 
         // Check if certificate already exists
         if cert_manager.has_certificate(domain) {
+            // Notify any waiters
+            domain_info.cert_ready.notify_waiters();
+            domain_info.cert_acquiring.store(false, Ordering::SeqCst);
             return;
         }
 
-        self.cert_requests.insert(domain.to_string(), ());
-
         // Acquire certificate using ACME
         match cert_manager.acquire_certificate(domain).await {
-            Ok(_) => {},
+            Ok(_) => {
+                // Notify any waiters that certificate is ready
+                domain_info.cert_ready.notify_waiters();
+            },
             Err(e) => {
                 eprintln!("Failed to acquire certificate for {}: {}", domain, e);
             }
         }
 
-        self.cert_requests.remove(domain);
-    }
-
-    async fn ensure_all_certificates(&self) {
-        // Scan for all project directories
-        let mut domains = Vec::new();
-
-        for entry in glob::glob(&self.config.projects).unwrap() {
-            if let Ok(base_path) = entry {
-                if let Ok(entries) = fs::read_dir(base_path) {
-                    for entry in entries.flatten() {
-                        if entry.path().is_dir() {
-                            if let Some(domain) = entry.file_name().to_str() {
-                                let valid_domain = Regex::new(r"^[a-zA-Z0-9.-]+$").unwrap();
-                                if valid_domain.is_match(domain) {
-                                    domains.push(domain.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        println!("Acquiring certificates for {} domains...", domains.len());
-
-        for domain in domains {
-            self.acquire_certificate_for_domain(&domain).await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        println!("Certificate acquisition complete");
+        // Mark as no longer acquiring
+        domain_info.cert_acquiring.store(false, Ordering::SeqCst);
     }
 
     pub async fn stop(&self) {
@@ -500,6 +522,15 @@ impl rustls::server::ResolvesServerCert for CertResolver {
     fn resolve(&self, client_hello: rustls::server::ClientHello) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let server_name = client_hello.server_name()?;
         let domain: &str = server_name.as_ref();
+
+        // Check if domain exists in DOMAINS
+        if let Some(domain_info) = DOMAINS.get(domain) {
+            // Check if certificate is currently being acquired
+            if domain_info.cert_acquiring.load(Ordering::SeqCst) {
+                eprintln!("Certificate for {} is still being acquired, connection will be closed", domain);
+                return None;
+            }
+        }
 
         // Load certificate for the requested domain
         let (certs, key) = self.cert_manager.get_certificate(domain).ok()?;

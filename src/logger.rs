@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+#[derive(Debug)]
 pub struct Logger {
     dir: PathBuf,
     file: Mutex<Option<File>>,

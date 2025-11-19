@@ -364,16 +364,13 @@ Make sure no other services are using ports 80 or 443.
 
 ## Changelog
 
-2025-11-16:
+2025-11-19:
+ - Initial AI-driven Rust reimplementation of the [original Node.js version](https://github.com/vanviegen/webcentral/tree/nodejs). It was born out of Node.js dependency rot frustration. It also adds multi-threading, and should be fully compatible with original configuration format and project structure.
  - Added a test suite, mostly for catching configuration-change race conditions.
  - Configurable log retention (`--prune-logs`)
- - Proactive certificate acquisition for new projects
+ - Proactive certificate acquisition for newly created projects (no longer awaiting the first request)
  - Added Procfile support (though no `release:` yet)
  - Added support for worker processes alongside main app process (not for Docker yet)
-
-2025-11-16:
- - Initial AI-driven Go reimplementation of the [original Node.js version](https://github.com/vanviegen/webcentral/tree/nodejs). It was born out of Node.js dependency rot frustration. It also adds multi-threading.
- - Should be fully compatible with original configuration format and project structure.
 
 See `git log` for further changes.
 

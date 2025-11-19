@@ -764,7 +764,7 @@ def test_config_unknown_key_in_root(t):
 
     # Make HTTP request to trigger project creation and config loading
     t.assert_http('badconfig1.test', '/', check_body='Test')
-    t.assert_log('badconfig1.test', "Unknown key 'unknown_key' in root section", count=1)
+    t.assert_log('badconfig1.test', "Unknown key 'unknown_key'", count=1)
 
 
 @test
@@ -776,7 +776,7 @@ def test_config_unknown_section(t):
 
     # Make HTTP request to trigger project creation and config loading
     t.assert_http('badconfig2.test', '/', check_body='Test')
-    t.assert_log('badconfig2.test', 'Unknown section [invalid_section] in webcentral.ini', count=1)
+    t.assert_log('badconfig2.test', "Unknown key 'invalid_section.key'", count=1)
 
 
 @test
@@ -796,7 +796,7 @@ def test_config_unknown_key_in_docker(t):
         pass
 
     # Verify the config error was logged
-    t.assert_log('badconfig3.test', "Unknown key 'invalid_docker_key' in [docker] section", count=1)
+    t.assert_log('badconfig3.test', "Unknown key 'docker.invalid_docker_key'", count=1)
 
 
 @test
@@ -808,7 +808,7 @@ def test_config_unknown_key_in_reload(t):
 
     # Make HTTP request to trigger project creation and app start
     t.assert_http('badconfig4.test', '/', check_body='Test')
-    t.assert_log('badconfig4.test', "Unknown key 'bad_key' in [reload] section", count=1)
+    t.assert_log('badconfig4.test', "Unknown key 'reload.bad_key'", count=1)
     t.assert_log('badconfig4.test', 'reachable on port', count=1)
 
 

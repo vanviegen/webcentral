@@ -1,0 +1,17 @@
+[ ] `watcher.watch(Path::new(&self.dir), RecursiveMode::Recursive)?;` is really wasteful - it would for instance trigger for every database update or log write (and then we'd ignore the event in should_reload_for_file). It would be better if we could exclude directories that cannot possibly even include a matched file somehow.
+[ ] Go over all logger.write calls and make sure that they are useful and all messages are brief and clear and start with a capital
+[ ] Reintroduce bindings.json to prevent one user for stealing another user's domain
+[ ] Have test.py output stdout/stderr for when webcentral is failing to start up
+[ ] See if we can reduce dependencies somewhat (for instance hex and md5 are probably not needed just to come up with a name hash)
+[ ] Implement HTTP/3 server using https://github.com/quinn-rs/quinn
+[ ] Add a test.py test for WebSockets relaying
+[ ] Add a test.py test for www redirection
+[ ] Add a test.py test for HTTP to HTTPS redirection
+[ ] Add a test.py test for static file serving with correct MIME types
+[ ] To verify that a project is actually running, don't just check if the port is open, but make sure you get a http 2xx, 3xx or 4xx back from the server
+[ ] Make the URL to check configurable in webcentral.ini
+[ ] Optionally do a periodic check on that URL after the project has started, forcing a shutdown if it's no longer responding
+[ ] When a Project shuts down or after 15 minutes of running, output some stats (at least request count, but other easy-to-gather stats would be nice as well) to its log file
+[ ] Review and improve documentation for users and developers
+
+For each of the above: update README.md (and add to its Changelog section) if needed.
