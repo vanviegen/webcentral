@@ -132,14 +132,12 @@ impl Project {
     }
 
     async fn handle_impl(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-        eprintln!("project.handle_impl: start");
         *self.last_activity.lock().await = Instant::now();
 
         if self.config.log_requests {
             let _ = self.logger.write("", &format!("{} {}", req.method(), req.uri().path()));
         }
 
-        eprintln!("project.handle_impl: applying rewrites");
         // Apply URL rewrites
         let (_path, redirect) = self.apply_rewrites(req.uri().path());
 
@@ -155,25 +153,17 @@ impl Project {
         }
 
         // Determine handler based on configuration
-        eprintln!("project.handle_impl: determining handler");
-        let result = if !self.config.redirect.is_empty() {
-            eprintln!("project.handle_impl: redirect");
+        if !self.config.redirect.is_empty() {
             self.handle_redirect().await
         } else if !self.config.proxy.is_empty() {
-            eprintln!("project.handle_impl: proxy_remote");
             self.handle_proxy_remote(req).await
         } else if !self.config.socket_path.is_empty() || self.config.port > 0 {
-            eprintln!("project.handle_impl: forward");
             self.handle_forward(req).await
         } else if self.needs_process_management() {
-            eprintln!("project.handle_impl: application");
             self.handle_application(req).await
         } else {
-            eprintln!("project.handle_impl: static");
             self.handle_static(req).await
-        };
-        eprintln!("project.handle_impl: handler returned");
-        result
+        }
     }
 
     fn apply_rewrites(&self, path: &str) -> (String, String) {
@@ -342,11 +332,9 @@ impl Project {
     }
 
     async fn handle_application(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-        eprintln!("handle_application: ensuring app started");
         // Ensure application is started
         self.ensure_started().await?;
 
-        eprintln!("handle_application: getting port");
         // Get current port
         let port = {
             let state = self.state.lock().await;
@@ -357,12 +345,9 @@ impl Project {
             }
         };
 
-        eprintln!("handle_application: port={}, proxying", port);
         // Proxy to application
         let target = format!("http://localhost:{}", port);
-        let result = self.proxy_request(req, &target).await;
-        eprintln!("handle_application: proxy_request returned");
-        result
+        self.proxy_request(req, &target).await
     }
 
     async fn ensure_started(&self) -> Result<()> {
@@ -484,29 +469,52 @@ impl Project {
 
         *self.state.lock().await = ProjectState::Running { port, process: child, workers };
 
-        // Monitor process exit
-        let proj = Arc::new(self.clone());
-        tokio::spawn(async move {
-            let exit_status = {
-                let mut state = proj.state.lock().await;
-                if let ProjectState::Running { ref mut process, .. } = *state {
-                    process.wait().await
-                } else {
-                    return;
-                }
-            };
-
-            match exit_status {
-                Ok(status) => {
-                    let _ = proj.logger.write("", &format!("process exited: {:?}", status));
-                }
-                Err(e) => {
-                    let _ = proj.logger.write("", &format!("process error: {}", e));
-                }
+        // Monitor process exit in background - extract process ID before spawning
+        let child_id = {
+            let state = self.state.lock().await;
+            if let ProjectState::Running { ref process, .. } = *state {
+                process.id()
+            } else {
+                None
             }
+        };
 
-            *proj.state.lock().await = ProjectState::Stopped;
-        });
+        if let Some(pid) = child_id {
+            let proj_dir = self.dir.clone();
+            let logger = self.logger.clone();
+            let state_clone = self.state.clone();
+
+            tokio::spawn(async move {
+                // Periodically check if process is still running
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+
+                    // Check if process still exists
+                    #[cfg(unix)]
+                    {
+                        use nix::sys::signal::{kill, Signal};
+                        use nix::unistd::Pid;
+
+                        if kill(Pid::from_raw(pid as i32), None).is_err() {
+                            // Process no longer exists
+                            let _ = logger.write("", "process exited");
+                            *state_clone.lock().await = ProjectState::Stopped;
+                            break;
+                        }
+                    }
+
+                    // Check if we're still in Running state
+                    let still_running = {
+                        let state = state_clone.lock().await;
+                        matches!(*state, ProjectState::Running { .. })
+                    };
+
+                    if !still_running {
+                        break;
+                    }
+                }
+            });
+        }
 
         Ok(())
     }
@@ -723,7 +731,7 @@ impl Project {
 
                 // Check if should reload
                 if self.should_reload_for_file(rel_path) {
-                    self.logger.write("", &format!("file changed: {}", rel_path.display()))?;
+                    self.logger.write("", &format!("stopping due to change for {}", rel_path.display()))?;
                     self.reload().await?;
                     break; // Stop watching, will be recreated on reload
                 }
@@ -777,7 +785,6 @@ impl Project {
     }
 
     async fn reload(&self) -> Result<()> {
-        self.logger.write("", "reloading due to file change")?;
         self.stop().await;
 
         // Remove from projects map so it will be recreated
@@ -902,7 +909,7 @@ fn matches_pattern(path: &str, pattern: &str) -> bool {
             return false;
         }
 
-        if !suffix.is_empty() {
+        if !suffix.is_empty() && suffix != "*" {
             let check_path = if !prefix.is_empty() {
                 path.strip_prefix(prefix).unwrap_or(path).trim_start_matches('/')
             } else {

@@ -109,13 +109,7 @@ impl Server {
                     .title_case_headers(true)
                     .serve_connection(io, service_fn(move |req| {
                         let server = server.clone();
-                        async move {
-                            let result = server.handle_http(req).await;
-                            if let Err(ref e) = result {
-                                eprintln!("Handle HTTP error: {:?}", e);
-                            }
-                            result
-                        }
+                        async move { server.handle_http(req).await }
                     }))
                     .await
                 {
@@ -151,30 +145,25 @@ impl Server {
     }
 
     async fn handle_http(&self, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        eprintln!("handle_http: got request for {:?}", req.uri());
         let domain = match self.extract_domain(&req) {
             Some(d) => d,
             None => {
-                eprintln!("handle_http: no domain found");
                 return Ok(Response::builder()
                     .status(StatusCode::BAD_REQUEST)
                     .body(Full::new(Bytes::from("Bad Request: Missing Host header")))
                     .unwrap());
             }
         };
-        eprintln!("handle_http: domain={}", domain);
 
         let project_dir = match self.get_project_dir(&domain).await {
             Ok(dir) => dir,
-            Err(e) => {
-                eprintln!("handle_http: project_dir error: {}", e);
+            Err(_) => {
                 return Ok(Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(Full::new(Bytes::from("Not Found")))
                     .unwrap());
             }
         };
-        eprintln!("handle_http: project_dir={}", project_dir);
 
         // Check for per-project redirect settings
         if let Ok(config) = ProjectConfig::load(&PathBuf::from(&project_dir)) {
@@ -215,10 +204,7 @@ impl Server {
             }
         }
 
-        eprintln!("handle_http: calling route_request");
-        let result = self.route_request(req, &domain, &project_dir).await;
-        eprintln!("handle_http: route_request returned");
-        result
+        self.route_request(req, &domain, &project_dir).await
     }
 
     async fn handle_https(&self, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
@@ -261,10 +247,8 @@ impl Server {
 
     async fn route_request(&self, req: Request<hyper::body::Incoming>, domain: &str, project_dir: &str)
         -> Result<Response<Full<Bytes>>, hyper::Error> {
-        eprintln!("route_request: start");
         // Check for www redirect
         if self.config.redirect_www {
-            eprintln!("route_request: checking www redirect");
             if let Some(target_domain) = domain.strip_prefix("www.") {
                 if self.get_project_dir(target_domain).await.is_ok() {
                     let proto = if req.uri().scheme_str() == Some("https") { "https" } else { "http" };
@@ -292,15 +276,10 @@ impl Server {
         }
 
         // Get or create project
-        eprintln!("route_request: getting project");
         match project::get_project(&PathBuf::from(project_dir), self.config.firejail, self.config.prune_logs).await {
             Ok(project) => {
-                eprintln!("route_request: got project, calling handle");
                 match project.handle(req).await {
-                    Ok(resp) => {
-                        eprintln!("route_request: handle returned success");
-                        Ok(resp)
-                    }
+                    Ok(resp) => Ok(resp),
                     Err(e) => {
                         eprintln!("Project handle error: {}", e);
                         Ok(Response::builder()
