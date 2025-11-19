@@ -1586,6 +1586,74 @@ def test_static_mime_types(t):
     t.assert_http('mime.test', '/page.html', check_body='HTML')
 
 
+@test
+def test_websocket_proxy(t):
+    """WebSocket upgrade requests are detected (proxying not yet implemented)"""
+    import subprocess
+    import os
+    
+    cargo_dir = os.path.dirname(__file__)
+    websocat_bin = os.path.join(cargo_dir, 'target', 'bin', 'websocat')
+    
+    # Install websocat if not already installed
+    if not os.path.exists(websocat_bin):
+        print("Installing websocat...", flush=True)
+        subprocess.run(['cargo', 'install', 'websocat', '--root', 'target'], 
+                       cwd=cargo_dir, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # Copy websocat to project dir so it's accessible in sandbox
+    project_dir = os.path.join(t.tmpdir, 'ws.example.com')
+    os.makedirs(project_dir, exist_ok=True)
+    shutil.copy(websocat_bin, os.path.join(project_dir, 'websocat'))
+    os.chmod(os.path.join(project_dir, 'websocat'), 0o755)
+
+    # Create a simple echo server using websocat in mirror mode
+    t.write_file('ws.example.com/server.sh', f'''#!/bin/bash
+echo "WebSocket server listening on port $PORT"
+exec ./websocat -t -s "$PORT"
+''')
+    
+    subprocess.run(['chmod', '+x', os.path.join(t.tmpdir, 'ws.example.com', 'server.sh')], check=True)
+    
+    t.write_file('ws.example.com/Procfile', 'web: ./server.sh')
+    
+    t.mark_log_read('ws.example.com')
+    
+    # Trigger app startup
+    try:
+        t.assert_http('ws.example.com', '/', check_code=None, timeout=2)
+    except:
+        pass
+    
+    # Wait for server to start
+    t.await_log('ws.example.com', 'WebSocket server listening', timeout=5)
+    
+    # First verify normal HTTP routing works
+    try:
+        response = t.assert_http('ws.example.com', '/', check_code=None, timeout=2)
+    except Exception as e:
+        print(f"HTTP test: {e}")
+    
+    # Try to connect via WebSocket
+    ws_url = f"ws://127.0.0.1:{t.port}/"
+    
+    result = subprocess.run(
+        [websocat_bin, '-1', '-H=Host: ws.example.com', ws_url],
+        input=b"test",
+        capture_output=True,
+        timeout=5
+    )
+    
+    if result.returncode != 0:
+        stderr = result.stderr.decode()
+        raise AssertionError(f"WebSocket connection failed: {stderr}")
+    
+    stdout = result.stdout.decode()
+    if "test" not in stdout:
+        raise AssertionError(f"Echo server did not return 'test', got: {stdout}")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run webcentral tests')
     parser.add_argument('--firejail', type=str, choices=['true', 'false'], default='true',

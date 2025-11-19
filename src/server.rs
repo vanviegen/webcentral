@@ -187,8 +187,6 @@ impl Server {
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 if let Err(e) = http1::Builder::new()
-                    .preserve_header_case(true)
-                    .title_case_headers(true)
                     .serve_connection(io, service_fn(move |req| {
                         let server = server.clone();
                         async move { server.handle_http(req).await }
