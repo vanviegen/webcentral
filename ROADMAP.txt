@@ -1,0 +1,8 @@
+- Implement HTTP/2
+- Implement HTTP/3 server using https://github.com/quinn-rs/quinn
+- To verify that a project is actually running, don't just check if the port is open, but make sure you get a http 2xx, 3xx or 4xx back from the server
+- Make the URL to check configurable in webcentral.ini
+- Optionally do a periodic check on that URL after the project has started, forcing a shutdown if it's no longer responding
+- When a Project shuts down or after 15 minutes of running, output some stats (at least request count, but other easy-to-gather stats would be nice as well) to its log file
+
+For each of the above: update README.md (and add to its Changelog section) if needed.

@@ -1,5 +1,10 @@
-node_modules
-shrinkwrap.yaml
-pnpm-debug.log
-package-lock.json
-pnpm-lock.yaml
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+.claude
+target/
+__pycache__
+
