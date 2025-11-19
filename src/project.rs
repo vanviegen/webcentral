@@ -260,10 +260,9 @@ impl Project {
         let uri: hyper::Uri = uri_str.parse()?;
 
         // Check if this is a WebSocket upgrade request
-        let is_upgrade = is_websocket_upgrade(&req);
-
+        let is_upgrade = is_upgrade_request(&req);
         if is_upgrade {
-            return self.proxy_websocket_upgrade(req, uri).await;
+            return self.proxy_upgrade(req, uri).await;
         }
 
         // Collect the incoming body first
@@ -383,7 +382,7 @@ impl Project {
         process.stdout(std::process::Stdio::piped());
         process.stderr(std::process::Stdio::piped());
 
-        self.logger.write("", "Starting application")?;
+        self.logger.write("", &format!("Starting application: {:?}", process))?;
 
         let mut child = process.spawn()?;
 
@@ -828,7 +827,7 @@ impl Project {
         });
     }
 
-    async fn proxy_websocket_upgrade(&self, req: Request<Incoming>, target_uri: hyper::Uri) -> Result<Response<Full<Bytes>>> {
+    async fn proxy_upgrade(&self, req: Request<Incoming>, target_uri: hyper::Uri) -> Result<Response<Full<Bytes>>> {
         let host = target_uri.host().unwrap_or("localhost").to_string();
         let port = target_uri.port_u16().unwrap_or(80);
         let addr = format!("{}:{}", host, port);
@@ -938,17 +937,12 @@ impl Project {
 }
 
 // Helper function to detect WebSocket upgrade requests
-fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
+fn is_upgrade_request(req: &Request<Incoming>) -> bool {
     req.headers()
-        .get(hyper::header::UPGRADE)
+        .get(hyper::header::CONNECTION)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .map(|v| v.to_lowercase().contains("upgrade"))
         .unwrap_or(false)
-        && req.headers()
-            .get(hyper::header::CONNECTION)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_lowercase().contains("upgrade"))
-            .unwrap_or(false)
 }
 
 // Make Project cloneable for Arc usage

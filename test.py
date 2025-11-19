@@ -243,7 +243,7 @@ class TestRunner:
             response = conn.getresponse()
             body = response.read().decode('utf-8')
 
-            if response.status != check_code:
+            if check_code is not None and response.status != check_code:
                 raise AssertionError(
                     f"Expected status {check_code}, got {response.status}\n"
                     f"Body: {body}"
@@ -1609,67 +1609,46 @@ def test_websocket_proxy(t):
     shutil.copy(websocat_bin, os.path.join(project_dir, 'websocat'))
     os.chmod(os.path.join(project_dir, 'websocat'), 0o755)
 
-    # Create a simple echo server using websocat in mirror mode
-    t.write_file('ws.example.com/server.sh', f'''#!/bin/bash
-echo "WebSocket server listening on port $PORT"
-exec ./websocat -t -s "$PORT"
-''')
-
-    subprocess.run(['chmod', '+x', os.path.join(t.tmpdir, 'ws.example.com', 'server.sh')], check=True)
-
-    t.write_file('ws.example.com/Procfile', 'web: ./server.sh')
+    # Start websocat in mirror mode with verbose logging
+    # mirror: echoes back what it receives
+    # log: logs traffic to stdout
+    # ws-l:0.0.0.0:$PORT: listen on all interfaces
+    t.write_file('ws.example.com/Procfile', 'web: ./websocat -v -t ws-l:0.0.0.0:$PORT log:mirror:')
 
     t.mark_log_read('ws.example.com')
 
-    # Trigger app startup
+    # Use websocat with ws-c overlay to connect to specific IP/port while using correct Host header
+    # --ws-c-uri: The WebSocket URI to use for the handshake
+    # ws-c:tcp:127.0.0.1:{t.port}: Connect via TCP to localhost and upgrade to WS
+    # -: Use stdin/stdout for the other side of the bridge
+    cmd = [
+        websocat_bin,
+        '-v',
+        '--binary',
+        f'--ws-c-uri=ws://ws.example.com/',
+        f'ws-c:tcp:127.0.0.1:{t.port}',
+        '-'
+    ]
+
+    # Run client, sending "test" and expecting it echoed back
+    # We use a timeout to ensure it doesn't hang
+    message = 'h%madsd4v$'
     try:
-        t.assert_http('ws.example.com', '/', check_code=None, timeout=2)
-    except:
-        pass
+        proc = subprocess.run(cmd, input=message.encode(), capture_output=True, timeout=5)
+    except subprocess.TimeoutError:
+        raise AssertionError("websocat client timed out")
 
-    # Wait for server to start
-    t.await_log('ws.example.com', 'WebSocket server listening', timeout=5)
+    if proc.returncode != 0:
+        print(f"websocat stderr: {proc.stderr.decode()}", flush=True)
+        raise AssertionError(f"websocat failed with exit code {proc.returncode}")
 
-    # Test WebSocket connection using raw socket to control Host header
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(5)
-    sock.connect(('127.0.0.1', t.port))
-
-    # Send WebSocket upgrade request with correct Host header
-    import base64
-    ws_key = base64.b64encode(b"test_key_1234567").decode()
-    request = f"""GET / HTTP/1.1\r
-Host: ws.example.com\r
-Upgrade: websocket\r
-Connection: Upgrade\r
-Sec-WebSocket-Key: {ws_key}\r
-Sec-WebSocket-Version: 13\r
-\r
-"""
-    sock.sendall(request.encode())
-
-    # Read response
-    response = sock.recv(4096).decode()
-
-    if "101" not in response and "Switching Protocols" not in response:
-        raise AssertionError(f"Expected 101 Switching Protocols, got: {response}")
-
-    # Send a WebSocket text frame (FIN=1, opcode=1 for text, mask=1 for client-to-server)
-    message = b"test"
-    # WebSocket frame: FIN=1, opcode=1 (text), mask=1, payload length=4
-    # Mask the payload with mask key (required for client-to-server)
-    mask_key = b'\x37\xfa\x21\x3d'
-    masked_payload = bytes([message[i] ^ mask_key[i % 4] for i in range(len(message))])
-    frame = bytes([0x81, 0x84]) + mask_key + masked_payload
-    sock.sendall(frame)
-    sock.close()
-
-    # Wait for the message to be echoed by the backend
-    import time
-    time.sleep(0.5)
-
+    # Verify the client received the echo
+    output = proc.stdout.decode()
+    if message not in output:
+        raise AssertionError(f"Expected '{message}' in client output, got: {output}")
+    
     # Verify that the backend received and echoed the message by checking logs
-    t.await_log('ws.example.com', 'test', timeout=2)
+    t.await_log('ws.example.com', '"'+message+'\\n"', timeout=2)
 
 
 if __name__ == '__main__':
