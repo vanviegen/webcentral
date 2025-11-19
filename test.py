@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 
-import os
-import sys
-import time
-import tempfile
-import subprocess
-import shutil
+import argparse
+import glob
 import http.client
+import os
+import shutil
 import socket
+import subprocess
+import sys
+import tempfile
+import time
 import traceback
-from pathlib import Path
 from datetime import datetime
-from functools import wraps
 
 # ANSI color codes
 GREEN = '\033[92m'
@@ -90,28 +90,8 @@ class TestRunner:
         time.sleep(0.5)
 
         if self.webcentral_proc.poll() is not None:
-            # Process failed to start, show output
-            stdout_f.close()
-            stderr_f.close()
-
-            stdout_content = ""
-            stderr_content = ""
-
-            if os.path.exists(stdout_log):
-                with open(stdout_log, 'r') as f:
-                    stdout_content = f.read()
-
-            if os.path.exists(stderr_log):
-                with open(stderr_log, 'r') as f:
-                    stderr_content = f.read()
-
-            error_msg = "webcentral process failed to start"
-            if stdout_content:
-                error_msg += f"\n\nStdout:\n{stdout_content}"
-            if stderr_content:
-                error_msg += f"\n\nStderr:\n{stderr_content}"
-
-            raise Exception(error_msg)
+            self.show_all_new_logs()
+            raise Exception("Webcentral process failed to start")
 
         print(f"webcentral started (PID: {self.webcentral_proc.pid})")
         print()
@@ -189,7 +169,6 @@ class TestRunner:
 
     def show_all_new_logs(self):
         """Show all log files that have new content since last mark"""
-        import glob
         today = datetime.now().strftime('%Y-%m-%d')
 
         has_output = False
@@ -404,7 +383,7 @@ def test_simple_application(t):
     t.assert_http('app.net', '/', check_body='App Server')
 
     # Verify the app actually started
-    t.assert_log('app.net', 'reachable on port', count=1)
+    t.assert_log('app.net', 'Ready on port', count=1)
 
 
 @test
@@ -416,18 +395,18 @@ def test_application_file_change_reload(t):
 
     # Make HTTP request to trigger app start
     t.assert_http('reload.test', '/', check_body='Version 1')
-    t.assert_log('reload.test', 'reachable on port', count=1)
+    t.assert_log('reload.test', 'Ready on port', count=1)
 
     # Mark logs as read before making changes
     t.mark_log_read('reload.test')
 
     # Modify file and wait for stop
     t.write_file('reload.test/index.html', '<h1>Version 2</h1>')
-    t.await_log('reload.test', 'stopping due to change')
+    t.await_log('reload.test', 'Stopping due to change')
 
     # Make HTTP request to trigger restart and serve new content
     t.assert_http('reload.test', '/', check_body='Version 2')
-    t.assert_log('reload.test', 'reachable on port', count=1)
+    t.assert_log('reload.test', 'Ready on port', count=1)
 
 
 @test
@@ -439,18 +418,18 @@ def test_config_change_reload(t):
 
     # Make HTTP request to trigger app start
     t.assert_http('conftest.io', '/page.html', check_body='Test Page')
-    t.assert_log('conftest.io', 'reachable on port', count=1)
+    t.assert_log('conftest.io', 'Ready on port', count=1)
     t.mark_log_read('conftest.io')
 
     # Change config and wait for stop
     t.write_file('conftest.io/webcentral.ini',
                  'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=300')
 
-    t.await_log('conftest.io', 'stopping due to change')
+    t.await_log('conftest.io', 'Stopping due to change')
 
     # Make HTTP request to trigger restart
     t.assert_http('conftest.io', '/page.html', check_body='Test Page')
-    t.assert_log('conftest.io', 'reachable on port', count=1)
+    t.assert_log('conftest.io', 'Ready on port', count=1)
 
 
 @test
@@ -480,7 +459,7 @@ with socketserver.TCPServer(("", PORT), Handler) as httpd:
 
     # Make HTTP request (will take ~1 second to start)
     t.assert_http('slow.app', '/data.txt', check_body='Slow Server Data')
-    t.assert_log('slow.app', 'reachable on port', count=1)
+    t.assert_log('slow.app', 'Ready on port', count=1)
 
 
 @test
@@ -562,7 +541,7 @@ def test_multiple_projects_isolation(t):
     t.assert_http('project3.test', '/', check_body='Project 3')
 
     # Verify project3 started its application
-    t.assert_log('project3.test', 'reachable on port', count=1)
+    t.assert_log('project3.test', 'Ready on port', count=1)
 
 
 @test
@@ -583,11 +562,11 @@ def test_application_stops_on_inactivity(t):
 
     # Make HTTP request to trigger app start
     t.assert_http('timeout.test', '/', check_body='Timeout Test')
-    t.assert_log('timeout.test', 'reachable on port', count=1)
+    t.assert_log('timeout.test', 'Ready on port', count=1)
     t.mark_log_read('timeout.test')
 
     # Wait for timeout (1 second + some buffer)
-    t.await_log('timeout.test', 'stopping due to inactivity', timeout=3)
+    t.await_log('timeout.test', 'Stopping due to inactivity', timeout=3)
 
 
 @test
@@ -599,16 +578,16 @@ def test_application_restarts_after_timeout(t):
 
     # Make HTTP request to trigger app start
     t.assert_http('restart.test', '/', check_body='Restart Test')
-    t.assert_log('restart.test', 'reachable on port', count=1)
+    t.assert_log('restart.test', 'Ready on port', count=1)
     t.mark_log_read('restart.test')
 
     # Wait for timeout
-    t.await_log('restart.test', 'stopping due to inactivity', timeout=3)
+    t.await_log('restart.test', 'Stopping due to inactivity', timeout=3)
 
     # Make request to trigger restart
     t.mark_log_read('restart.test')
     t.assert_http('restart.test', '/', check_body='Restart Test')
-    t.await_log('restart.test', 'reachable on port')
+    t.await_log('restart.test', 'Ready on port')
 
 
 @test
@@ -646,7 +625,7 @@ with socketserver.TCPServer(("", PORT), MyHandler) as httpd:
 
     # Make HTTP request to trigger app start and verify env var
     t.assert_http('envtest.site', '/', check_body='TEST_VAR=hello_world')
-    t.assert_log('envtest.site', 'reachable on port', count=1)
+    t.assert_log('envtest.site', 'Ready on port', count=1)
 
 
 @test
@@ -679,7 +658,7 @@ with socketserver.TCPServer(("", PORT), MyHandler) as httpd:
     # Make POST request to trigger app start and verify
     t.assert_http('post.test', '/', method='POST', data='test_data',
                   check_body='Received: test_data')
-    t.assert_log('post.test', 'reachable on port', count=1)
+    t.assert_log('post.test', 'Ready on port', count=1)
 
 
 @test
@@ -692,7 +671,7 @@ def test_multiple_file_changes_single_reload(t):
 
     # Make HTTP request to trigger app start
     t.assert_http('multichg.test', '/file1.html', check_body='v1')
-    t.assert_log('multichg.test', 'reachable on port', count=1)
+    t.assert_log('multichg.test', 'Ready on port', count=1)
     t.mark_log_read('multichg.test')
 
     # Make multiple changes rapidly
@@ -701,18 +680,18 @@ def test_multiple_file_changes_single_reload(t):
     t.write_file('multichg.test/file3.html', 'v2')
 
     # Wait for stop
-    t.await_log('multichg.test', 'stopping due to change')
+    t.await_log('multichg.test', 'Stopping due to change')
 
     # Should only see one stop (file watcher exits on first change)
-    t.assert_log('multichg.test', 'stopping due to change', count=1)
+    t.assert_log('multichg.test', 'Stopping due to change', count=1)
 
     # Make HTTP request to trigger restart
     t.assert_http('multichg.test', '/file1.html', check_body='v2')
-    t.assert_log('multichg.test', 'reachable on port', count=1)
+    t.assert_log('multichg.test', 'Ready on port', count=1)
 
     # Verify that file watcher  runs again
     t.write_file('multichg.test/file1.html', 'v3')
-    t.await_log('multichg.test', 'stopping due to change')
+    t.await_log('multichg.test', 'Stopping due to change')
     t.assert_http('multichg.test', '/file1.html', check_body='v3')
 
 
@@ -743,7 +722,7 @@ def test_application_with_custom_port(t):
 
     # Make HTTP request to trigger app start
     t.assert_http('customport.test', '/test.html', check_body='Custom Port')
-    t.assert_log('customport.test', 'reachable on port', count=1)
+    t.assert_log('customport.test', 'Ready on port', count=1)
 
 
 @test
@@ -830,7 +809,7 @@ def test_config_unknown_key_in_reload(t):
     # Make HTTP request to trigger project creation and app start
     t.assert_http('badconfig4.test', '/', check_body='Test')
     t.assert_log('badconfig4.test', "Unexpected key 'reload.bad_key'", count=1)
-    t.assert_log('badconfig4.test', 'reachable on port', count=1)
+    t.assert_log('badconfig4.test', 'Ready on port', count=1)
 
 
 @test
@@ -843,7 +822,7 @@ def test_procfile_unsupported_type(t):
     # Make HTTP request to trigger project creation and app start
     t.assert_http('procfile.test', '/', check_body='Procfile Test')
     t.assert_log('procfile.test', "Procfile process type 'clock' is not supported", count=1)
-    t.assert_log('procfile.test', 'reachable on port', count=1)
+    t.assert_log('procfile.test', 'Ready on port', count=1)
 
 
 @test
@@ -855,7 +834,7 @@ def test_procfile_web_only(t):
 
     # Make HTTP request to trigger app start
     t.assert_http('procweb.test', '/', check_body='Procfile Web')
-    t.assert_log('procweb.test', 'reachable on port', count=1)
+    t.assert_log('procweb.test', 'Ready on port', count=1)
 
 
 @test
@@ -865,11 +844,11 @@ def test_procfile_with_worker(t):
     t.write_file('procworker.test/worker.py', '''
 import time
 import os
-print("Worker starting...", flush=True)
+print("I am a starting test worker...", flush=True)
 time.sleep(0.5)
 with open("worker_output.txt", "w") as f:
     f.write("Worker was here")
-print("Worker task complete", flush=True)
+print("I am a finished little worker", flush=True)
 time.sleep(100)  # Keep running
 ''')
 
@@ -879,12 +858,12 @@ time.sleep(100)  # Keep running
 
     # Make HTTP request to trigger app start
     t.assert_http('procworker.test', '/', check_body='Procfile with Worker')
-    t.assert_log('procworker.test', 'reachable on port', count=1)
+    t.assert_log('procworker.test', 'Ready on port', count=1)
 
     # Verify worker started
-    t.assert_log('procworker.test', 'starting 1 worker(s)', count=1)
-    t.await_log('procworker.test', 'Worker starting...')
-    t.await_log('procworker.test', 'Worker task complete')
+    t.assert_log('procworker.test', 'Starting 1 worker(s)', count=1)
+    t.await_log('procworker.test', 'I am a starting test worker...')
+    t.await_log('procworker.test', 'I am a finished little worker')
 
     # Verify worker output file was created
     time.sleep(0.2)
@@ -916,10 +895,10 @@ time.sleep(100)
 
     # Make HTTP request to trigger app start
     t.assert_http('procmulti.test', '/', check_body='Multiple Workers')
-    t.assert_log('procmulti.test', 'reachable on port', count=1)
+    t.assert_log('procmulti.test', 'Ready on port', count=1)
 
     # Verify both workers started
-    t.assert_log('procmulti.test', 'starting 2 worker(s)', count=1)
+    t.assert_log('procmulti.test', 'Starting 2 worker(s)', count=1)
     t.await_log('procmulti.test', 'Worker 1 starting')
     t.await_log('procmulti.test', 'Worker 2 starting')
 
@@ -940,10 +919,10 @@ time.sleep(100)
 
     # Make HTTP request to trigger app start
     t.assert_http('iniworker.test', '/', check_body='INI Worker')
-    t.assert_log('iniworker.test', 'reachable on port', count=1)
+    t.assert_log('iniworker.test', 'Ready on port', count=1)
 
     # Verify worker started
-    t.assert_log('iniworker.test', 'starting 1 worker(s)', count=1)
+    t.assert_log('iniworker.test', 'Starting 1 worker(s)', count=1)
     t.await_log('iniworker.test', 'INI Worker running')
 
 
@@ -970,10 +949,10 @@ time.sleep(100)
 
     # Make HTTP request to trigger app start
     t.assert_http('inimulti.test', '/', check_body='Multiple Named Workers')
-    t.assert_log('inimulti.test', 'reachable on port', count=1)
+    t.assert_log('inimulti.test', 'Ready on port', count=1)
 
     # Verify workers started
-    t.assert_log('inimulti.test', 'starting 2 worker(s)', count=1)
+    t.assert_log('inimulti.test', 'Starting 2 worker(s)', count=1)
     t.await_log('inimulti.test', 'Email worker active')
     t.await_log('inimulti.test', 'Task worker active')
 
@@ -994,7 +973,7 @@ time.sleep(100)
 
     # Make HTTP request to trigger app start
     t.assert_http('workerreload.test', '/', check_body='Version 1')
-    t.assert_log('workerreload.test', 'reachable on port', count=1)
+    t.assert_log('workerreload.test', 'Ready on port', count=1)
     t.await_log('workerreload.test', 'Worker v1')
 
     # Mark logs as read before making changes
@@ -1008,11 +987,11 @@ time.sleep(100)
 ''')
 
     # Wait for stop
-    t.await_log('workerreload.test', 'stopping due to change')
+    t.await_log('workerreload.test', 'Stopping due to change')
 
     # Make HTTP request to trigger restart
     t.assert_http('workerreload.test', '/', check_body='Version 1')
-    t.assert_log('workerreload.test', 'reachable on port', count=1)
+    t.assert_log('workerreload.test', 'Ready on port', count=1)
     t.await_log('workerreload.test', 'Worker v2')
 
 
@@ -1033,13 +1012,13 @@ time.sleep(100)
 
     # Make HTTP request to trigger app start
     t.assert_http('workertimeout.test', '/', check_body='Worker Timeout')
-    t.assert_log('workertimeout.test', 'reachable on port', count=1)
+    t.assert_log('workertimeout.test', 'Ready on port', count=1)
     t.await_log('workertimeout.test', 'Worker running')
 
     t.mark_log_read('workertimeout.test')
 
     # Wait for timeout
-    t.await_log('workertimeout.test', 'stopping due to inactivity', timeout=3)
+    t.await_log('workertimeout.test', 'Stopping due to inactivity', timeout=3)
 
 
 @test
@@ -1073,7 +1052,7 @@ def test_edit_broken_ini_triggers_reload(t):
     t.write_file('editini.test/webcentral.ini', 'different garbage\n###')
 
     # Should trigger a reload/restart
-    t.await_log('editini.test', 'stopping due to change', timeout=2)
+    t.await_log('editini.test', 'Stopping due to change', timeout=2)
 
     # Should still serve static files after reload
     t.assert_http('editini.test', '/', check_body='Version 1')
@@ -1090,18 +1069,18 @@ def test_ini_disappearing_app_becomes_static(t):
 
     # Start the app
     t.assert_http('disappear.test', '/', check_body='App Content')
-    t.assert_log('disappear.test', 'reachable on port', count=1)
+    t.assert_log('disappear.test', 'Ready on port', count=1)
     t.mark_log_read('disappear.test')
 
     # Remove the ini file
     os.remove(os.path.join(t.tmpdir, 'disappear.test/webcentral.ini'))
 
     # Should trigger reload and stop the process
-    t.await_log('disappear.test', 'process exited', timeout=3)
+    t.await_log('disappear.test', 'Process exited', timeout=3)
 
     # Now should serve static files from public/
     t.assert_http('disappear.test', '/', check_body='Static Content')
-    t.await_log('disappear.test', 'starting static file server', timeout=4)
+    t.await_log('disappear.test', 'Static file server', timeout=4)
 
 
 @test
@@ -1120,11 +1099,11 @@ def test_ini_appearing_static_becomes_app(t):
                  'command=python3 -u -m http.server $PORT')
 
     # Should trigger reload
-    t.await_log('appear.test', 'stopping due to change', timeout=2)
+    t.await_log('appear.test', 'Stopping due to change', timeout=2)
 
     # Now should serve via app
     t.assert_http('appear.test', '/', check_body='App Will Serve This')
-    t.assert_log('appear.test', 'reachable on port', count=1)
+    t.assert_log('appear.test', 'Ready on port', count=1)
 
 
 @test
@@ -1145,11 +1124,11 @@ def test_ini_broken_to_valid(t):
                  'command=python3 -u -m http.server $PORT')
 
     # Should trigger reload
-    t.await_log('fixini.test', 'stopping due to change', timeout=2)
+    t.await_log('fixini.test', 'Stopping due to change', timeout=2)
 
     # Now should work as app
     t.assert_http('fixini.test', '/', check_body='App Content')
-    t.assert_log('fixini.test', 'reachable on port', count=1)
+    t.assert_log('fixini.test', 'Ready on port', count=1)
 
 
 @test
@@ -1163,14 +1142,14 @@ def test_ini_valid_to_broken(t):
 
     # Start the app
     t.assert_http('breakini.test', '/', check_body='App')
-    t.assert_log('breakini.test', 'reachable on port', count=1)
+    t.assert_log('breakini.test', 'Ready on port', count=1)
     t.mark_log_read('breakini.test')
 
     # Break the ini
     t.write_file('breakini.test/webcentral.ini', 'invalid!!!\ngarbage')
 
     # Should trigger reload
-    t.await_log('breakini.test', 'stopping due to change', timeout=2)
+    t.await_log('breakini.test', 'Stopping due to change', timeout=2)
 
     # Now should serve static
     t.assert_http('breakini.test', '/', check_body='Static')
@@ -1187,7 +1166,7 @@ def test_command_changing(t):
 
     # Start the app
     t.assert_http('cmdchange.test', '/', check_body='HTTP Server')
-    t.assert_log('cmdchange.test', 'reachable on port', count=1)
+    t.assert_log('cmdchange.test', 'Ready on port', count=1)
     t.mark_log_read('cmdchange.test')
 
     # Change to a different server command
@@ -1213,7 +1192,7 @@ with socketserver.TCPServer(("", PORT), CustomHandler) as httpd:
                  'command=python3 -u server.py')
 
     # Should trigger reload
-    t.await_log('cmdchange.test', 'stopping due to change', timeout=2)
+    t.await_log('cmdchange.test', 'Stopping due to change', timeout=2)
 
     # Should start with new command
     t.assert_http('cmdchange.test', '/', check_body='Custom Server')
@@ -1246,7 +1225,7 @@ with socketserver.TCPServer(("", PORT), EnvHandler) as httpd:
 
     # Start the app
     t.assert_http('envchange.test', '/', check_body='MY_VAR=value1')
-    t.assert_log('envchange.test', 'reachable on port', count=1)
+    t.assert_log('envchange.test', 'Ready on port', count=1)
     t.mark_log_read('envchange.test')
 
     # Change environment variable
@@ -1254,7 +1233,7 @@ with socketserver.TCPServer(("", PORT), EnvHandler) as httpd:
                  'command=python3 -u server.py\n\n[environment]\nMY_VAR=value2')
 
     # Should trigger reload
-    t.await_log('envchange.test', 'stopping due to change', timeout=2)
+    t.await_log('envchange.test', 'Stopping due to change', timeout=2)
 
     # Should have new value
     t.assert_http('envchange.test', '/', check_body='MY_VAR=value2')
@@ -1275,7 +1254,7 @@ time.sleep(100)
 
     # Start the app
     t.assert_http('addworker.test', '/', check_body='Test')
-    t.assert_log('addworker.test', 'reachable on port', count=1)
+    t.assert_log('addworker.test', 'Ready on port', count=1)
     t.mark_log_read('addworker.test')
 
     # Add worker to config
@@ -1284,11 +1263,11 @@ time.sleep(100)
                  'worker=python3 -u worker.py')
 
     # Should trigger reload
-    t.await_log('addworker.test', 'stopping due to change', timeout=2)
+    t.await_log('addworker.test', 'Stopping due to change', timeout=2)
 
     # Should start with worker
     t.assert_http('addworker.test', '/', check_body='Test')
-    t.assert_log('addworker.test', 'starting 1 worker(s)', count=1)
+    t.assert_log('addworker.test', 'Starting 1 worker(s)', count=1)
     t.await_log('addworker.test', 'New worker started')
 
 
@@ -1316,14 +1295,14 @@ time.sleep(100)
                  'command=python3 -u -m http.server $PORT')
 
     # Should trigger reload
-    t.await_log('rmworker.test', 'stopping due to change', timeout=2)
+    t.await_log('rmworker.test', 'Stopping due to change', timeout=2)
 
     # Should not log about workers anymore
     t.mark_log_read('rmworker.test')
     t.assert_http('rmworker.test', '/', check_body='Test')
     # No "starting N worker(s)" message in new logs
     new_logs = t.get_log_content('rmworker.test', t.log_positions['rmworker.test'])
-    if 'starting 1 worker(s)' in new_logs:
+    if 'Starting 1 worker(s)' in new_logs:
         raise AssertionError("Workers should not be started after removal from config")
 
 
@@ -1344,11 +1323,11 @@ def test_redirect_changes_to_app(t):
                  'command=python3 -u -m http.server $PORT')
 
     # Should trigger reload
-    t.await_log('redir2app.test', 'stopping due to change', timeout=2)
+    t.await_log('redir2app.test', 'Stopping due to change', timeout=2)
 
     # Should now serve app
     t.assert_http('redir2app.test', '/', check_body='App Content')
-    t.assert_log('redir2app.test', 'reachable on port', count=1)
+    t.assert_log('redir2app.test', 'Ready on port', count=1)
 
 
 @test
@@ -1361,7 +1340,7 @@ def test_app_changes_to_redirect(t):
 
     # Start the app
     t.assert_http('app2redir.test', '/', check_body='App')
-    t.assert_log('app2redir.test', 'reachable on port', count=1)
+    t.assert_log('app2redir.test', 'Ready on port', count=1)
     t.mark_log_read('app2redir.test')
 
     # Change to redirect
@@ -1369,7 +1348,7 @@ def test_app_changes_to_redirect(t):
                  'redirect=https://example.org/')
 
     # Should trigger reload
-    t.await_log('app2redir.test', 'stopping due to change', timeout=2)
+    t.await_log('app2redir.test', 'Stopping due to change', timeout=2)
 
     # Should now redirect
     t.assert_http('app2redir.test', '/', check_code=301)
@@ -1390,11 +1369,11 @@ def test_static_ignores_non_config_file_changes(t):
     
     # Should NOT have any "stopping" log
     t.assert_http('staticwatch.test', '/', check_body='Static')
-    t.assert_log('staticwatch.test', 'stopping due to change', count=0)
+    t.assert_log('staticwatch.test', 'Stopping due to change', count=0)
     
     # But adding webcentral.ini should trigger reload
     t.write_file('staticwatch.test/webcentral.ini', 'command=echo test')
-    t.await_log('staticwatch.test', 'stopping due to change', timeout=2)
+    t.await_log('staticwatch.test', 'Stopping due to change', timeout=2)
 
 
 @test
@@ -1411,7 +1390,7 @@ include[]=webcentral.ini
     
     # Start the app
     t.assert_http('includetest.test', '/', check_body='Original')
-    t.assert_log('includetest.test', 'reachable on port', count=1)
+    t.assert_log('includetest.test', 'Ready on port', count=1)
     t.mark_log_read('includetest.test')
     
     # Modify .txt file (should NOT trigger reload)
@@ -1419,11 +1398,11 @@ include[]=webcentral.ini
     
     # Should NOT have reloaded
     t.assert_http('includetest.test', '/', check_body='Original')
-    t.assert_log('includetest.test', 'stopping due to change', count=0)
+    t.assert_log('includetest.test', 'Stopping due to change', count=0)
     
     # Modify .py file (should trigger reload)
     t.write_file('includetest.test/script.py', 'print("test")')
-    t.await_log('includetest.test', 'stopping due to change', timeout=2)
+    t.await_log('includetest.test', 'Stopping due to change', timeout=2)
 
 
 @test
@@ -1440,7 +1419,7 @@ exclude[]=temp/*
     
     # Start the app
     t.assert_http('excludetest.test', '/', check_body='Test')
-    t.assert_log('excludetest.test', 'reachable on port', count=1)
+    t.assert_log('excludetest.test', 'Ready on port', count=1)
     t.mark_log_read('excludetest.test')
     
     # Create excluded .tmp file (should NOT trigger reload)
@@ -1448,18 +1427,18 @@ exclude[]=temp/*
     
     # Should NOT have reloaded
     t.assert_http('excludetest.test', '/', check_body='Test')
-    t.assert_log('excludetest.test', 'stopping due to change', count=0)
+    t.assert_log('excludetest.test', 'Stopping due to change', count=0)
     
     # Create file in excluded directory (should NOT trigger reload)
     t.write_file('excludetest.test/temp/file.txt', 'data')
     
     # Wait a bit
     t.assert_http('excludetest.test', '/', check_body='Test')
-    t.assert_log('excludetest.test', 'stopping due to change', count=0)
+    t.assert_log('excludetest.test', 'Stopping due to change', count=0)
     
     # Create regular file (should trigger reload)
     t.write_file('excludetest.test/data.json', '{}')
-    t.await_log('excludetest.test', 'stopping due to change', timeout=2)
+    t.await_log('excludetest.test', 'Stopping due to change', timeout=2)
 
 
 @test
@@ -1477,17 +1456,17 @@ exclude[]=subdir/package.json
     
     # Start the app
     t.assert_http('rootedtest.test', '/')
-    t.assert_log('rootedtest.test', 'reachable on port', count=1)
+    t.assert_log('rootedtest.test', 'Ready on port', count=1)
     t.mark_log_read('rootedtest.test')
     
     # Modify subdir/package.json (explicitly excluded, should NOT reload)
     t.write_file('rootedtest.test/subdir/package.json', '{"version": "2.0.1"}')
     t.assert_http('rootedtest.test', '/')
-    t.assert_log('rootedtest.test', 'stopping due to change', count=0)
+    t.assert_log('rootedtest.test', 'Stopping due to change', count=0)
     
     # Modify root package.json (not excluded, should reload)
     t.write_file('rootedtest.test/package.json', '{"version": "1.0.1"}')
-    t.await_log('rootedtest.test', 'stopping due to change', timeout=2)
+    t.await_log('rootedtest.test', 'Stopping due to change', timeout=2)
 
 
 @test
@@ -1520,17 +1499,17 @@ include[]=src/package.json
     
     # Start the app
     t.assert_http('patterntest.test', '/', check_body='V1')
-    t.assert_log('patterntest.test', 'reachable on port', count=1)
+    t.assert_log('patterntest.test', 'Ready on port', count=1)
     t.mark_log_read('patterntest.test')
     
     # Modify src/other.js (not included, should NOT reload)
     t.write_file('patterntest.test/src/other.js', 'console.log("v2")')
     t.assert_http('patterntest.test', '/', check_body='V1')
-    t.assert_log('patterntest.test', 'stopping due to change', count=0)
+    t.assert_log('patterntest.test', 'Stopping due to change', count=0)
     
     # Modify src/package.json (included, SHOULD reload)
     t.write_file('patterntest.test/src/package.json', '{"version": "1.0.1"}')
-    t.await_log('patterntest.test', 'stopping due to change', timeout=2)
+    t.await_log('patterntest.test', 'Stopping due to change', timeout=2)
 
 
 @test
@@ -1609,8 +1588,6 @@ def test_static_mime_types(t):
 
 
 if __name__ == '__main__':
-    import argparse
-
     parser = argparse.ArgumentParser(description='Run webcentral tests')
     parser.add_argument('--firejail', type=str, choices=['true', 'false'], default='true',
                         help='Enable or disable Firejail sandboxing (default: true)')

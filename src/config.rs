@@ -141,8 +141,6 @@ impl IniMap {
 
 // Build ProjectConfig directly from IniMap
 fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
-    let config_errors = ini_map.errors.clone();
-    
     // Determine project type by checking for type-specific keys
     // Priority: redirect > proxy > forward (socket/port) > application > static
     let project_type = if let Some(target) = ini_map.fetch("redirect") {
@@ -216,7 +214,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
     };
     
     // Read common configuration
-    let config = ProjectConfig {
+    let mut config = ProjectConfig {
         dir,
         project_type,
         log_requests: ini_map.fetch_bool("log_requests").unwrap_or(false),
@@ -229,12 +227,12 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
             exclude: ini_map.fetch_array("reload.exclude"),
         },
         rewrites: ini_map.fetch_prefix("rewrite"),
-        config_errors,
+        config_errors: ini_map.errors.clone(),
     };
     
     // Check for unexpected keys
     for key in ini_map.remaining_keys() {
-        eprintln!("[webcentral.ini] Unexpected key '{}'", key);
+        config.config_errors.push(format!("Unexpected key '{}'", key));
     }
     
     config
