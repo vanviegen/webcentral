@@ -21,8 +21,7 @@ impl IniMap {
 
     // Parse INI file into flat HashMap with dotted keys
     fn parse(path: &Path) -> Result<Self> {
-        let content = fs::read_to_string(path)
-            .context("Failed to open webcentral.ini")?;
+        let content = fs::read_to_string(path).context("Failed to open webcentral.ini")?;
 
         let mut ini_map = Self::new();
         let mut current_section = String::new();
@@ -64,9 +63,17 @@ impl IniMap {
                 };
 
                 // Store in map
-                ini_map.map.entry(full_key).or_insert_with(Vec::new).push(value);
+                ini_map
+                    .map
+                    .entry(full_key)
+                    .or_insert_with(Vec::new)
+                    .push(value);
             } else {
-                ini_map.errors.push(format!("Invalid syntax in webcentral.ini at line {}: {}", line_num + 1, line));
+                ini_map.errors.push(format!(
+                    "Invalid syntax in webcentral.ini at line {}: {}",
+                    line_num + 1,
+                    line
+                ));
             }
         }
 
@@ -78,7 +85,8 @@ impl IniMap {
     fn fetch(&mut self, key: &str) -> Option<String> {
         if let Some(values) = self.map.remove(key) {
             if values.len() > 1 {
-                self.errors.push(format!("Key '{}' has multiple values, using last one", key));
+                self.errors
+                    .push(format!("Key '{}' has multiple values, using last one", key));
             }
             values.into_iter().last()
         } else {
@@ -110,24 +118,27 @@ impl IniMap {
     fn fetch_prefix(&mut self, prefix: &str) -> HashMap<String, String> {
         let prefix_with_dot = format!("{}.", prefix);
         let mut result = HashMap::new();
-        
-        let keys: Vec<String> = self.map.keys()
+
+        let keys: Vec<String> = self
+            .map
+            .keys()
             .filter(|k| k.starts_with(&prefix_with_dot))
             .cloned()
             .collect();
-        
+
         for key in keys {
             if let Some(values) = self.map.remove(&key) {
                 let suffix = &key[prefix_with_dot.len()..];
                 if values.len() > 1 {
-                    self.errors.push(format!("Key '{}' has multiple values, using last one", key));
+                    self.errors
+                        .push(format!("Key '{}' has multiple values, using last one", key));
                 }
                 if let Some(value) = values.into_iter().last() {
                     result.insert(suffix.to_string(), value);
                 }
             }
         }
-        
+
         result
     }
 
@@ -150,13 +161,17 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
     } else if let Some(socket_path) = ini_map.fetch("socket_path") {
         ProjectType::Forward {
             port: ini_map.fetch_parse("port", 0),
-            host: ini_map.fetch("host").unwrap_or_else(|| "localhost".to_string()),
+            host: ini_map
+                .fetch("host")
+                .unwrap_or_else(|| "localhost".to_string()),
             socket_path,
         }
     } else if ini_map.fetch_parse::<i32>("port", 0) > 0 {
         ProjectType::Forward {
             port: ini_map.fetch_parse("port", 0),
-            host: ini_map.fetch("host").unwrap_or_else(|| "localhost".to_string()),
+            host: ini_map
+                .fetch("host")
+                .unwrap_or_else(|| "localhost".to_string()),
             socket_path: String::new(),
         }
     } else if let Some(command) = ini_map.fetch("command") {
@@ -164,46 +179,70 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
         if let Some(worker_cmd) = ini_map.fetch("worker") {
             workers.insert("default".to_string(), worker_cmd);
         }
-        for key in ini_map.map.keys().filter(|k| k.starts_with("worker:")).cloned().collect::<Vec<_>>() {
+        for key in ini_map
+            .map
+            .keys()
+            .filter(|k| k.starts_with("worker:"))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
             if let Some(cmd) = ini_map.fetch(&key) {
                 workers.insert(key[7..].to_string(), cmd);
             }
         }
-        
+
         let docker = if ini_map.map.keys().any(|k| k.starts_with("docker.")) {
             Some(DockerConfig {
-                base: ini_map.fetch("docker.base").unwrap_or_else(|| "alpine".to_string()),
+                base: ini_map
+                    .fetch("docker.base")
+                    .unwrap_or_else(|| "alpine".to_string()),
                 packages: ini_map.fetch_array("docker.packages"),
                 commands: ini_map.fetch_array("docker.commands"),
                 http_port: ini_map.fetch_parse("docker.http_port", 8000),
-                app_dir: ini_map.fetch("docker.app_dir").unwrap_or_else(|| "/app".to_string()),
+                app_dir: ini_map
+                    .fetch("docker.app_dir")
+                    .unwrap_or_else(|| "/app".to_string()),
                 mount_app_dir: ini_map.fetch_bool("docker.mount_app_dir").unwrap_or(true),
                 mounts: ini_map.fetch_array("docker.mounts"),
             })
         } else {
             None
         };
-        
-        ProjectType::Application { command, docker, workers }
+
+        ProjectType::Application {
+            command,
+            docker,
+            workers,
+        }
     } else if ini_map.map.keys().any(|k| k.starts_with("docker.")) {
         let mut workers = HashMap::new();
         if let Some(worker_cmd) = ini_map.fetch("worker") {
             workers.insert("default".to_string(), worker_cmd);
         }
-        for key in ini_map.map.keys().filter(|k| k.starts_with("worker:")).cloned().collect::<Vec<_>>() {
+        for key in ini_map
+            .map
+            .keys()
+            .filter(|k| k.starts_with("worker:"))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
             if let Some(cmd) = ini_map.fetch(&key) {
                 workers.insert(key[7..].to_string(), cmd);
             }
         }
-        
+
         ProjectType::Application {
             command: String::new(),
             docker: Some(DockerConfig {
-                base: ini_map.fetch("docker.base").unwrap_or_else(|| "alpine".to_string()),
+                base: ini_map
+                    .fetch("docker.base")
+                    .unwrap_or_else(|| "alpine".to_string()),
                 packages: ini_map.fetch_array("docker.packages"),
                 commands: ini_map.fetch_array("docker.commands"),
                 http_port: ini_map.fetch_parse("docker.http_port", 8000),
-                app_dir: ini_map.fetch("docker.app_dir").unwrap_or_else(|| "/app".to_string()),
+                app_dir: ini_map
+                    .fetch("docker.app_dir")
+                    .unwrap_or_else(|| "/app".to_string()),
                 mount_app_dir: ini_map.fetch_bool("docker.mount_app_dir").unwrap_or(true),
                 mounts: ini_map.fetch_array("docker.mounts"),
             }),
@@ -212,7 +251,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
     } else {
         ProjectType::Static
     };
-    
+
     // Read common configuration
     let mut config = ProjectConfig {
         dir,
@@ -229,12 +268,14 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
         rewrites: ini_map.fetch_prefix("rewrite"),
         config_errors: ini_map.errors.clone(),
     };
-    
+
     // Check for unexpected keys
     for key in ini_map.remaining_keys() {
-        config.config_errors.push(format!("Unexpected key '{}'", key));
+        config
+            .config_errors
+            .push(format!("Unexpected key '{}'", key));
     }
-    
+
     config
 }
 
@@ -356,13 +397,21 @@ impl ProjectConfig {
         if ini_path.exists() {
             match IniMap::parse(&ini_path) {
                 Ok(mut ini_map) => {
-                    return Ok(build_project_config(dir.to_string_lossy().to_string(), &mut ini_map));
+                    return Ok(build_project_config(
+                        dir.to_string_lossy().to_string(),
+                        &mut ini_map,
+                    ));
                 }
                 Err(e) => {
                     // Failed to parse ini file, fall through to check Procfile/package.json
                     let mut ini_map = IniMap::new();
-                    ini_map.errors.push(format!("Failed to parse webcentral.ini: {}", e));
-                    return Ok(build_project_config(dir.to_string_lossy().to_string(), &mut ini_map));
+                    ini_map
+                        .errors
+                        .push(format!("Failed to parse webcentral.ini: {}", e));
+                    return Ok(build_project_config(
+                        dir.to_string_lossy().to_string(),
+                        &mut ini_map,
+                    ));
                 }
             }
         }
@@ -372,23 +421,33 @@ impl ProjectConfig {
         if procfile_path.exists() {
             if let Ok(procfile) = Procfile::parse(&procfile_path) {
                 let mut ini_map = IniMap::new();
-                
+
                 if let Some(web_cmd) = procfile.processes.get("web") {
-                    ini_map.map.insert("command".to_string(), vec![web_cmd.clone()]);
+                    ini_map
+                        .map
+                        .insert("command".to_string(), vec![web_cmd.clone()]);
                 }
 
                 // Check for worker processes
                 let mut worker_index = 0;
                 for (process_type, cmd) in &procfile.processes {
                     if process_type == "worker" || process_type == "urgentworker" {
-                        ini_map.map.insert(format!("worker:{}", worker_index), vec![cmd.clone()]);
+                        ini_map
+                            .map
+                            .insert(format!("worker:{}", worker_index), vec![cmd.clone()]);
                         worker_index += 1;
                     } else if process_type != "web" {
-                        ini_map.errors.push(format!("Procfile process type '{}' is not supported and will be ignored", process_type));
+                        ini_map.errors.push(format!(
+                            "Procfile process type '{}' is not supported and will be ignored",
+                            process_type
+                        ));
                     }
                 }
-                
-                return Ok(build_project_config(dir.to_string_lossy().to_string(), &mut ini_map));
+
+                return Ok(build_project_config(
+                    dir.to_string_lossy().to_string(),
+                    &mut ini_map,
+                ));
             }
         }
 
@@ -399,8 +458,13 @@ impl ProjectConfig {
                 if let Some(start_script) = pkg.scripts.get("start") {
                     if !start_script.is_empty() {
                         let mut ini_map = IniMap::new();
-                        ini_map.map.insert("command".to_string(), vec!["npm start".to_string()]);
-                        return Ok(build_project_config(dir.to_string_lossy().to_string(), &mut ini_map));
+                        ini_map
+                            .map
+                            .insert("command".to_string(), vec!["npm start".to_string()]);
+                        return Ok(build_project_config(
+                            dir.to_string_lossy().to_string(),
+                            &mut ini_map,
+                        ));
                     }
                 }
             }
@@ -408,6 +472,9 @@ impl ProjectConfig {
 
         // No configuration found, create empty static project
         let mut ini_map = IniMap::new();
-        Ok(build_project_config(dir.to_string_lossy().to_string(), &mut ini_map))
+        Ok(build_project_config(
+            dir.to_string_lossy().to_string(),
+            &mut ini_map,
+        ))
     }
 }

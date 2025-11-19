@@ -1,24 +1,24 @@
 use crate::acme::CertManager;
 use crate::project::{self, Project};
 use anyhow::Result;
+use bytes::Bytes;
 use dashmap::DashMap;
+use http_body_util::Full;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use http_body_util::Full;
-use bytes::Bytes;
-use notify::{Watcher, RecursiveMode};
+use notify::{RecursiveMode, Watcher};
 use regex::Regex;
 use rustls::ServerConfig;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, Notify};
+use tokio::sync::{Notify, RwLock};
 use tokio_rustls::TlsAcceptor;
 
 // Domain information stored in the global DOMAINS map
@@ -92,11 +92,11 @@ impl Server {
     fn read_bindings(data_dir: &str) -> Result<HashSet<String>> {
         let bindings_path = PathBuf::from(data_dir).join("bindings.list");
         let mut bindings = HashSet::new();
-        
+
         if bindings_path.exists() {
             let file = fs::File::open(&bindings_path)?;
             let reader = std::io::BufReader::new(file);
-            
+
             for line in reader.lines() {
                 if let Ok(path) = line {
                     let path = path.trim();
@@ -105,36 +105,44 @@ impl Server {
                     }
                 }
             }
-            println!("Loaded {} authorized bindings from {}", bindings.len(), bindings_path.display());
+            println!(
+                "Loaded {} authorized bindings from {}",
+                bindings.len(),
+                bindings_path.display()
+            );
         }
-        
+
         Ok(bindings)
     }
 
     // Write current DOMAINS mapping to bindings.list
     fn write_bindings(&self) -> Result<()> {
         let bindings_path = PathBuf::from(&self.config.data_dir).join("bindings.list");
-        
+
         // Ensure data directory exists
         fs::create_dir_all(&self.config.data_dir)?;
-        
+
         // Collect all unique directories from DOMAINS
         let mut directories = HashSet::new();
         for entry in DOMAINS.iter() {
             directories.insert(entry.directory.clone());
         }
-        
+
         // Convert to sorted vector for deterministic output
         let mut sorted_dirs: Vec<_> = directories.into_iter().collect();
         sorted_dirs.sort();
-        
+
         // Write to file
         let mut file = fs::File::create(&bindings_path)?;
         for dir in sorted_dirs {
             writeln!(file, "{}", dir)?;
         }
-        
-        println!("Wrote {} bindings to {}", DOMAINS.len(), bindings_path.display());
+
+        println!(
+            "Wrote {} bindings to {}",
+            DOMAINS.len(),
+            bindings_path.display()
+        );
         Ok(())
     }
 
@@ -187,10 +195,13 @@ impl Server {
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 if let Err(e) = http1::Builder::new()
-                    .serve_connection(io, service_fn(move |req| {
-                        let server = server.clone();
-                        async move { server.handle_http(req).await }
-                    }))
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| {
+                            let server = server.clone();
+                            async move { server.handle_http(req).await }
+                        }),
+                    )
                     .with_upgrades()
                     .await
                 {
@@ -205,7 +216,9 @@ impl Server {
         let listener = TcpListener::bind(&addr).await?;
 
         // Create TLS config with SNI resolver
-        let cert_manager = self.cert_manager.as_ref()
+        let cert_manager = self
+            .cert_manager
+            .as_ref()
             .expect("Certificate manager required for HTTPS");
         let cert_manager_clone = cert_manager.clone();
 
@@ -234,10 +247,13 @@ impl Server {
 
                 let io = TokioIo::new(tls_stream);
                 if let Err(e) = http1::Builder::new()
-                    .serve_connection(io, service_fn(move |req| {
-                        let server = server.clone();
-                        async move { server.handle_https(req).await }
-                    }))
+                    .serve_connection(
+                        io,
+                        service_fn(move |req| {
+                            let server = server.clone();
+                            async move { server.handle_https(req).await }
+                        }),
+                    )
                     .with_upgrades()
                     .await
                 {
@@ -247,7 +263,10 @@ impl Server {
         }
     }
 
-    async fn handle_http(&self, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    async fn handle_http(
+        &self,
+        req: Request<hyper::body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
         // Handle ACME HTTP-01 challenges
         let path = req.uri().path();
         if path.starts_with("/.well-known/acme-challenge/") {
@@ -261,13 +280,19 @@ impl Server {
                         .unwrap());
                 }
             }
-            return Ok(Self::error_response(StatusCode::NOT_FOUND, "Challenge not found"));
+            return Ok(Self::error_response(
+                StatusCode::NOT_FOUND,
+                "Challenge not found",
+            ));
         }
 
         self.route_request(req, false).await
     }
 
-    async fn handle_https(&self, req: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    async fn handle_https(
+        &self,
+        req: Request<hyper::body::Incoming>,
+    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
         self.route_request(req, true).await
     }
 
@@ -286,14 +311,18 @@ impl Server {
             .unwrap()
     }
 
-    async fn route_request(&self, req: Request<hyper::body::Incoming>, from_https: bool)
-        -> Result<Response<Full<Bytes>>, hyper::Error> {
-
+    async fn route_request(
+        &self,
+        req: Request<hyper::body::Incoming>,
+        from_https: bool,
+    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
         let domain = match self.extract_domain(&req) {
             Some(d) => d,
             None => {
-                return Ok(Self::error_response(StatusCode::BAD_REQUEST, 
-                    "Bad Request: Missing Host header"));
+                return Ok(Self::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Bad Request: Missing Host header",
+                ));
             }
         };
 
@@ -310,8 +339,15 @@ impl Server {
 
                     if let Ok(_) = self.get_project_for_domain(&alt_domain).await {
                         let proto = if from_https { "https" } else { "http" };
-                        let redirect_url = format!("{}://{}{}", proto, alt_domain,
-                        req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+                        let redirect_url = format!(
+                            "{}://{}{}",
+                            proto,
+                            alt_domain,
+                            req.uri()
+                                .path_and_query()
+                                .map(|pq| pq.as_str())
+                                .unwrap_or("/")
+                        );
                         return Ok(Self::redirect_to(redirect_url));
                     }
                 }
@@ -323,9 +359,17 @@ impl Server {
         if from_https {
             // HTTPS request - check if we should redirect to HTTP
             if project.config.redirect_https == Some(true) {
-                let redirect_url = format!("http://{}{}",
-                    req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or(&domain),
-                    req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+                let redirect_url = format!(
+                    "http://{}{}",
+                    req.headers()
+                        .get("host")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or(&domain),
+                    req.uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str())
+                        .unwrap_or("/")
+                );
                 return Ok(Self::redirect_to(redirect_url));
             }
         } else {
@@ -339,9 +383,17 @@ impl Server {
             };
 
             if should_redirect {
-                let redirect_url = format!("https://{}{}",
-                    req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or(&domain),
-                    req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+                let redirect_url = format!(
+                    "https://{}{}",
+                    req.headers()
+                        .get("host")
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or(&domain),
+                    req.uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str())
+                        .unwrap_or("/")
+                );
                 return Ok(Self::redirect_to(redirect_url));
             }
         }
@@ -351,8 +403,10 @@ impl Server {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 eprintln!("Project handle error: {}", e);
-                Ok(Self::error_response(StatusCode::INTERNAL_SERVER_ERROR, 
-                    "Internal Server Error"))
+                Ok(Self::error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                ))
             }
         }
     }
@@ -377,7 +431,8 @@ impl Server {
 
     async fn get_project_for_domain(&self, domain: &str) -> Result<Arc<Project>> {
         // Look up domain in DOMAINS map
-        let domain_info = DOMAINS.get(domain)
+        let domain_info = DOMAINS
+            .get(domain)
             .ok_or_else(|| anyhow::anyhow!("Domain not found: {}", domain))?;
 
         // Check if project already exists
@@ -393,8 +448,9 @@ impl Server {
             &PathBuf::from(&domain_info.directory),
             domain.to_string(),
             self.config.firejail,
-            self.config.prune_logs
-        ).await?;
+            self.config.prune_logs,
+        )
+        .await?;
 
         // Store in domain info
         {
@@ -405,26 +461,48 @@ impl Server {
         Ok(project)
     }
 
-    async fn add_domain(&self, domain: String, directory: String, bindings: Option<&HashSet<String>>) {
+    async fn add_domain(
+        &self,
+        domain: String,
+        directory: String,
+        bindings: Option<&HashSet<String>>,
+    ) {
         if let Some(existing) = DOMAINS.get(&domain) {
             // Domain exists - check if transfer is allowed
             let existing_dir_gone = !std::path::Path::new(&existing.directory).exists();
             let authorized = bindings.map_or(false, |b| b.contains(&directory));
             if !existing_dir_gone && !authorized {
-                println!("Rejecting domain override attempt for {} from unauthorized directory {}", domain, directory);
-                return
+                println!(
+                    "Rejecting domain override attempt for {} from unauthorized directory {}",
+                    domain, directory
+                );
+                return;
             }
-            println!("Overriding domain {} from {} to {}{}", domain, existing.directory, directory, if authorized { " (authorized)" } else { " (directory gone)" });
+            println!(
+                "Overriding domain {} from {} to {}{}",
+                domain,
+                existing.directory,
+                directory,
+                if authorized {
+                    " (authorized)"
+                } else {
+                    " (directory gone)"
+                }
+            );
         }
         DOMAINS.insert(domain, DomainInfo::new(directory));
     }
 
     // Process a directory path, validating domain and setting up project + certificate
-    async fn process_project_directory(self: &Arc<Self>, path: &std::path::Path, bindings: Option<&HashSet<String>>) {
+    async fn process_project_directory(
+        self: &Arc<Self>,
+        path: &std::path::Path,
+        bindings: Option<&HashSet<String>>,
+    ) {
         if !path.is_dir() {
             return;
         }
-        
+
         if let Some(domain) = path.file_name().and_then(|n| n.to_str()) {
             if VALID_DOMAIN.is_match(domain) {
                 let directory = path.to_string_lossy().to_string();
@@ -445,20 +523,20 @@ impl Server {
 
     async fn scan_all_project_directories(self: Arc<Self>) {
         // Read authorized bindings from previous run
-        let bindings = Self::read_bindings(&self.config.data_dir).unwrap_or_else(|_e| {
-            HashSet::new()
-        });
+        let bindings =
+            Self::read_bindings(&self.config.data_dir).unwrap_or_else(|_e| HashSet::new());
 
         for entry in glob::glob(&self.config.projects).unwrap() {
             if let Ok(base_path) = entry {
                 if let Ok(entries) = fs::read_dir(base_path) {
                     for entry in entries.flatten() {
-                        self.process_project_directory(&entry.path(), Some(&bindings)).await;
+                        self.process_project_directory(&entry.path(), Some(&bindings))
+                            .await;
                     }
                 }
             }
         }
-        
+
         // Write current bindings to file
         if let Err(e) = self.write_bindings() {
             eprintln!("Failed to write bindings: {}", e);
@@ -468,11 +546,12 @@ impl Server {
     async fn watch_project_directories(self: Arc<Self>) -> Result<()> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
-        let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if let Ok(event) = res {
-                let _ = tx.blocking_send(event);
-            }
-        })?;
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    let _ = tx.blocking_send(event);
+                }
+            })?;
 
         // Find all project base directories and watch them
         for entry in glob::glob(&self.config.projects)? {
@@ -483,7 +562,7 @@ impl Server {
 
         while let Some(event) = rx.recv().await {
             let mut changed = false;
-            
+
             match event.kind {
                 notify::EventKind::Create(_) => {
                     for path in event.paths {
@@ -491,27 +570,27 @@ impl Server {
                         self.process_project_directory(&path, None).await;
                         changed = true;
                     }
-                },
+                }
                 notify::EventKind::Remove(_) => {
                     for path in event.paths {
                         if let Some(domain) = path.file_name().and_then(|n| n.to_str()) {
                             if VALID_DOMAIN.is_match(domain) {
                                 let domain = domain.to_lowercase();
                                 println!("Project directory removed: {}", domain);
-                                
+
                                 // Remove from DOMAINS
                                 DOMAINS.remove(&domain);
                                 changed = true;
-                                
+
                                 // Note: Certificate removal from ACME client would go here
                                 // For now, we just keep the certificate files
                             }
                         }
                     }
-                },
+                }
                 _ => {}
             }
-            
+
             // Write bindings after any changes
             if changed {
                 if let Err(e) = self.write_bindings() {
@@ -529,14 +608,13 @@ impl Server {
             Some(info) => info,
             None => return,
         };
-        
+
         // Try to set cert_acquiring from false to true atomically
-        if domain_info.cert_acquiring.compare_exchange(
-            false, 
-            true, 
-            Ordering::SeqCst, 
-            Ordering::SeqCst
-        ).is_err() {
+        if domain_info
+            .cert_acquiring
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             // Already being acquired
             return;
         }
@@ -562,7 +640,7 @@ impl Server {
             Ok(_) => {
                 // Notify any waiters that certificate is ready
                 domain_info.cert_ready.notify_waiters();
-            },
+            }
             Err(e) => {
                 eprintln!("Failed to acquire certificate for {}: {}", domain, e);
             }
@@ -585,7 +663,10 @@ struct CertResolver {
 }
 
 impl rustls::server::ResolvesServerCert for CertResolver {
-    fn resolve(&self, client_hello: rustls::server::ClientHello) -> Option<Arc<rustls::sign::CertifiedKey>> {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let server_name = client_hello.server_name()?;
         let domain: &str = server_name.as_ref();
 
@@ -593,7 +674,10 @@ impl rustls::server::ResolvesServerCert for CertResolver {
         if let Some(domain_info) = DOMAINS.get(domain) {
             // Check if certificate is currently being acquired
             if domain_info.cert_acquiring.load(Ordering::SeqCst) {
-                eprintln!("Certificate for {} is still being acquired, connection will be closed", domain);
+                eprintln!(
+                    "Certificate for {} is still being acquired, connection will be closed",
+                    domain
+                );
                 return None;
             }
         }
@@ -601,9 +685,11 @@ impl rustls::server::ResolvesServerCert for CertResolver {
         // Load certificate for the requested domain
         let (certs, key) = self.cert_manager.get_certificate(domain).ok()?;
 
-        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
-            .ok()?;
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).ok()?;
 
-        Some(Arc::new(rustls::sign::CertifiedKey::new(certs, signing_key)))
+        Some(Arc::new(rustls::sign::CertifiedKey::new(
+            certs,
+            signing_key,
+        )))
     }
 }

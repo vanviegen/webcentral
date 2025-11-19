@@ -1,7 +1,7 @@
 mod acme;
-mod project_config;
 mod logger;
 mod project;
+mod project_config;
 mod server;
 
 use anyhow::Result;
@@ -37,13 +37,21 @@ pub struct GlobalConfig {
     #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value = "true", default_missing_value = "true", help = "Use Firejail sandboxing")]
     pub firejail: bool,
 
-    #[arg(long, default_value = "https://acme-v02.api.letsencrypt.org/directory", help = "ACME service endpoint")]
+    #[arg(
+        long,
+        default_value = "https://acme-v02.api.letsencrypt.org/directory",
+        help = "ACME service endpoint"
+    )]
     pub acme_url: String,
 
     #[arg(long, default_value = "draft-11", help = "ACME protocol version")]
     pub acme_version: String,
 
-    #[arg(long, default_value = "28", help = "Number of days to keep log files (0 to disable)")]
+    #[arg(
+        long,
+        default_value = "28",
+        help = "Number of days to keep log files (0 to disable)"
+    )]
     pub prune_logs: i64,
 }
 
@@ -51,7 +59,10 @@ fn default_projects() -> String {
     if nix::unistd::geteuid().is_root() {
         "/home/*/webcentral-projects".to_string()
     } else {
-        format!("{}/webcentral-projects", std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+        format!(
+            "{}/webcentral-projects",
+            std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+        )
     }
 }
 
@@ -59,13 +70,17 @@ fn default_config() -> String {
     if nix::unistd::geteuid().is_root() {
         "/var/lib/webcentral".to_string()
     } else {
-        format!("{}/.webcentral", std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+        format!(
+            "{}/.webcentral",
+            std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+        )
     }
 }
 
 impl GlobalConfig {
     pub fn redirect_http(&self) -> bool {
-        self.redirect_http.unwrap_or(self.https > 0 && self.http > 0)
+        self.redirect_http
+            .unwrap_or(self.https > 0 && self.http > 0)
     }
 }
 

@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
-use instant_acme::{
-    Account, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
-};
+use instant_acme::{Account, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus};
 use rcgen::CertificateParams;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs;
@@ -174,18 +172,31 @@ impl CertManager {
         };
 
         // Save certificate and key
-        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", domain));
+        let cert_path = self
+            .config_dir
+            .join("certs")
+            .join(format!("{}.pem", domain));
         let key_path = self.config_dir.join("keys").join(format!("{}.pem", domain));
 
         fs::write(&cert_path, &cert_chain_pem)?;
         fs::write(&key_path, key_pair.serialize_pem())?;
 
-        println!("  {}: Certificate acquired (took {:?})", domain, start.elapsed());
+        println!(
+            "  {}: Certificate acquired (took {:?})",
+            domain,
+            start.elapsed()
+        );
         Ok(())
     }
 
-    pub fn get_certificate(&self, domain: &str) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", domain));
+    pub fn get_certificate(
+        &self,
+        domain: &str,
+    ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+        let cert_path = self
+            .config_dir
+            .join("certs")
+            .join(format!("{}.pem", domain));
         let key_path = self.config_dir.join("keys").join(format!("{}.pem", domain));
 
         if !cert_path.exists() || !key_path.exists() {
@@ -194,19 +205,21 @@ impl CertManager {
 
         // Load certificate chain
         let cert_data = fs::read(&cert_path)?;
-        let certs = rustls_pemfile::certs(&mut &cert_data[..])
-            .collect::<Result<Vec<_>, _>>()?;
+        let certs = rustls_pemfile::certs(&mut &cert_data[..]).collect::<Result<Vec<_>, _>>()?;
 
         // Load private key
         let key_data = fs::read(&key_path)?;
-        let key = rustls_pemfile::private_key(&mut &key_data[..])?
-            .context("No private key found")?;
+        let key =
+            rustls_pemfile::private_key(&mut &key_data[..])?.context("No private key found")?;
 
         Ok((certs, key))
     }
 
     pub fn has_certificate(&self, domain: &str) -> bool {
-        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", domain));
+        let cert_path = self
+            .config_dir
+            .join("certs")
+            .join(format!("{}.pem", domain));
         let key_path = self.config_dir.join("keys").join(format!("{}.pem", domain));
         cert_path.exists() && key_path.exists()
     }

@@ -34,18 +34,18 @@ A reverse proxy that runs multiple web applications on a single server. Just put
 
 ```sh
 # Install dependencies
-sudo apt install git firejail docker.io golang
+sudo apt install git firejail docker.io rustc
 
 # Build
 git clone https://github.com/vanviegen/webcentral.git
 cd webcentral
-go build
+cargo build --release
 
 # Run
-sudo ./webcentral --email you@example.com
+sudo ./target/release/webcentral --email you@example.com
 ```
 
-The `email` flag is mandatory, as it's needed for Let’s Encrypt. Alternatively you can disable HTTPS (` ./webcentral -https 0`). See `./webcentral --help` for more options.
+The `email` flag is mandatory, as it's needed for Let’s Encrypt. Alternatively you can disable HTTPS (` ./target/release/webcentral -https 0`). See `./target/release/webcentral --help` for more options.
 
 Create a directory at `~/webcentral-projects/someapp.yourdomain.com/` with either:
 - A `Procfile` for Heroku-style applications
@@ -61,7 +61,7 @@ Point DNS for `someapp.yourdomain.com` at your server. Up and running!
 
 When run as a regular user, by default Webcentral searches `~/webcentral-projects/` for project directories. When run as root, it searches all users' `webcentral-projects` directories by default and runs each project with its owner's permissions. This allows multiple users to share the precious ports 80 and 443, without having to give them privileged access to the server.
 
-If you want to run WebCentral as a regular user while still being able to bind to privileged ports, run `sudo setcap 'cap_net_bind_service=+ep' ./webcentral` once.
+If you want to run WebCentral as a regular user while still being able to bind to privileged ports, run `sudo setcap 'cap_net_bind_service=+ep' ./target/release/webcentral` once.
 
 ---
 

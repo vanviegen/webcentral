@@ -1,12 +1,15 @@
-use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
 use crate::logger::Logger;
+use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
 use anyhow::Result;
-use hyper::{body::Incoming, Request, Response};
-use hyper_util::{client::legacy::Client, rt::{TokioExecutor, TokioIo}};
-use http_body_util::{BodyExt, Full};
 use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{body::Incoming, Request, Response};
+use hyper_util::{
+    client::legacy::Client,
+    rt::{TokioExecutor, TokioIo},
+};
 use nix::unistd::Uid;
-use notify::{Watcher, RecursiveMode, Event as NotifyEvent};
+use notify::{Event as NotifyEvent, RecursiveMode, Watcher};
 use regex::Regex;
 use std::fs;
 use std::future::Future;
@@ -16,13 +19,17 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, BufReader, AsyncWriteExt, AsyncReadExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-
-pub async fn create_project(dir: &Path, domain: String, use_firejail: bool, prune_logs: i64) -> Result<Arc<Project>> {
+pub async fn create_project(
+    dir: &Path,
+    domain: String,
+    use_firejail: bool,
+    prune_logs: i64,
+) -> Result<Arc<Project>> {
     // Load configuration
     let config = ProjectConfig::load(dir)?;
     let (uid, gid) = get_ownership(dir);
@@ -39,7 +46,11 @@ pub async fn create_project(dir: &Path, domain: String, use_firejail: bool, prun
         ProjectType::Proxy { target } => {
             logger.write("", &format!("Proxy to {}", target))?;
         }
-        ProjectType::Forward { socket_path, host, port } => {
+        ProjectType::Forward {
+            socket_path,
+            host,
+            port,
+        } => {
             if !socket_path.is_empty() {
                 logger.write("", &format!("Forward to socket {}", socket_path))?;
             } else {
@@ -94,7 +105,9 @@ pub async fn create_project(dir: &Path, domain: String, use_firejail: bool, prun
         let proj = project.clone();
         tokio::spawn(async move {
             if let Err(e) = proj.start_process().await {
-                let _ = proj.logger.write("", &format!("Failed to start process: {}", e));
+                let _ = proj
+                    .logger
+                    .write("", &format!("Failed to start process: {}", e));
             }
         });
     }
@@ -122,7 +135,10 @@ impl Project {
         matches!(self.config.project_type, ProjectType::Application { .. })
     }
 
-    pub fn handle<'a>(&'a self, req: Request<Incoming>) -> Pin<Box<dyn Future<Output = Result<Response<Full<Bytes>>>> + Send + 'a>> {
+    pub fn handle<'a>(
+        &'a self,
+        req: Request<Incoming>,
+    ) -> Pin<Box<dyn Future<Output = Result<Response<Full<Bytes>>>> + Send + 'a>> {
         Box::pin(async move { self.handle_impl(req).await })
     }
 
@@ -130,7 +146,9 @@ impl Project {
         *self.last_activity.lock().await = Instant::now();
 
         if self.config.log_requests {
-            let _ = self.logger.write("", &format!("{} {}", req.method(), req.uri().path()));
+            let _ = self
+                .logger
+                .write("", &format!("{} {}", req.method(), req.uri().path()));
         }
 
         // Apply URL rewrites
@@ -145,21 +163,11 @@ impl Project {
 
         // Determine handler based on configuration
         match &self.config.project_type {
-            ProjectType::Redirect { .. } => {
-                self.handle_redirect().await
-            }
-            ProjectType::Proxy { .. } => {
-                self.handle_proxy_remote(req).await
-            }
-            ProjectType::Forward { .. } => {
-                self.handle_forward(req).await
-            }
-            ProjectType::Application { .. } => {
-                self.handle_application(req).await
-            }
-            ProjectType::Static => {
-                self.handle_static(req).await
-            }
+            ProjectType::Redirect { .. } => self.handle_redirect().await,
+            ProjectType::Proxy { .. } => self.handle_proxy_remote(req).await,
+            ProjectType::Forward { .. } => self.handle_forward(req).await,
+            ProjectType::Application { .. } => self.handle_application(req).await,
+            ProjectType::Static => self.handle_static(req).await,
         }
     }
 
@@ -168,7 +176,10 @@ impl Project {
             if let Ok(re) = Regex::new(&format!("^{}$", pattern)) {
                 if re.is_match(path) {
                     let result = re.replace(path, target).to_string();
-                    if result.starts_with("http://") || result.starts_with("https://") || result.starts_with("webcentral://") {
+                    if result.starts_with("http://")
+                        || result.starts_with("https://")
+                        || result.starts_with("webcentral://")
+                    {
                         return (path.to_string(), result);
                     }
                     return (result, String::new());
@@ -183,7 +194,7 @@ impl Project {
             ProjectType::Redirect { target } => target,
             _ => unreachable!("handle_redirect called for non-Redirect project"),
         };
-        
+
         Ok(Response::builder()
             .status(301)
             .header("Location", target)
@@ -222,10 +233,14 @@ impl Project {
 
     async fn handle_forward(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         let (socket_path, host, port) = match &self.config.project_type {
-            ProjectType::Forward { socket_path, host, port } => (socket_path, host, port),
+            ProjectType::Forward {
+                socket_path,
+                host,
+                port,
+            } => (socket_path, host, port),
             _ => unreachable!("handle_forward called for non-Forward project"),
         };
-        
+
         // For forwards (static port/socket), just proxy directly
         let target = if !socket_path.is_empty() {
             format!("unix://{}", socket_path)
@@ -241,18 +256,24 @@ impl Project {
             ProjectType::Proxy { target } => target,
             _ => unreachable!("handle_proxy_remote called for non-Proxy project"),
         };
-        
+
         // Simplified proxy without retry logic
         // (Retry would require request cloning which is complex with streaming bodies)
         self.proxy_request(req, target).await
     }
 
-    async fn proxy_request(&self, req: Request<Incoming>, target: &str) -> Result<Response<Full<Bytes>>> {
+    async fn proxy_request(
+        &self,
+        req: Request<Incoming>,
+        target: &str,
+    ) -> Result<Response<Full<Bytes>>> {
         // Parse target URL
         let target_uri: hyper::Uri = target.parse()?;
 
         // Build the full URI for the proxied request
-        let path_and_query = req.uri().path_and_query()
+        let path_and_query = req
+            .uri()
+            .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("/");
 
@@ -281,8 +302,11 @@ impl Project {
         // Copy headers, skipping connection-related headers
         for (name, value) in &parts.headers {
             let name_str = name.as_str().to_lowercase();
-            if name_str != "host" && name_str != "connection" &&
-               name_str != "transfer-encoding" && name_str != "content-length" {
+            if name_str != "host"
+                && name_str != "connection"
+                && name_str != "transfer-encoding"
+                && name_str != "content-length"
+            {
                 proxy_req = proxy_req.header(name, value);
             }
         }
@@ -298,8 +322,14 @@ impl Project {
         }
 
         // Add X-Forwarded headers
-        let proto = if parts.uri.scheme_str() == Some("https") { "https" } else { "http" };
-        let original_host = parts.headers.get("host")
+        let proto = if parts.uri.scheme_str() == Some("https") {
+            "https"
+        } else {
+            "http"
+        };
+        let original_host = parts
+            .headers
+            .get("host")
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
 
@@ -345,7 +375,8 @@ impl Project {
     }
 
     async fn wait_for_port(&self) -> Result<u16> {
-        for _ in 0..300 {  // 30 second timeout
+        for _ in 0..300 {
+            // 30 second timeout
             if let Some(port) = *self.port.lock().await {
                 return Ok(port);
             }
@@ -356,15 +387,21 @@ impl Project {
 
     async fn start_process(&self) -> Result<()> {
         let port = get_free_port()?;
-        self.logger.write("", &format!("Starting on port {}", port))?;
+        self.logger
+            .write("", &format!("Starting on port {}", port))?;
 
         let (command, docker, _workers) = match &self.config.project_type {
-            ProjectType::Application { command, docker, workers } => (command, docker, workers),
+            ProjectType::Application {
+                command,
+                docker,
+                workers,
+            } => (command, docker, workers),
             _ => unreachable!("start_process called for non-Application project"),
         };
-        
+
         let mut process = if let Some(docker_config) = docker {
-            self.build_docker_command(port, docker_config, command).await?
+            self.build_docker_command(port, docker_config, command)
+                .await?
         } else {
             self.build_shell_command(command)?
         };
@@ -382,7 +419,8 @@ impl Project {
         process.stdout(std::process::Stdio::piped());
         process.stderr(std::process::Stdio::piped());
 
-        self.logger.write("", &format!("Starting application: {:?}", process))?;
+        self.logger
+            .write("", &format!("Starting application: {:?}", process))?;
 
         let mut child = process.spawn()?;
 
@@ -414,7 +452,8 @@ impl Project {
 
         if !ready {
             child.kill().await?;
-            self.logger.write("", "Application failed to start listening on port")?;
+            self.logger
+                .write("", "Application failed to start listening on port")?;
             anyhow::bail!("Port not ready");
         }
 
@@ -443,7 +482,7 @@ impl Project {
                     // Check if process still exists
                     #[cfg(unix)]
                     {
-                        use nix::sys::signal::{kill};
+                        use nix::sys::signal::kill;
                         use nix::unistd::Pid;
 
                         if kill(Pid::from_raw(pid as i32), None).is_err() {
@@ -470,12 +509,14 @@ impl Project {
             ProjectType::Application { workers, .. } => workers,
             _ => return vec![],
         };
-        
+
         if workers_map.is_empty() {
             return vec![];
         }
 
-        self.logger.write("", &format!("Starting {} worker(s)", workers_map.len())).unwrap();
+        self.logger
+            .write("", &format!("Starting {} worker(s)", workers_map.len()))
+            .unwrap();
 
         let mut workers = vec![];
 
@@ -483,7 +524,9 @@ impl Project {
             let mut process = match self.build_shell_command(cmd) {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = self.logger.write("", &format!("Failed to build worker {}: {}", name, e));
+                    let _ = self
+                        .logger
+                        .write("", &format!("Failed to build worker {}: {}", name, e));
                     continue;
                 }
             };
@@ -527,7 +570,9 @@ impl Project {
                     workers.push(child);
                 }
                 Err(e) => {
-                    let _ = self.logger.write("", &format!("Failed to start worker {}: {}", name, e));
+                    let _ = self
+                        .logger
+                        .write("", &format!("Failed to start worker {}: {}", name, e));
                 }
             }
         }
@@ -536,8 +581,14 @@ impl Project {
     }
 
     fn build_shell_command(&self, command: &str) -> Result<Command> {
-        let has_docker = matches!(self.config.project_type, ProjectType::Application { docker: Some(_), .. });
-        
+        let has_docker = matches!(
+            self.config.project_type,
+            ProjectType::Application {
+                docker: Some(_),
+                ..
+            }
+        );
+
         let mut cmd = if self.use_firejail && !has_docker {
             let home = get_user_home(self.uid);
             let mut c = Command::new("firejail");
@@ -551,7 +602,9 @@ impl Project {
                 "--read-only=/",
                 &format!("--read-write={}", self.dir),
                 "--",
-                "/bin/sh", "-c", &command,
+                "/bin/sh",
+                "-c",
+                &command,
             ]);
             c
         } else {
@@ -570,7 +623,12 @@ impl Project {
         Ok(cmd)
     }
 
-    async fn build_docker_command(&self, port: u16, dc: &DockerConfig, command: &str) -> Result<Command> {
+    async fn build_docker_command(
+        &self,
+        port: u16,
+        dc: &DockerConfig,
+        command: &str,
+    ) -> Result<Command> {
         // Generate container name using a hash of the directory path
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -652,7 +710,9 @@ impl Project {
             } else {
                 format!("{}/{}", dc.app_dir, mount)
             };
-            let host_path = PathBuf::from(&self.dir).join("_webcentral_data/mounts").join(&container_path);
+            let host_path = PathBuf::from(&self.dir)
+                .join("_webcentral_data/mounts")
+                .join(&container_path);
             fs::create_dir_all(&host_path)?;
             cmd.args(&["-v", &format!("{}:{}", host_path.display(), container_path)]);
         }
@@ -675,11 +735,12 @@ impl Project {
     async fn watch_files(&self) -> Result<()> {
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
-        let mut watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
-            if let Ok(event) = res {
-                let _ = tx.blocking_send(event);
-            }
-        })?;
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
+                if let Ok(event) = res {
+                    let _ = tx.blocking_send(event);
+                }
+            })?;
 
         // Watch directory recursively. Note: notify crate doesn't support exclusion patterns,
         // so we watch everything and filter unwanted paths in should_reload_for_file().
@@ -694,7 +755,10 @@ impl Project {
 
                 // Check if should reload
                 if self.should_reload_for_file(rel_path) {
-                    self.logger.write("", &format!("Stopping due to change in {}", rel_path.display()))?;
+                    self.logger.write(
+                        "",
+                        &format!("Stopping due to change in {}", rel_path.display()),
+                    )?;
 
                     // Remove from DOMAINS map immediately so new requests create a fresh instance
                     crate::server::discard_project(&self.domain).await;
@@ -718,8 +782,13 @@ impl Project {
 
         // Default excludes
         let default_excludes = vec![
-            "_webcentral_data/**", "node_modules/**", "**/*.log", "**/.*",
-            "data/**", "log/**", "logs/**"
+            "_webcentral_data/**",
+            "node_modules/**",
+            "**/*.log",
+            "**/.*",
+            "data/**",
+            "log/**",
+            "logs/**",
         ];
 
         // Check default excludes
@@ -744,7 +813,12 @@ impl Project {
                 vec!["webcentral.ini", "Procfile"]
             }
         } else {
-            self.config.reload.include.iter().map(|s| s.as_str()).collect()
+            self.config
+                .reload
+                .include
+                .iter()
+                .map(|s| s.as_str())
+                .collect()
         };
 
         for pattern in &includes {
@@ -827,13 +901,22 @@ impl Project {
         });
     }
 
-    async fn proxy_upgrade(&self, req: Request<Incoming>, target_uri: hyper::Uri) -> Result<Response<Full<Bytes>>> {
+    async fn proxy_upgrade(
+        &self,
+        req: Request<Incoming>,
+        target_uri: hyper::Uri,
+    ) -> Result<Response<Full<Bytes>>> {
         let host = target_uri.host().unwrap_or("localhost").to_string();
         let port = target_uri.port_u16().unwrap_or(80);
         let addr = format!("{}:{}", host, port);
 
         let method = req.method().clone();
-        let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/")
+            .to_string();
         let headers = req.headers().clone();
         let logger = self.logger.clone();
 
@@ -841,7 +924,8 @@ impl Project {
         let upgrade_fut = hyper::upgrade::on(req);
 
         // Connect to backend and send upgrade request
-        let mut backend = tokio::net::TcpStream::connect(&addr).await
+        let mut backend = tokio::net::TcpStream::connect(&addr)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to backend {}: {}", addr, e))?;
 
         // Build and send the upgrade request to backend
@@ -856,7 +940,9 @@ impl Project {
         }
         buf.extend_from_slice(b"\r\n");
 
-        backend.write_all(&buf).await
+        backend
+            .write_all(&buf)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to send upgrade request to backend: {}", e))?;
 
         // Read response headers from backend
@@ -864,11 +950,15 @@ impl Project {
         let mut bytes_read = 0;
 
         let header_end = loop {
-            let n = backend.read(&mut response_buf[bytes_read..]).await
+            let n = backend
+                .read(&mut response_buf[bytes_read..])
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to read backend response: {}", e))?;
 
             if n == 0 {
-                return Err(anyhow::anyhow!("Backend closed connection during handshake"));
+                return Err(anyhow::anyhow!(
+                    "Backend closed connection during handshake"
+                ));
             }
 
             bytes_read += n;
@@ -885,7 +975,8 @@ impl Project {
 
         // Parse backend response to extract status and headers
         let mut response_lines = response_str.lines();
-        let status_line = response_lines.next()
+        let status_line = response_lines
+            .next()
             .ok_or_else(|| anyhow::anyhow!("Empty backend response"))?;
 
         // Extract status code from "HTTP/1.1 101 Switching Protocols"
@@ -917,8 +1008,14 @@ impl Project {
 
                     // Write any excess data from the response to the client
                     if header_end < bytes_read {
-                        if let Err(e) = upgraded.write_all(&response_buf[header_end..bytes_read]).await {
-                            let _ = logger.write("error", &format!("Failed to write excess data to client: {}", e));
+                        if let Err(e) = upgraded
+                            .write_all(&response_buf[header_end..bytes_read])
+                            .await
+                        {
+                            let _ = logger.write(
+                                "error",
+                                &format!("Failed to write excess data to client: {}", e),
+                            );
                             return;
                         }
                     }
@@ -1005,7 +1102,10 @@ fn matches_pattern(path: &str, pattern: &str) -> bool {
     if pattern.contains("**") {
         let parts: Vec<_> = pattern.splitn(2, "**").collect();
         let prefix = parts[0].trim_end_matches('/');
-        let suffix = parts.get(1).map(|s| s.trim_start_matches('/')).unwrap_or("");
+        let suffix = parts
+            .get(1)
+            .map(|s| s.trim_start_matches('/'))
+            .unwrap_or("");
 
         // Check prefix with directory boundary
         if !prefix.is_empty() {
@@ -1018,13 +1118,16 @@ fn matches_pattern(path: &str, pattern: &str) -> bool {
 
         if !suffix.is_empty() && suffix != "*" {
             let check_path = if !prefix.is_empty() {
-                path.strip_prefix(prefix).unwrap_or(path).trim_start_matches('/')
+                path.strip_prefix(prefix)
+                    .unwrap_or(path)
+                    .trim_start_matches('/')
             } else {
                 path
             };
 
-            return check_path == suffix || check_path.ends_with(&format!("/{}", suffix)) ||
-                   check_path.contains(&format!("/{}/", suffix));
+            return check_path == suffix
+                || check_path.ends_with(&format!("/{}", suffix))
+                || check_path.contains(&format!("/{}/", suffix));
         }
 
         return true;
@@ -1032,14 +1135,14 @@ fn matches_pattern(path: &str, pattern: &str) -> bool {
 
     if pattern.ends_with("/*") {
         let dir = pattern.trim_end_matches("/*");
-        return path == dir || (path.starts_with(&format!("{}/", dir)) && !path[dir.len() + 1..].contains('/'));
+        return path == dir
+            || (path.starts_with(&format!("{}/", dir)) && !path[dir.len() + 1..].contains('/'));
     }
 
     // Handle wildcard patterns like *.py, *.txt
     if pattern.starts_with("*.") && !pattern.contains('/') {
         let extension = &pattern[1..]; // includes the dot
-        return path.ends_with(extension) ||
-               path.split('/').any(|part| part.ends_with(extension));
+        return path.ends_with(extension) || path.split('/').any(|part| part.ends_with(extension));
     }
 
     if pattern.contains('/') {
@@ -1047,6 +1150,7 @@ fn matches_pattern(path: &str, pattern: &str) -> bool {
     }
 
     // Simple pattern matches name anywhere
-    path == pattern || path.starts_with(&format!("{}/", pattern)) ||
-    path.split('/').any(|part| part == pattern)
+    path == pattern
+        || path.starts_with(&format!("{}/", pattern))
+        || path.split('/').any(|part| part == pattern)
 }
