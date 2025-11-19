@@ -34,23 +34,23 @@ pub async fn create_project(dir: &Path, domain: String, use_firejail: bool, prun
     // Log project type
     match &config.project_type {
         ProjectType::Redirect { target } => {
-            logger.write("", &format!("starting redirect to {}", target))?;
+            logger.write("", &format!("Redirect to {}", target))?;
         }
         ProjectType::Proxy { target } => {
-            logger.write("", &format!("starting proxy for {}", target))?;
+            logger.write("", &format!("Proxy to {}", target))?;
         }
         ProjectType::Forward { socket_path, host, port } => {
             if !socket_path.is_empty() {
-                logger.write("", &format!("starting forward to socket {}", socket_path))?;
+                logger.write("", &format!("Forward to socket {}", socket_path))?;
             } else {
-                logger.write("", &format!("starting forward to http://{}:{}", host, port))?;
+                logger.write("", &format!("Forward to http://{}:{}", host, port))?;
             }
         }
         ProjectType::Application { .. } => {
             // Will log when process starts
         }
         ProjectType::Static => {
-            logger.write("", "starting static file server")?;
+            logger.write("", "Static file server")?;
         }
     }
 
@@ -353,7 +353,7 @@ impl Project {
             ProjectState::Stopped => {
                 // Start the application
                 let port = get_free_port()?;
-                self.logger.write("", &format!("starting on port {}", port))?;
+                self.logger.write("", &format!("Starting on port {}", port))?;
 
                 *state = ProjectState::Starting {
                     port,
@@ -411,7 +411,7 @@ impl Project {
         process.stdout(std::process::Stdio::piped());
         process.stderr(std::process::Stdio::piped());
 
-        self.logger.write("", &format!("starting command: {:?}", process))?;
+        self.logger.write("", "Starting application")?;
 
         let mut child = process.spawn()?;
 
@@ -443,12 +443,12 @@ impl Project {
 
         if !ready {
             child.kill().await?;
-            self.logger.write("", "application failed to start listening on port")?;
+            self.logger.write("", "Application failed to start listening on port")?;
             *self.state.lock().await = ProjectState::Stopped;
             anyhow::bail!("Port not ready");
         }
 
-        self.logger.write("", &format!("reachable on port {}", port))?;
+        self.logger.write("", &format!("Ready on port {}", port))?;
 
         // Start workers
         let workers = self.start_workers(port).await;
@@ -482,7 +482,7 @@ impl Project {
 
                         if kill(Pid::from_raw(pid as i32), None).is_err() {
                             // Process no longer exists
-                            let _ = logger.write("", "process exited");
+                            let _ = logger.write("", "Process exited");
                             *state_clone.lock().await = ProjectState::Stopped;
                             break;
                         }
@@ -514,7 +514,7 @@ impl Project {
             return vec![];
         }
 
-        self.logger.write("", &format!("starting {} worker(s)", workers_map.len())).unwrap();
+        self.logger.write("", &format!("Starting {} worker(s)", workers_map.len())).unwrap();
 
         let mut workers = vec![];
 
@@ -522,7 +522,7 @@ impl Project {
             let mut process = match self.build_shell_command(cmd) {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = self.logger.write("", &format!("failed to build worker {}: {}", name, e));
+                    let _ = self.logger.write("", &format!("Failed to build worker {}: {}", name, e));
                     continue;
                 }
             };
@@ -566,7 +566,7 @@ impl Project {
                     workers.push(child);
                 }
                 Err(e) => {
-                    let _ = self.logger.write("", &format!("failed to start worker {}: {}", name, e));
+                    let _ = self.logger.write("", &format!("Failed to start worker {}: {}", name, e));
                 }
             }
         }
@@ -610,8 +610,14 @@ impl Project {
     }
 
     async fn build_docker_command(&self, port: u16, dc: &DockerConfig, command: &str) -> Result<Command> {
-        // Generate container name
-        let hash = md5::compute(self.dir.as_bytes());
+        // Generate container name using a hash of the directory path
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        self.dir.hash(&mut hasher);
+        let hash = hasher.finish();
+
         let container_name = format!("webcentral-{:x}", hash);
         let image_name = format!("{}:latest", container_name);
 
@@ -714,7 +720,11 @@ impl Project {
             }
         })?;
 
-        // Watch directory
+        // Watch directory recursively. Note: notify crate doesn't support exclusion patterns,
+        // so we watch everything and filter unwanted paths in should_reload_for_file().
+        // This generates events for files in node_modules/, data/, etc. that we then ignore,
+        // but the overhead is acceptable and this approach is simpler than selectively watching
+        // only certain subdirectories.
         watcher.watch(Path::new(&self.dir), RecursiveMode::Recursive)?;
 
         while let Some(event) = rx.recv().await {
@@ -723,7 +733,7 @@ impl Project {
 
                 // Check if should reload
                 if self.should_reload_for_file(rel_path) {
-                    self.logger.write("", &format!("stopping due to change for {}", rel_path.display()))?;
+                    self.logger.write("", &format!("Stopping due to change in {}", rel_path.display()))?;
 
                     // Remove from DOMAINS map immediately so new requests create a fresh instance
                     crate::server::discard_project(&self.domain).await;
@@ -794,7 +804,7 @@ impl Project {
 
             let last = *self.last_activity.lock().await;
             if last.elapsed() > timeout {
-                let _ = self.logger.write("", "stopping due to inactivity");
+                let _ = self.logger.write("", "Stopping due to inactivity");
 
                 // Stop and remove from DOMAINS map so it will be recreated on next request
                 let domain = self.domain.clone();
@@ -851,7 +861,7 @@ impl Project {
                         let _ = worker.kill().await;
                     }
                     let _ = process.kill().await;
-                    let _ = logger_clone.write("", "stopped");
+                    let _ = logger_clone.write("", "Stopped");
                     *state = ProjectState::Stopped;
                 }
                 _ => {
