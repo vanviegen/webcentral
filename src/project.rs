@@ -588,6 +588,8 @@ impl Project {
         let mut cmd = if self.use_firejail && self.config.docker.is_none() {
             let home = get_user_home(self.uid);
             let mut c = Command::new("firejail");
+            // Use exec to replace the shell with the command, ensuring signals reach the process
+            let exec_command = format!("exec {}", command);
             c.args(&[
                 "--quiet",
                 "--noprofile",
@@ -598,12 +600,13 @@ impl Project {
                 "--read-only=/",
                 &format!("--read-write={}", self.dir),
                 "--",
-                "/bin/sh", "-c", command,
+                "/bin/sh", "-c", &exec_command,
             ]);
             c
         } else {
             let mut c = Command::new("/bin/sh");
-            c.args(&["-c", command]);
+            let exec_command = format!("exec {}", command);
+            c.args(&["-c", &exec_command]);
             c
         };
 
@@ -733,13 +736,13 @@ impl Project {
                 if self.should_reload_for_file(rel_path) {
                     self.logger.write("", &format!("stopping due to change for {}", rel_path.display()))?;
 
-                    // Stop process in background (non-blocking)
+                    // Remove from projects map immediately so new requests create a fresh instance
+                    PROJECTS.remove(&self.dir);
+
+                    // Stop the old process in background
                     let project_clone = self.clone();
-                    let dir = self.dir.clone();
                     tokio::spawn(async move {
                         project_clone.stop().await;
-                        // Remove from projects map so it will be recreated
-                        PROJECTS.remove(&dir);
                     });
 
                     break; // Stop watching, will be recreated on reload
@@ -826,30 +829,70 @@ impl Project {
             let last = *self.last_activity.lock().await;
             if last.elapsed() > timeout {
                 let _ = self.logger.write("", "stopping due to inactivity");
+
+                // Stop and remove from projects map so it will be recreated on next request
+                let dir = self.dir.clone();
                 self.stop().await;
+                PROJECTS.remove(&dir);
                 break;
             }
         }
     }
 
     pub async fn stop(&self) {
-        // Force kill immediately
-        let mut state = self.state.lock().await;
-        match &mut *state {
-            ProjectState::Running { process, workers, .. } => {
-                // Kill workers
-                for worker in workers {
-                    let _ = worker.kill().await;
+        // Send SIGTERM first, then force kill after delay
+        let pids: Vec<u32> = {
+            let state = self.state.lock().await;
+            match &*state {
+                ProjectState::Running { process, workers, .. } => {
+                    let mut pids = vec![];
+                    if let Some(pid) = process.id() {
+                        pids.push(pid);
+                    }
+                    for worker in workers {
+                        if let Some(pid) = worker.id() {
+                            pids.push(pid);
+                        }
+                    }
+                    pids
                 }
-                // Kill main process
-                let _ = process.kill().await;
-                let _ = self.logger.write("", "stopped");
-                *state = ProjectState::Stopped;
+                _ => vec![]
             }
-            _ => {
-                *state = ProjectState::Stopped;
+        };
+
+        // Send SIGTERM to all processes
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+
+            for pid in &pids {
+                let _ = kill(Pid::from_raw(*pid as i32), Signal::SIGTERM);
             }
         }
+
+        // Wait for graceful shutdown (but don't block - do it in background)
+        let state_clone = self.state.clone();
+        let logger_clone = self.logger.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+
+            // Force kill if still running
+            let mut state = state_clone.lock().await;
+            match &mut *state {
+                ProjectState::Running { process, workers, .. } => {
+                    for worker in workers {
+                        let _ = worker.kill().await;
+                    }
+                    let _ = process.kill().await;
+                    let _ = logger_clone.write("", "stopped");
+                    *state = ProjectState::Stopped;
+                }
+                _ => {
+                    *state = ProjectState::Stopped;
+                }
+            }
+        });
     }
 }
 
@@ -927,8 +970,13 @@ fn matches_pattern(path: &str, pattern: &str) -> bool {
         let prefix = parts[0].trim_end_matches('/');
         let suffix = parts.get(1).map(|s| s.trim_start_matches('/')).unwrap_or("");
 
-        if !prefix.is_empty() && !path.starts_with(prefix) {
-            return false;
+        // Check prefix with directory boundary
+        if !prefix.is_empty() {
+            if path == prefix || path.starts_with(&format!("{}/", prefix)) {
+                // Prefix matches
+            } else {
+                return false;
+            }
         }
 
         if !suffix.is_empty() && suffix != "*" {
@@ -948,6 +996,13 @@ fn matches_pattern(path: &str, pattern: &str) -> bool {
     if pattern.ends_with("/*") {
         let dir = pattern.trim_end_matches("/*");
         return path == dir || (path.starts_with(&format!("{}/", dir)) && !path[dir.len() + 1..].contains('/'));
+    }
+
+    // Handle wildcard patterns like *.py, *.txt
+    if pattern.starts_with("*.") && !pattern.contains('/') {
+        let extension = &pattern[1..]; // includes the dot
+        return path.ends_with(extension) ||
+               path.split('/').any(|part| part.ends_with(extension));
     }
 
     if pattern.contains('/') {
