@@ -182,8 +182,8 @@ impl Project {
         match &self.config.project_type {
             ProjectType::Redirect { target } => self.handle_redirect(req, target).await,
             ProjectType::Proxy { target } => self.proxy_request(req, target).await,
-            ProjectType::TcpForward { .. } => self.forward_request(req).await,
-            ProjectType::UnixForward { .. } => self.forward_request(req).await,
+            ProjectType::TcpForward { address } => self.handle_forward(req, address).await,
+            ProjectType::UnixForward { socket_path } => self.handle_unix_forward(req, socket_path).await,
             ProjectType::Application { .. } => self.handle_application(req).await,
             ProjectType::Static => self.handle_static(req).await,
         }
@@ -254,7 +254,8 @@ impl Project {
         let uri_str = format!("{}{}", target, parts.uri.path_and_query().unwrap());
 
         let mut new_parts = parts.clone();
-        new_parts.uri = uri_str.parse()?;
+        let new_uri: http::Uri = uri_str.parse()?;
+        new_parts.uri = new_uri.clone();
 
         let original_host = parts
             .headers
@@ -262,8 +263,14 @@ impl Project {
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
 
+        // Set X-Forwarded headers to preserve original request info
         new_parts.headers.insert("X-Forwarded-Host", HeaderValue::from_str(original_host)?);
         new_parts.headers.insert("X-Forwarded-Proto", HeaderValue::from_str(parts.uri.scheme_str().unwrap_or("?"))?);
+
+        // Rewrite Host header to match the backend (extracted from target URI)
+        if let Some(authority) = new_uri.authority() {
+            new_parts.headers.insert("host", HeaderValue::from_str(authority.as_str())?);
+        }
 
         let proxy_req = Request::from_parts(new_parts, body);
         self.forward_request(proxy_req).await
@@ -294,9 +301,25 @@ impl Project {
     async fn handle_application(&self, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         // Wait for port to be available (with timeout)
         let port = self.wait_for_port().await?;
-        
+
         // Rewrite URI to point to localhost:port
         let uri_string = format!("http://127.0.0.1:{}{}", port, req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+        *req.uri_mut() = uri_string.parse()?;
+
+        self.forward_request(req).await
+    }
+
+    async fn handle_forward(&self, mut req: Request<Incoming>, address: &str) -> Result<Response<Full<Bytes>>> {
+        // Rewrite URI to absolute form for TCP forward
+        let uri_string = format!("http://{}{}", address, req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+        *req.uri_mut() = uri_string.parse()?;
+
+        self.forward_request(req).await
+    }
+
+    async fn handle_unix_forward(&self, mut req: Request<Incoming>, _socket_path: &str) -> Result<Response<Full<Bytes>>> {
+        // For Unix sockets, use a dummy host in the URI since the connector will use the socket path
+        let uri_string = format!("http://localhost{}", req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
         *req.uri_mut() = uri_string.parse()?;
 
         self.forward_request(req).await

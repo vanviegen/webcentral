@@ -1716,6 +1716,226 @@ def test_websocket_proxy(t):
     t.assert_log('ws.example.com', f"Echoed: {message5}", count=1)
 
 
+@test
+def test_forward_preserves_host_header(t):
+    """Forward preserves the Host header from the original request"""
+    # Create a backend server that echoes request headers
+    t.write_file('forward.test/server.py', '''
+import os
+import http.server
+import socketserver
+
+class HeaderEchoHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+
+        # Echo back the Host header
+        host = self.headers.get('Host', 'no-host')
+        x_forwarded_host = self.headers.get('X-Forwarded-Host', 'no-x-forwarded-host')
+        x_forwarded_proto = self.headers.get('X-Forwarded-Proto', 'no-x-forwarded-proto')
+        path = self.path
+
+        response = f"Host: {host}\\nX-Forwarded-Host: {x_forwarded_host}\\nX-Forwarded-Proto: {x_forwarded_proto}\\nPath: {path}"
+        self.wfile.write(response.encode())
+
+PORT = int(os.environ.get('PORT', 8000))
+with socketserver.TCPServer(("", PORT), HeaderEchoHandler) as httpd:
+    print(f"Header echo server on {PORT}", flush=True)
+    httpd.serve_forever()
+''')
+
+    t.write_file('forward.test/webcentral.ini', 'command=python3 -u server.py')
+
+    # Make request and verify Host header is preserved
+    response = t.assert_http('forward.test', '/test/path', check_code=200)
+
+    # For forward, Host header should be preserved as "forward.test"
+    if 'Host: forward.test' not in response:
+        raise AssertionError(f"Expected 'Host: forward.test' in response, got: {response}")
+
+    # X-Forwarded headers should NOT be added by forward
+    if 'X-Forwarded-Host: no-x-forwarded-host' not in response:
+        raise AssertionError(f"Expected no X-Forwarded-Host header in forward mode, got: {response}")
+
+    # Path should be preserved exactly
+    if 'Path: /test/path' not in response:
+        raise AssertionError(f"Expected 'Path: /test/path', got: {response}")
+
+
+@test
+def test_forward_tcp_port(t):
+    """Forward to TCP port preserves original request"""
+    # Start a backend server on a known port
+    t.write_file('backend.test/server.py', '''
+import os
+import http.server
+import socketserver
+
+class SimpleHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+
+        host = self.headers.get('Host', 'unknown')
+        path = self.path
+
+        response = f"Backend received - Host: {host}, Path: {path}"
+        self.wfile.write(response.encode())
+
+PORT = int(os.environ.get('PORT', 8000))
+print(f"Backend on {PORT}", flush=True)
+with socketserver.TCPServer(("", PORT), SimpleHandler) as httpd:
+    httpd.serve_forever()
+''')
+
+    t.write_file('backend.test/webcentral.ini', 'command=python3 -u server.py')
+
+    # First, start the backend to get a port assigned
+    t.assert_http('backend.test', '/', check_code=200)
+    t.await_log('backend.test', 'Backend on')
+
+    # Extract the port from logs
+    backend_log = t.get_log_content('backend.test', 0)
+    import re
+    port_match = re.search(r'Backend on (\d+)', backend_log)
+    if not port_match:
+        raise AssertionError("Could not find backend port in logs")
+    backend_port = port_match.group(1)
+
+    # Now create a forward that points to this backend
+    t.write_file('forwarder.test/webcentral.ini', f'port={backend_port}')
+
+    # Make request through the forwarder
+    response = t.assert_http('forwarder.test', '/api/endpoint', check_code=200)
+
+    # The backend should see the original Host header
+    if 'Host: forwarder.test' not in response:
+        raise AssertionError(f"Expected 'Host: forwarder.test', got: {response}")
+
+    # Path should be preserved
+    if 'Path: /api/endpoint' not in response:
+        raise AssertionError(f"Expected 'Path: /api/endpoint', got: {response}")
+
+
+@test
+def test_proxy_rewrites_headers(t):
+    """Proxy rewrites Host and adds X-Forwarded headers"""
+    # Create a backend server that echoes headers
+    t.write_file('proxy-backend.test/server.py', '''
+import os
+import http.server
+import socketserver
+
+class HeaderEchoHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+
+        host = self.headers.get('Host', 'no-host')
+        x_forwarded_host = self.headers.get('X-Forwarded-Host', 'no-x-forwarded-host')
+        x_forwarded_proto = self.headers.get('X-Forwarded-Proto', 'no-x-forwarded-proto')
+        path = self.path
+
+        response = f"Host: {host}\\nX-Forwarded-Host: {x_forwarded_host}\\nX-Forwarded-Proto: {x_forwarded_proto}\\nPath: {path}"
+        self.wfile.write(response.encode())
+
+PORT = int(os.environ.get('PORT', 8000))
+print(f"Proxy backend on {PORT}", flush=True)
+with socketserver.TCPServer(("", PORT), HeaderEchoHandler) as httpd:
+    httpd.serve_forever()
+''')
+
+    t.write_file('proxy-backend.test/webcentral.ini', 'command=python3 -u server.py')
+
+    # Start backend and get its port
+    t.assert_http('proxy-backend.test', '/', check_code=200)
+    t.await_log('proxy-backend.test', 'Proxy backend on')
+
+    backend_log = t.get_log_content('proxy-backend.test', 0)
+    import re
+    port_match = re.search(r'Proxy backend on (\d+)', backend_log)
+    if not port_match:
+        raise AssertionError("Could not find backend port")
+    backend_port = port_match.group(1)
+
+    # Create a proxy that points to this backend
+    t.write_file('proxy-test.test/webcentral.ini', f'proxy=http://127.0.0.1:{backend_port}')
+
+    # Make request through the proxy
+    response = t.assert_http('proxy-test.test', '/api/data', check_code=200)
+
+    # For proxy, Host header should be rewritten to the backend address
+    if f'Host: 127.0.0.1:{backend_port}' not in response:
+        raise AssertionError(f"Expected 'Host: 127.0.0.1:{backend_port}' in proxy mode, got: {response}")
+
+    # X-Forwarded-Host should contain the original host
+    if 'X-Forwarded-Host: proxy-test.test' not in response:
+        raise AssertionError(f"Expected 'X-Forwarded-Host: proxy-test.test', got: {response}")
+
+    # X-Forwarded-Proto should be set
+    if 'X-Forwarded-Proto:' not in response or 'no-x-forwarded-proto' in response:
+        raise AssertionError(f"Expected X-Forwarded-Proto to be set, got: {response}")
+
+    # Path should be preserved
+    if 'Path: /api/data' not in response:
+        raise AssertionError(f"Expected 'Path: /api/data', got: {response}")
+
+
+@test
+def test_proxy_vs_forward_path_handling(t):
+    """Demonstrate that both proxy and forward preserve the request path"""
+    # Create backend
+    t.write_file('pathtest-backend.test/server.py', '''
+import os
+import http.server
+import socketserver
+
+class PathHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(f"Path: {self.path}".encode())
+
+PORT = int(os.environ.get('PORT', 8000))
+print(f"Path backend on {PORT}", flush=True)
+with socketserver.TCPServer(("", PORT), PathHandler) as httpd:
+    httpd.serve_forever()
+''')
+
+    t.write_file('pathtest-backend.test/webcentral.ini', 'command=python3 -u server.py')
+
+    # Start backend
+    t.assert_http('pathtest-backend.test', '/', check_code=200)
+    t.await_log('pathtest-backend.test', 'Path backend on')
+
+    backend_log = t.get_log_content('pathtest-backend.test', 0)
+    import re
+    port_match = re.search(r'Path backend on (\d+)', backend_log)
+    backend_port = port_match.group(1)
+
+    # Create forward
+    t.write_file('path-forward.test/webcentral.ini', f'port={backend_port}')
+
+    # Create proxy
+    t.write_file('path-proxy.test/webcentral.ini', f'proxy=http://127.0.0.1:{backend_port}')
+
+    # Test that both preserve paths with query strings
+    forward_response = t.assert_http('path-forward.test', '/some/path?query=value', check_code=200)
+    proxy_response = t.assert_http('path-proxy.test', '/some/path?query=value', check_code=200)
+
+    # Both should preserve the full path
+    if 'Path: /some/path?query=value' not in forward_response:
+        raise AssertionError(f"Forward didn't preserve path, got: {forward_response}")
+
+    if 'Path: /some/path?query=value' not in proxy_response:
+        raise AssertionError(f"Proxy didn't preserve path, got: {proxy_response}")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run webcentral tests')
     parser.add_argument('--firejail', type=str, choices=['true', 'false'], default='true',
