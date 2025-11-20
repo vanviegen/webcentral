@@ -2,7 +2,7 @@ use crate::logger::Logger;
 use crate::project_config::{ConnectionTarget, DockerConfig, ProjectConfig, ProjectType};
 use anyhow::Result;
 use bytes::Bytes;
-use http::Uri;
+use http::{HeaderValue, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request, Response};
 use hyper_util::client::legacy::connect::{HttpConnector, Connection, Connected};
@@ -17,19 +17,17 @@ use std::fs;
 use std::net::TcpStream;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::future::Future;
-use std::task::{Context as TaskContext, Poll};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, AsyncRead, AsyncWrite};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tower::Service;
 
 lazy_static::lazy_static! {
-     static ref HTTP_CLIENT: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http(); 
+     static ref DEFAULT_HTTP_CLIENT: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http(); 
+     static ref DEFAULT_CONNECTOR: HttpConnector = HttpConnector::new();
 }
 
 pub async fn create_project(
@@ -46,6 +44,10 @@ pub async fn create_project(
     let log_dir = dir.join("_webcentral_data/log");
     let logger = Arc::new(Logger::new(log_dir, uid, gid, prune_logs)?);
 
+    // Create connector
+    let mut custom_connector = None;
+    let mut port = 0u16;
+
     // Log project type
     let descr = match &config.project_type {
         ProjectType::Redirect { target } => {
@@ -55,13 +57,18 @@ pub async fn create_project(
             &format!("Proxy to {}", target)
         }
         ProjectType::TcpForward { address } => {
+            custom_connector = Some(FixedTcpHttpConnector::new(address.clone()));
             &format!("Forward to port {}", address)
         }
         ProjectType::UnixForward { socket_path } => {
+            custom_connector = Some(FixedUnixHttpConnector::new(socket_path.clone()));
             &format!("Forward to unix socket {}", socket_path)
         }
         ProjectType::Application { .. } => {
-            "Application server"
+            port = get_free_port()?;
+            let addr = &format!("127.0.0.1:{}", port);
+            custom_connector = Some(FixedTcpHttpConnector::new(addr.clone()));
+            &format!("Application server on {}", addr)
         }
         ProjectType::Static => {
             "Static file server"
@@ -74,23 +81,18 @@ pub async fn create_project(
         logger.write("config", err);
     }
 
-    // Determine connection target
-    let connection_target = match &config.project_type {
-        ProjectType::Application { connection_target, .. } => connection_target.clone(),
-        ProjectType::Forward { connection_target, .. } => connection_target.clone(),
-        _ => ConnectionTarget::Standard,
+    let http_client = if let Some(connector) = custom_connector {
+        Client::builder(TokioExecutor::new()).build(connector)
+    } else {
+        DEFAULT_HTTP_CLIENT
     };
-
-    // Create connector
-    let connector = match connection_target {
-        ConnectionTarget::Unix(path) => TargetedConnector::Unix(path),
-        ConnectionTarget::Tcp(addr) => TargetedConnector::Tcp(addr),
-        ConnectionTarget::Standard => TargetedConnector::Standard(HttpConnector::new()),
+    
+    let connector = if let Some(connector) = custom_connector {
+        connector
+    } else {
+        DEFAULT_CONNECTOR
     };
-
-    // Create HTTP client
-    let http_client = Client::builder(TokioExecutor::new()).build(connector.clone());
-
+    
     let project = Arc::new(Project {
         domain: domain.clone(),
         dir: dir.to_string_lossy().to_string(),
@@ -103,7 +105,7 @@ pub async fn create_project(
         process: Arc::new(Mutex::new(None)),
         workers: Arc::new(Mutex::new(Vec::new())),
         last_activity: Arc::new(Mutex::new(Instant::now())),
-        http_client,
+        http_client: Client::builder(TokioExecutor::new()).build(connector.clone()),
         connector,
     });
 
@@ -124,10 +126,10 @@ pub async fn create_project(
     }
 
     // Start application process if needed
-    if matches!(config.project_type, ProjectType::Application { .. }) {
+    if let ProjectType::Application { .. } = config.project_type {
         let proj = project.clone();
         tokio::spawn(async move {
-            if let Err(e) = proj.start_process().await {
+            if let Err(e) = proj.start_process(port).await {
                 let _ = proj
                     .logger
                     .write("", &format!("Failed to start process: {}", e));
@@ -151,8 +153,8 @@ pub struct Project {
     process: Arc<Mutex<Option<tokio::process::Child>>>,
     workers: Arc<Mutex<Vec<tokio::process::Child>>>,
     last_activity: Arc<Mutex<Instant>>,
-    http_client: Client<TargetedConnector, Full<Bytes>>,
-    connector: TargetedConnector,
+    http_client: Client<TODO, Full<Bytes>>,
+    connector: TODO,
 }
 
 impl Project {
@@ -181,7 +183,8 @@ impl Project {
         match &self.config.project_type {
             ProjectType::Redirect { target } => self.handle_redirect(req, target).await,
             ProjectType::Proxy { target } => self.proxy_request(req, target).await,
-            ProjectType::Forward { .. } => self.forward_request(req).await,
+            ProjectType::TcpForward { .. } => self.forward_request(req).await,
+            ProjectType::UnixForward { .. } => self.forward_request(req).await,
             ProjectType::Application { .. } => self.handle_application(req).await,
             ProjectType::Static => self.handle_static(req).await,
         }
@@ -244,106 +247,27 @@ impl Project {
 
     async fn proxy_request(
         &self,
-        mut req: Request<Incoming>,
+        req: Request<Incoming>,
         target: &str,
     ) -> Result<Response<Full<Bytes>>> {
-        // Parse target URL
-        let target_uri: hyper::Uri = target.parse()?;
 
-        // Build the full URI for the proxied request
-        let path_and_query = req
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-
-        let uri_str = format!("{}{}", target, path_and_query);
-        let uri: hyper::Uri = uri_str.parse()?;
-
-        // Check if this is a WebSocket upgrade request
-        let is_upgrade = is_upgrade_request(&req);
-        if is_upgrade {
-            *req.uri_mut() = uri;
-            return self.proxy_upgrade(req).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e));
-        }
-
-        // Collect the incoming body first
         let (parts, body) = req.into_parts();
-        let body_bytes = body.collect().await?.to_bytes();
+        let uri_str = format!("{}{}", target, parts.uri.path_and_query().unwrap());
 
-        // Build proxied request with collected body
-        let mut proxy_req = hyper::Request::builder()
-            .method(&parts.method)
-            .uri(uri)
-            .version(hyper::Version::HTTP_11);
+        let mut new_parts = parts.clone();
+        new_parts.uri = uri_str.parse()?;
 
-        // Copy headers, skipping connection-related headers
-        for (name, value) in &parts.headers {
-            let name_str = name.as_str().to_lowercase();
-            if name_str != "host"
-                && name_str != "connection"
-                && name_str != "transfer-encoding"
-                && name_str != "content-length"
-            {
-                proxy_req = proxy_req.header(name, value);
-            }
-        }
-
-        // Set proper Host header
-        if let Some(host) = target_uri.host() {
-            let host_value = if let Some(port) = target_uri.port_u16() {
-                format!("{}:{}", host, port)
-            } else {
-                host.to_string()
-            };
-            proxy_req = proxy_req.header("Host", host_value);
-        }
-
-        // Add X-Forwarded headers
-        let proto = if parts.uri.scheme_str() == Some("https") {
-            "https"
-        } else {
-            "http"
-        };
         let original_host = parts
             .headers
             .get("host")
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
 
-        proxy_req = proxy_req
-            .header("X-Forwarded-Host", original_host)
-            .header("X-Forwarded-Proto", proto);
+        new_parts.headers.insert("X-Forwarded-Host", HeaderValue::from_str(original_host)?);
+        new_parts.headers.insert("X-Forwarded-Proto", HeaderValue::from_str(parts.uri.scheme_str().unwrap_or("?"))?);
 
-        // Set Content-Length if we have a body
-        if !body_bytes.is_empty() {
-            proxy_req = proxy_req.header("Content-Length", body_bytes.len());
-        }
-
-        let proxy_req = proxy_req.body(Full::new(body_bytes))?;
-
-        // Send request
-        let resp = HTTP_CLIENT.clone()
-            .request(proxy_req)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to backend: {}", e))?;
-
-        // Convert response
-        let (resp_parts, resp_body) = resp.into_parts();
-        let resp_bytes = resp_body.collect().await?.to_bytes();
-
-        let mut response = Response::builder()
-            .status(resp_parts.status)
-            .version(resp_parts.version);
-
-        // Copy response headers
-        for (name, value) in resp_parts.headers {
-            if let Some(name) = name {
-                response = response.header(name, value);
-            }
-        }
-
-        Ok(response.body(Full::new(resp_bytes))?)
+        let proxy_req = Request::from_parts(new_parts, body);
+        self.forward_request(proxy_req).await
     }
 
     async fn forward_request(
@@ -351,7 +275,6 @@ impl Project {
         req: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>>
     {
-                
         // Check if this is a WebSocket upgrade request
         if is_upgrade_request(&req) {
             return self.proxy_upgrade(req).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e));
@@ -391,8 +314,7 @@ impl Project {
         anyhow::bail!("Application startup timeout")
     }
 
-    async fn start_process(&self) -> Result<()> {
-        let port = get_free_port()?;
+    async fn start_process(&self, port: u16) -> Result<()> {
         self.logger
             .write("", &format!("Starting on port {}", port));
 
@@ -921,30 +843,28 @@ impl Project {
         req: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>> {
         let method = req.method().clone();
-        let path = req
-            .uri()
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/")
-            .to_string();
-        let headers = req.headers().clone();
         let logger = self.logger.clone();
-        let uri = req.uri().clone();
 
         // Get the upgrade future before we return a response
         let upgrade_fut = hyper::upgrade::on(req);
 
         // Connect to backend
         let mut connector = self.connector.clone();
-        let io = connector.call(uri).await?;
+        let io = connector.call(req.uri()).await?;
         let mut backend = io.into_inner();
 
         // Build and send the upgrade request to backend
         let mut buf = Vec::new();
         use std::io::Write;
 
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/")
+            .to_string();
         write!(&mut buf, "{} {} HTTP/1.1\r\n", method, path).unwrap();
-        for (name, value) in &headers {
+        for (name, value) in req.headers() {
             write!(&mut buf, "{}: ", name).unwrap();
             buf.extend_from_slice(value.as_bytes());
             buf.extend_from_slice(b"\r\n");
@@ -1145,102 +1065,3 @@ fn matches_pattern(path: &str, pattern: &str) -> bool {
         || path.split('/').any(|part| part == pattern)
 }
 
-#[derive(Clone, Debug)]
-pub enum TargetedConnector {
-    Unix(String),
-    Tcp(String),
-    Standard(HttpConnector),
-}
-
-impl tower::Service<Uri> for TargetedConnector {
-    type Response = TokioIo<ProjectStream>;
-    type Error = std::io::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
-        match self {
-            TargetedConnector::Standard(connector) => connector.poll_ready(cx).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-            _ => Poll::Ready(Ok(())),
-        }
-    }
-
-    fn call(&mut self, req: Uri) -> Self::Future {
-        match self {
-            TargetedConnector::Unix(path) => {
-                let path = path.clone();
-                Box::pin(async move {
-                    let stream = tokio::net::UnixStream::connect(path).await?;
-                    Ok(TokioIo::new(ProjectStream::Unix(stream)))
-                })
-            }
-            TargetedConnector::Tcp(addr) => {
-                let addr = addr.clone();
-                Box::pin(async move {
-                    let stream = tokio::net::TcpStream::connect(addr).await?;
-                    Ok(TokioIo::new(ProjectStream::Tcp(stream)))
-                })
-            }
-            TargetedConnector::Standard(connector) => {
-                let fut = connector.call(req);
-                Box::pin(async move {
-                    let stream = fut.await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                    Ok(TokioIo::new(ProjectStream::Tcp(stream.into_inner())))
-                })
-            }
-        }
-    }
-}
-
-pub enum ProjectStream {
-    Unix(tokio::net::UnixStream),
-    Tcp(tokio::net::TcpStream),
-}
-
-impl AsyncRead for ProjectStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            ProjectStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
-            ProjectStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for ProjectStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            ProjectStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
-            ProjectStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            ProjectStream::Unix(s) => Pin::new(s).poll_flush(cx),
-            ProjectStream::Tcp(s) => Pin::new(s).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            ProjectStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
-            ProjectStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
-        }
-    }
-}
-
-impl Connection for ProjectStream {
-    fn connected(&self) -> Connected {
-        match self {
-            ProjectStream::Unix(_) => Connected::new(),
-            ProjectStream::Tcp(_) => Connected::new(),
-        }
-    }
-}
