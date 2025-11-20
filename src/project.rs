@@ -35,7 +35,7 @@ lazy_static::lazy_static! {
 
 // --- Project ---
 
-pub async fn create_project(
+pub fn create_project(
     dir: &Path,
     domain: String,
     use_firejail: bool,
@@ -71,7 +71,7 @@ pub async fn create_project(
         }
         ProjectType::Application { .. } => {
             port = get_free_port()?;
-            let addr = format!("127.0.0.1:{}", port);
+            let addr = format!("localhost:{}", port);
             custom_connector = Some(AnyConnector::FixedTcp(addr.clone()));
             &format!("Application server on {}", addr)
         }
@@ -304,7 +304,7 @@ impl Project {
         let port = self.wait_for_port().await?;
 
         // Rewrite URI to point to localhost:port
-        let uri_string = format!("http://127.0.0.1:{}{}", port, req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+        let uri_string = format!("http://localhost:{}{}", port, req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
         *req.uri_mut() = uri_string.parse()?;
 
         self.forward_request(req).await
@@ -682,7 +682,7 @@ impl Project {
         // This generates events for files in node_modules/, data/, etc. that we then ignore,
         // but the overhead is acceptable and this approach is simpler than selectively watching
         // only certain subdirectories.
-        watcher.watch(Path::new(&self.dir), RecursiveMode::Recursive)?;
+        watcher.watch(Path::new(&self.dir),  RecursiveMode::NonRecursive)?;
 
         while let Some(event) = rx.recv().await {
             use notify::EventKind;
@@ -991,7 +991,7 @@ fn is_upgrade_request(req: &Request<Incoming>) -> bool {
 }
 
 fn get_free_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let listener = std::net::TcpListener::bind("localhost:0")?;
     Ok(listener.local_addr()?.port())
 }
 
@@ -1014,7 +1014,7 @@ async fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
-        if StdTcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+        if StdTcpStream::connect(format!("localhost:{}", port)).is_ok() {
             return true;
         }
         sleep(Duration::from_millis(200)).await;

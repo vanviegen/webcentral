@@ -410,32 +410,34 @@ impl Server {
     }
 
     async fn get_project_for_domain(&self, domain: &str) -> Result<Arc<Project>> {
-        // Look up domain in DOMAINS map
+        // First do an immutable lookup
         let domain_info = DOMAINS
             .get(domain)
             .ok_or_else(|| anyhow::anyhow!("Domain not found: {}", domain))?;
-
-        // Check if project already exists
         if let Some(project) = domain_info.project.as_ref() {
             return Ok(project.clone());
         }
-        
-        // Need to drop the ref to get mutable access
-        drop(domain_info);
+        drop(domain_info); // Drop immutable lock
 
+        // Now get a mutable lock on the domain_info, to prevent race conditions
+        let mut domain_info = DOMAINS
+            .get_mut(domain)
+            .ok_or_else(|| anyhow::anyhow!("Domain not found: {}", domain))?;
+        if let Some(project) = domain_info.project.as_ref() {
+            // Was project was created in the mean time.
+            return Ok(project.clone());
+        }
+        
         // Create or recreate project
         let project = project::create_project(
             &PathBuf::from(&DOMAINS.get(domain).unwrap().directory),
             domain.to_string(),
             self.config.firejail,
             self.config.prune_logs,
-        )
-        .await?;
+        )?;
 
         // Store in domain info
-        if let Some(mut domain_info) = DOMAINS.get_mut(domain) {
-            domain_info.project = Some(project.clone());
-        }
+        domain_info.project = Some(project.clone());
 
         Ok(project)
     }

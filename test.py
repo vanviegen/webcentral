@@ -1664,7 +1664,7 @@ def test_websocket_proxy(t):
     # Connect to localhost but use ws.example.com as the Host header for routing
     client = wstool.WebSocketClient(
         'ws://ws.example.com/',
-        connect_host='127.0.0.1',
+        connect_host='localhost',
         connect_port=t.port,
         host_header='ws.example.com'
     )
@@ -1863,14 +1863,14 @@ with socketserver.TCPServer(("", PORT), HeaderEchoHandler) as httpd:
     backend_port = port_match.group(1)
 
     # Create a proxy that points to this backend
-    t.write_file('proxy-test.test/webcentral.ini', f'proxy=http://127.0.0.1:{backend_port}')
+    t.write_file('proxy-test.test/webcentral.ini', f'proxy=http://localhost:{backend_port}')
 
     # Make request through the proxy
     response = t.assert_http('proxy-test.test', '/api/data', check_code=200)
 
     # For proxy, Host header should be rewritten to the backend address
-    if f'Host: 127.0.0.1:{backend_port}' not in response:
-        raise AssertionError(f"Expected 'Host: 127.0.0.1:{backend_port}' in proxy mode, got: {response}")
+    if f'Host: localhost:{backend_port}' not in response:
+        raise AssertionError(f"Expected 'Host: localhost:{backend_port}' in proxy mode, got: {response}")
 
     # X-Forwarded-Host should contain the original host
     if 'X-Forwarded-Host: proxy-test.test' not in response:
@@ -1922,7 +1922,7 @@ with socketserver.TCPServer(("", PORT), PathHandler) as httpd:
     t.write_file('path-forward.test/webcentral.ini', f'port={backend_port}')
 
     # Create proxy
-    t.write_file('path-proxy.test/webcentral.ini', f'proxy=http://127.0.0.1:{backend_port}')
+    t.write_file('path-proxy.test/webcentral.ini', f'proxy=http://localhost:{backend_port}')
 
     # Test that both preserve paths with query strings
     forward_response = t.assert_http('path-forward.test', '/some/path?query=value', check_code=200)
