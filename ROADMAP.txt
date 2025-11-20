@@ -1,8 +1,9 @@
-- Implement HTTP/2
-- Implement HTTP/3 server using https://github.com/quinn-rs/quinn
+- When a Project shuts down or after 15 minutes of running, output some stats (at least request count, but other easy-to-gather stats would be nice as well) to its log file
 - To verify that a project is actually running, don't just check if the port is open, but make sure you get a http 2xx, 3xx or 4xx back from the server
 - Make the URL to check configurable in webcentral.ini
 - Optionally do a periodic check on that URL after the project has started, forcing a shutdown if it's no longer responding
-- When a Project shuts down or after 15 minutes of running, output some stats (at least request count, but other easy-to-gather stats would be nice as well) to its log file
+- When a proxied/forwarded request (header+body) becomes larger than 512KB, switch to streaming proxying mode to avoid buffering large requests in memory, maintain backpressure
+- For proxied/forwarded responses, always do so in a streaming fashion, maintaining a 8MB buffer with backpressure beyond that
+- Implement HTTP/3 server using https://github.com/quinn-rs/quinn
 
 For each of the above: update README.md (and add to its Changelog section) if needed.

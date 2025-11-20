@@ -95,10 +95,20 @@ impl IniMap {
     }
 
     // Fetch a value and parse it as a type
-    fn fetch_parse<T: std::str::FromStr>(&mut self, key: &str, default: T) -> T {
+    fn fetch_parse_default<T: std::str::FromStr>(&mut self, key: &str, default: T) -> T {
         self.fetch(key)
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
+    }
+
+    // Fetch a value and parse it as a type
+    fn fetch_parse<T: std::str::FromStr>(&mut self, key: &str) -> Option<T> {
+        if let Some(value) = self.fetch(key) {
+            if let Ok(parse) = value.parse() {
+                return Some(parse);
+            }
+        }
+        return None;
     }
 
     // Fetch a boolean value (true/1/yes = true, anything else = false)
@@ -155,25 +165,17 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
     // Determine project type by checking for type-specific keys
     // Priority: redirect > proxy > forward (socket/port) > application > static
     let project_type = if let Some(target) = ini_map.fetch("redirect") {
-        ProjectType::Redirect { target }
+        ProjectType::Redirect { target: target.trim_end_matches('/').to_string() }
     } else if let Some(target) = ini_map.fetch("proxy") {
         ProjectType::Proxy { target }
     } else if let Some(socket_path) = ini_map.fetch("socket_path") {
-        ProjectType::Forward {
-            port: ini_map.fetch_parse("port", 0),
-            host: ini_map
-                .fetch("host")
-                .unwrap_or_else(|| "localhost".to_string()),
-            socket_path,
-        }
-    } else if ini_map.fetch_parse::<i32>("port", 0) > 0 {
-        ProjectType::Forward {
-            port: ini_map.fetch_parse("port", 0),
-            host: ini_map
-                .fetch("host")
-                .unwrap_or_else(|| "localhost".to_string()),
-            socket_path: String::new(),
-        }
+        ProjectType::UnixForward { socket_path }
+    } else if let Some(port) = ini_map.fetch_parse::<i32>("port") {
+        let host = ini_map.fetch("host").unwrap_or_else(|| "localhost".to_string());
+        ProjectType::TcpForward { address: format!("{}:{}", host, port) }
+    } else if let Some(host) = ini_map.fetch("host") {
+        let port = ini_map.fetch_parse_default("port", 80);
+        ProjectType::TcpForward { address: format!("{}:{}", host, port) }
     } else if let Some(command) = ini_map.fetch("command") {
         let mut workers = HashMap::new();
         if let Some(worker_cmd) = ini_map.fetch("worker") {
@@ -198,7 +200,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
                     .unwrap_or_else(|| "alpine".to_string()),
                 packages: ini_map.fetch_array("docker.packages"),
                 commands: ini_map.fetch_array("docker.commands"),
-                http_port: ini_map.fetch_parse("docker.http_port", 8000),
+                http_port: ini_map.fetch_parse_default("docker.http_port", 8000),
                 app_dir: ini_map
                     .fetch("docker.app_dir")
                     .unwrap_or_else(|| "/app".to_string()),
@@ -239,7 +241,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
                     .unwrap_or_else(|| "alpine".to_string()),
                 packages: ini_map.fetch_array("docker.packages"),
                 commands: ini_map.fetch_array("docker.commands"),
-                http_port: ini_map.fetch_parse("docker.http_port", 8000),
+                http_port: ini_map.fetch_parse_default("docker.http_port", 8000),
                 app_dir: ini_map
                     .fetch("docker.app_dir")
                     .unwrap_or_else(|| "/app".to_string()),
@@ -261,7 +263,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
         redirect_https: ini_map.fetch_bool("redirect_https"),
         environment: ini_map.fetch_prefix("environment"),
         reload: ReloadConfig {
-            timeout: ini_map.fetch_parse("reload.timeout", 300),
+            timeout: ini_map.fetch_parse_default("reload.timeout", 300),
             include: ini_map.fetch_array("reload.include"),
             exclude: ini_map.fetch_array("reload.exclude"),
         },
@@ -333,19 +335,12 @@ pub enum ProjectType {
     // Static file server (serves from public/ directory)
     Static,
     // HTTP redirect
-    Redirect {
-        target: String,
-    },
+    Redirect { target: String, },
     // Reverse proxy to external URL
-    Proxy {
-        target: String,
-    },
+    Proxy { target: String },
     // Forward to local port or unix socket
-    Forward {
-        port: i32,
-        host: String,
-        socket_path: String,
-    },
+    UnixForward { socket_path: String },
+    TcpForward { address: String },
 }
 
 #[derive(Debug, Clone)]
@@ -478,3 +473,5 @@ impl ProjectConfig {
         ))
     }
 }
+
+

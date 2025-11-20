@@ -30,12 +30,12 @@ impl Logger {
         })
     }
 
-    pub fn write(&self, topic: &str, message: &str) -> Result<()> {
+    pub fn write(&self, topic: &str, message: &str) {
         let date = get_date();
 
         let mut current_date = self.current_date.lock().unwrap();
         if *current_date != date {
-            self.rotate(&date)?;
+            let _ = self.rotate(&date);
             *current_date = date.clone();
         }
         drop(current_date);
@@ -44,7 +44,7 @@ impl Logger {
 
         let msg = message.trim();
         if msg.is_empty() {
-            return Ok(());
+            return;
         }
 
         // Calculate prefix for multi-line continuation
@@ -67,11 +67,9 @@ impl Logger {
 
         let mut file = self.file.lock().unwrap();
         if let Some(ref mut f) = *file {
-            f.write_all(output.as_bytes())?;
-            f.sync_all()?;
+            let _ = f.write_all(output.as_bytes());
+            let _ = f.sync_all();
         }
-
-        Ok(())
     }
 
     fn rotate(&self, date: &str) -> Result<()> {

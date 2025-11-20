@@ -16,49 +16,51 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, RwLock};
 use tokio_rustls::TlsAcceptor;
 
 // Domain information stored in the global DOMAINS map
 struct DomainInfo {
     directory: String,
-    project: RwLock<Option<Arc<Project>>>,
-    // Notify when certificate becomes ready
-    cert_ready: Arc<Notify>,
-    // Track if certificate acquisition is in progress
-    cert_acquiring: AtomicBool,
+    project: Option<Arc<Project>>,
+    cert_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DomainInfo {
-    fn new(directory: String) -> Self {
+    fn new(directory: String, cert_task: Option<tokio::task::JoinHandle<()>>) -> Self {
         Self {
             directory,
-            project: RwLock::new(None),
-            cert_ready: Arc::new(Notify::new()),
-            cert_acquiring: AtomicBool::new(false),
+            project: None,
+            cert_task,
+        }
+    }
+}
+
+impl Drop for DomainInfo {
+    fn drop(&mut self) {
+        if let Some(cert_task) = self.cert_task.take() {
+            cert_task.abort();
         }
     }
 }
 
 lazy_static::lazy_static! {
     static ref DOMAINS: DashMap<String, DomainInfo> = DashMap::new();
-    static ref VALID_DOMAIN: Regex = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$").unwrap();
+    static ref VALID_DOMAIN: Regex = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$").unwrap();
 }
 
 // Called by Project when it shuts down to remove itself from DOMAINS
 pub async fn discard_project(domain: &str) {
-    if let Some(domain_info) = DOMAINS.get_mut(domain) {
-        *domain_info.project.write().await = None;
+    if let Some(mut domain_info) = DOMAINS.get_mut(domain) {
+        domain_info.project = None;
     }
 }
 
 // Stop all running projects (called during shutdown)
 pub async fn stop_all_projects() {
     for entry in DOMAINS.iter() {
-        if let Some(project) = entry.project.read().await.as_ref() {
+        if let Some(project) = entry.project.as_ref() {
             project.stop().await;
         }
     }
@@ -148,10 +150,6 @@ impl Server {
     }
 
     pub async fn start(self: Arc<Self>) -> Result<()> {
-        // Do initial scan to populate DOMAINS
-        let server = self.clone();
-        server.scan_all_project_directories().await;
-
         // Start directory watcher to maintain DOMAINS
         let server = self.clone();
         tokio::spawn(async move {
@@ -159,6 +157,10 @@ impl Server {
                 eprintln!("Directory watcher error: {}", e);
             }
         });
+
+        // Do initial scan to populate DOMAINS
+        let server = self.clone();
+        server.scan_all_project_directories().await;
 
         // Start HTTP server
         if self.config.http > 0 {
@@ -231,7 +233,7 @@ impl Server {
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, _addr) = listener.accept().await?;
             let acceptor = acceptor.clone();
             let server = self.clone();
 
@@ -240,7 +242,11 @@ impl Server {
                 let tls_stream = match acceptor.accept(stream).await {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("TLS handshake error: {}", e);
+                        // Only log if it's not a "no certificate" error (unconfigured domain)
+                        let err_str = e.to_string();
+                        if !err_str.contains("no server certificate chain resolved") {
+                            eprintln!("TLS handshake error: {}", e);
+                        }
                         return;
                     }
                 };
@@ -279,7 +285,7 @@ impl Server {
                         .unwrap());
                 }
             }
-            return Ok(Self::error_response(
+            return Ok(Self::make_error(
                 StatusCode::NOT_FOUND,
                 "Challenge not found",
             ));
@@ -295,7 +301,14 @@ impl Server {
         self.route_request(req, true).await
     }
 
-    fn redirect_to(url: String) -> Response<Full<Bytes>> {
+    fn make_redirect(&self, scheme: &str, project: &Project, req: &Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
+        let port_suffix = match scheme {
+            "http" if self.config.http != 80 => format!(":{}", self.config.http),
+            "https" if self.config.https != 443 => format!(":{}", self.config.https),
+            _ => String::new(),
+        };
+        let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        let url = format!("{}://{}{}{}", scheme, &project.domain, port_suffix, path);
         Response::builder()
             .status(StatusCode::MOVED_PERMANENTLY)
             .header("Location", url)
@@ -303,7 +316,7 @@ impl Server {
             .unwrap()
     }
 
-    fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+    fn make_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
         Response::builder()
             .status(status)
             .body(Full::new(Bytes::from(message.to_string())))
@@ -312,17 +325,25 @@ impl Server {
 
     async fn route_request(
         &self,
-        req: Request<hyper::body::Incoming>,
+        mut req: Request<hyper::body::Incoming>,
         from_https: bool,
     ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        let domain = match self.extract_domain(&req) {
-            Some(d) => d,
-            None => {
-                return Ok(Self::error_response(
-                    StatusCode::BAD_REQUEST,
-                    "Bad Request: Missing Host header",
-                ));
+        if let Some(host) = req.headers().get("host").and_then(|h| h.to_str().ok()) {
+            let scheme = if from_https { "https" } else { "http" };
+            let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+            let uri_string = format!("{}://{}{}", scheme, host, path_and_query);
+            if let Ok(uri) = uri_string.parse() {
+                *req.uri_mut() = uri;
             }
+        }
+
+        let domain = if let Some(d) = self.extract_domain(&req) {
+            d
+        } else {
+            return Ok(Self::make_error(
+                StatusCode::BAD_REQUEST,
+                "Bad Request: Missing Host header",
+            ));
         };
 
         let project = match self.get_project_for_domain(&domain).await {
@@ -336,21 +357,12 @@ impl Server {
                         format!("www.{}", domain)
                     };
 
-                    if let Ok(_) = self.get_project_for_domain(&alt_domain).await {
-                        let proto = if from_https { "https" } else { "http" };
-                        let redirect_url = format!(
-                            "{}://{}{}",
-                            proto,
-                            alt_domain,
-                            req.uri()
-                                .path_and_query()
-                                .map(|pq| pq.as_str())
-                                .unwrap_or("/")
-                        );
-                        return Ok(Self::redirect_to(redirect_url));
+                    if let Ok(project) = self.get_project_for_domain(&alt_domain).await {
+                        let scheme = if from_https { "https" } else { "http" };
+                        return Ok(self.make_redirect(scheme, &project, &req));
                     }
                 }
-                return Ok(Self::error_response(StatusCode::NOT_FOUND, "Not Found"));
+                return Ok(Self::make_error(StatusCode::NOT_FOUND, "Not Found"));
             }
         };
 
@@ -358,18 +370,7 @@ impl Server {
         if from_https {
             // HTTPS request - check if we should redirect to HTTP
             if project.config.redirect_https == Some(true) {
-                let redirect_url = format!(
-                    "http://{}{}",
-                    req.headers()
-                        .get("host")
-                        .and_then(|h| h.to_str().ok())
-                        .unwrap_or(&domain),
-                    req.uri()
-                        .path_and_query()
-                        .map(|pq| pq.as_str())
-                        .unwrap_or("/")
-                );
-                return Ok(Self::redirect_to(redirect_url));
+                return Ok(self.make_redirect("http", &project, &req));
             }
         } else {
             // HTTP request - check if we should redirect to HTTPS
@@ -382,18 +383,7 @@ impl Server {
             };
 
             if should_redirect {
-                let redirect_url = format!(
-                    "https://{}{}",
-                    req.headers()
-                        .get("host")
-                        .and_then(|h| h.to_str().ok())
-                        .unwrap_or(&domain),
-                    req.uri()
-                        .path_and_query()
-                        .map(|pq| pq.as_str())
-                        .unwrap_or("/")
-                );
-                return Ok(Self::redirect_to(redirect_url));
+                return Ok(self.make_redirect("https", &project, &req));
             }
         }
 
@@ -401,27 +391,18 @@ impl Server {
         match project.handle(req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
-                eprintln!("Project handle error: {}", e);
-                Ok(Self::error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal Server Error",
-                ))
+                println!("Error for {}: {}", project.domain, e);
+                project.logger.write("handler", e.to_string().as_str());
+                Ok(Self::make_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"))
             }
         }
     }
 
     fn extract_domain(&self, req: &Request<hyper::body::Incoming>) -> Option<String> {
-        let host = req.headers().get("host")?.to_str().ok()?;
-
-        // Strip port
-        let host = host.split(':').next().unwrap_or(host);
-
-        // Convert to lowercase
-        let host = host.to_lowercase();
+        let host = req.uri().host()?.to_lowercase();
 
         // Validate domain format
-        let valid_domain = Regex::new(r"^[a-zA-Z0-9.-]+$").unwrap();
-        if !valid_domain.is_match(&host) {
+        if !VALID_DOMAIN.is_match(&host) {
             return None;
         }
 
@@ -435,16 +416,16 @@ impl Server {
             .ok_or_else(|| anyhow::anyhow!("Domain not found: {}", domain))?;
 
         // Check if project already exists
-        {
-            let project_guard = domain_info.project.read().await;
-            if let Some(project) = project_guard.as_ref() {
-                return Ok(project.clone());
-            }
+        if let Some(project) = domain_info.project.as_ref() {
+            return Ok(project.clone());
         }
+        
+        // Need to drop the ref to get mutable access
+        drop(domain_info);
 
         // Create or recreate project
         let project = project::create_project(
-            &PathBuf::from(&domain_info.directory),
+            &PathBuf::from(&DOMAINS.get(domain).unwrap().directory),
             domain.to_string(),
             self.config.firejail,
             self.config.prune_logs,
@@ -452,22 +433,34 @@ impl Server {
         .await?;
 
         // Store in domain info
-        {
-            let mut project_guard = domain_info.project.write().await;
-            *project_guard = Some(project.clone());
+        if let Some(mut domain_info) = DOMAINS.get_mut(domain) {
+            domain_info.project = Some(project.clone());
         }
 
         Ok(project)
     }
 
-    async fn add_domain(
-        &self,
-        domain: String,
-        directory: String,
+    // Process a directory path, validating domain and setting up project + certificate
+    async fn process_project_directory(
+        self: &Arc<Self>,
+        path: &std::path::Path,
         bindings: Option<&HashSet<String>>,
     ) {
+        if !path.is_dir() {
+            return; // It's a file
+        }
+        let Some(domain_name) = path.file_name().and_then(|n| n.to_str()) else {
+            return; // Shouldn't happen?
+        };
+        if !VALID_DOMAIN.is_match(domain_name) {
+            return; // It doesn't look like a domain name
+        }
+        
+        let directory = path.to_string_lossy().to_string();
+        let domain = domain_name.to_lowercase();
+        
+        // Check if domain exists and if transfer is allowed
         if let Some(existing) = DOMAINS.get(&domain) {
-            // Domain exists - check if transfer is allowed
             let existing_dir_gone = !std::path::Path::new(&existing.directory).exists();
             let authorized = bindings.map_or(false, |b| b.contains(&directory));
             if !existing_dir_gone && !authorized {
@@ -489,35 +482,20 @@ impl Server {
                 }
             );
         }
-        DOMAINS.insert(domain, DomainInfo::new(directory));
-    }
+        
+        
+        // Start certificate management task if HTTPS is enabled
+        let cert_task = if self.cert_manager.is_some() {
+            let server = self.clone();
+            let domain = domain.clone();
+            Some(tokio::spawn(async move {
+                server.manage_certificate(domain).await;
+            }))
+        } else {
+            None
+        };
 
-    // Process a directory path, validating domain and setting up project + certificate
-    async fn process_project_directory(
-        self: &Arc<Self>,
-        path: &std::path::Path,
-        bindings: Option<&HashSet<String>>,
-    ) {
-        if !path.is_dir() {
-            return;
-        }
-
-        if let Some(domain) = path.file_name().and_then(|n| n.to_str()) {
-            if VALID_DOMAIN.is_match(domain) {
-                let directory = path.to_string_lossy().to_string();
-                let domain = domain.to_lowercase();
-                self.add_domain(domain.clone(), directory, bindings).await;
-
-                // Start certificate acquisition in background if HTTPS enabled
-                if self.cert_manager.is_some() {
-                    let server = self.clone();
-                    let domain = domain.clone();
-                    tokio::spawn(async move {
-                        server.acquire_certificate_for_domain(&domain).await;
-                    });
-                }
-            }
-        }
+        DOMAINS.insert(domain, DomainInfo::new(directory, cert_task));
     }
 
     async fn scan_all_project_directories(self: Arc<Self>) {
@@ -601,52 +579,60 @@ impl Server {
         Ok(())
     }
 
-    async fn acquire_certificate_for_domain(&self, domain: &str) {
-        // Check if already being acquired using compare-and-swap
-        let domain_info = match DOMAINS.get(domain) {
-            Some(info) => info,
-            None => return,
-        };
+    async fn manage_certificate(&self, domain: String) {
+        let cert_manager = self.cert_manager.as_ref().unwrap();
+        
+        loop {
+            // 1. Check certificate status
+            let now = std::time::SystemTime::now();
+            
+            // Determine if we need to acquire a certificate
+            // If we have a valid certificate, we will sleep and continue the loop
+            // If we need to acquire, we will break out of this match and proceed to acquisition
+            match cert_manager.get_certificate_expiration(&domain) {
+                Ok(expiration) => {
+                    if let Ok(duration_until_expiry) = expiration.duration_since(now) {
+                        // Renew if expires in < 8 days
+                        if duration_until_expiry < std::time::Duration::from_secs(8 * 24 * 60 * 60) {
+                            println!("Certificate for {} expires in {:?}, renewing...", domain, duration_until_expiry);
+                            // Acquire!
+                        } else {
+                            // Valid certificate, sleep until renewal time (expiration - 7 days)
+                            let sleep_time = duration_until_expiry - to_jittered_duration(7 * 24 * 60 * 60);
+                            println!("Certificate for {} is valid. Sleeping for {}s", domain, sleep_time.as_secs());
+                            tokio::time::sleep(sleep_time).await;
+                            continue; // Do not acquire
+                        }
+                    } else {
+                        // Already expired - acquire!
+                        println!("Certificate for {} has expired", domain);
+                    }
+                }
+                Err(_) => {
+                    // No certificate or invalid - acquire!
+                }
+            };
 
-        // Try to set cert_acquiring from false to true atomically
-        if domain_info
-            .cert_acquiring
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            // Already being acquired
-            return;
-        }
-
-        let cert_manager = match &self.cert_manager {
-            Some(cm) => cm,
-            None => {
-                domain_info.cert_acquiring.store(false, Ordering::SeqCst);
-                return;
+            let mut backoff_time = 15 * 60; // 15 minutes
+            loop {
+                match cert_manager.acquire_certificate(&domain).await {
+                    Ok(_) => {
+                        println!("Successfully acquired certificate for {}", domain);
+                        break; // Go back to outer loop to check expiration and sleep
+                    }
+                    Err(e) => {
+                        // Add +/- 10% jitter
+                        let sleep_time = to_jittered_duration(backoff_time);
+                        if backoff_time < 12*60*60 { // 15m, 1h, 4h, 16h
+                            backoff_time *= 4;
+                        }
+                        
+                        eprintln!("Failed to acquire certificate for {}: {} (retrying in {}s)", domain, e, sleep_time.as_secs());
+                        tokio::time::sleep(sleep_time).await;
+                    }
+                }
             }
-        };
-
-        // Check if certificate already exists
-        if cert_manager.has_certificate(domain) {
-            // Notify any waiters
-            domain_info.cert_ready.notify_waiters();
-            domain_info.cert_acquiring.store(false, Ordering::SeqCst);
-            return;
         }
-
-        // Acquire certificate using ACME
-        match cert_manager.acquire_certificate(domain).await {
-            Ok(_) => {
-                // Notify any waiters that certificate is ready
-                domain_info.cert_ready.notify_waiters();
-            }
-            Err(e) => {
-                eprintln!("Failed to acquire certificate for {}: {}", domain, e);
-            }
-        }
-
-        // Mark as no longer acquiring
-        domain_info.cert_acquiring.store(false, Ordering::SeqCst);
     }
 
     pub async fn stop(&self) {
@@ -670,19 +656,20 @@ impl rustls::server::ResolvesServerCert for CertResolver {
         let domain: &str = server_name.as_ref();
 
         // Check if domain exists in DOMAINS
-        if let Some(domain_info) = DOMAINS.get(domain) {
-            // Check if certificate is currently being acquired
-            if domain_info.cert_acquiring.load(Ordering::SeqCst) {
-                eprintln!(
-                    "Certificate for {} is still being acquired, connection will be closed",
-                    domain
-                );
-                return None;
-            }
+        if !DOMAINS.contains_key(domain) {
+            // Domain not configured
+            eprintln!("Unconfigured domain: {}", domain);
+            return None;
         }
 
         // Load certificate for the requested domain
-        let (certs, key) = self.cert_manager.get_certificate(domain).ok()?;
+        let (certs, key) = match self.cert_manager.get_certificate(domain) {
+            Ok(cert) => cert,
+            Err(_) => {
+                eprintln!("HTTPS request for {} but no certificate is available yet", domain);
+                return None;
+            }
+        };
 
         let signing_key = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key).ok()?;
 
@@ -691,4 +678,11 @@ impl rustls::server::ResolvesServerCert for CertResolver {
             signing_key,
         )))
     }
+}
+
+fn to_jittered_duration(seconds: i32) -> std::time::Duration {
+    use rand::Rng;
+    std::time::Duration::from_secs(
+        ((seconds as f64 * rand::rng().random_range(0.9..=1.1)).max(0.0)).round() as u64,
+    )
 }

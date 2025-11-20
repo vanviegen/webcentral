@@ -7,17 +7,17 @@ A reverse proxy that runs multiple web applications on a single server. Just put
 
 ### Files
 
-`main.rs` - Entry point, command-line args, starts server, handles shutdown
+`src/main.rs` - Entry point, command-line args, starts server, handles shutdown
 
-`server.rs` - HTTP/HTTPS listeners, ACME certificate management, domain routing, www/HTTPS redirects, directory watching
+`src/server.rs` - HTTP/HTTPS listeners, ACME certificate management, domain routing, www/HTTPS redirects, directory watching
 
-`project.rs` - Per-domain lifecycle manager supporting: applications (Firejail/Docker), static files, redirects, proxies, forwards. Handles file watching, auto-reload, inactivity timeouts, URL rewrites
+`src/project.rs` - Per-domain lifecycle manager supporting: applications (Firejail/Docker), static files, redirects, proxies, forwards. Handles file watching, auto-reload, inactivity timeouts, URL rewrites
 
-`logger.rs` - Daily-rotated logs with configurable retention
+`src/logger.rs` - Daily-rotated logs with configurable retention
 
-`config.rs` - Parses `webcentral.ini`, `Procfile`, and `package.json`
+`src/config.rs` - Parses `webcentral.ini`, `Procfile`, and `package.json`
 
-`acme.rs` - ACME/Let's Encrypt certificate acquisition using HTTP-01 challenges
+`src/acme.rs` - ACME/Let's Encrypt certificate acquisition using HTTP-01 challenges
 
 `test.py` - Test suite and harness
 
