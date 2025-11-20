@@ -1,10 +1,11 @@
 use crate::logger::Logger;
-use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
+use crate::project_config::{ConnectionTarget, DockerConfig, ProjectConfig, ProjectType};
 use anyhow::Result;
 use bytes::Bytes;
+use http::Uri;
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request, Response};
-use hyper_util::client::legacy::connect::{Connect, HttpConnector};
+use hyper_util::client::legacy::connect::{HttpConnector, Connection, Connected};
 use hyper_util::{
     client::legacy::Client,
     rt::{TokioExecutor, TokioIo},
@@ -16,12 +17,16 @@ use std::fs;
 use std::net::TcpStream;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::future::Future;
+use std::task::{Context as TaskContext, Poll};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, AsyncRead, AsyncWrite};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+use tower::Service;
 
 lazy_static::lazy_static! {
      static ref HTTP_CLIENT: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http(); 
@@ -49,11 +54,11 @@ pub async fn create_project(
         ProjectType::Proxy { target } => {
             &format!("Proxy to {}", target)
         }
-        ProjectType::ForwardUnix { description, .. } => {
-            &format!("Forward to {}", description)
+        ProjectType::TcpForward { address } => {
+            &format!("Forward to port {}", address)
         }
-        ProjectType::ForwardTcp { description, .. } => {
-            &format!("Forward to {}", description)
+        ProjectType::UnixForward { socket_path } => {
+            &format!("Forward to unix socket {}", socket_path)
         }
         ProjectType::Application { .. } => {
             "Application server"
@@ -69,6 +74,23 @@ pub async fn create_project(
         logger.write("config", err);
     }
 
+    // Determine connection target
+    let connection_target = match &config.project_type {
+        ProjectType::Application { connection_target, .. } => connection_target.clone(),
+        ProjectType::Forward { connection_target, .. } => connection_target.clone(),
+        _ => ConnectionTarget::Standard,
+    };
+
+    // Create connector
+    let connector = match connection_target {
+        ConnectionTarget::Unix(path) => TargetedConnector::Unix(path),
+        ConnectionTarget::Tcp(addr) => TargetedConnector::Tcp(addr),
+        ConnectionTarget::Standard => TargetedConnector::Standard(HttpConnector::new()),
+    };
+
+    // Create HTTP client
+    let http_client = Client::builder(TokioExecutor::new()).build(connector.clone());
+
     let project = Arc::new(Project {
         domain: domain.clone(),
         dir: dir.to_string_lossy().to_string(),
@@ -81,6 +103,8 @@ pub async fn create_project(
         process: Arc::new(Mutex::new(None)),
         workers: Arc::new(Mutex::new(Vec::new())),
         last_activity: Arc::new(Mutex::new(Instant::now())),
+        http_client,
+        connector,
     });
 
     // Start file watcher
@@ -127,6 +151,8 @@ pub struct Project {
     process: Arc<Mutex<Option<tokio::process::Child>>>,
     workers: Arc<Mutex<Vec<tokio::process::Child>>>,
     last_activity: Arc<Mutex<Instant>>,
+    http_client: Client<TargetedConnector, Full<Bytes>>,
+    connector: TargetedConnector,
 }
 
 impl Project {
@@ -155,8 +181,7 @@ impl Project {
         match &self.config.project_type {
             ProjectType::Redirect { target } => self.handle_redirect(req, target).await,
             ProjectType::Proxy { target } => self.proxy_request(req, target).await,
-            ProjectType::ForwardUnix { http_client, .. } => self.forward_request(req, http_client).await,
-            ProjectType::ForwardTcp { http_client, .. } => self.forward_request(req, http_client).await,
+            ProjectType::Forward { .. } => self.forward_request(req).await,
             ProjectType::Application { .. } => self.handle_application(req).await,
             ProjectType::Static => self.handle_static(req).await,
         }
@@ -219,7 +244,7 @@ impl Project {
 
     async fn proxy_request(
         &self,
-        req: Request<Incoming>,
+        mut req: Request<Incoming>,
         target: &str,
     ) -> Result<Response<Full<Bytes>>> {
         // Parse target URL
@@ -238,7 +263,8 @@ impl Project {
         // Check if this is a WebSocket upgrade request
         let is_upgrade = is_upgrade_request(&req);
         if is_upgrade {
-            return self.proxy_upgrade(req, uri).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e));
+            *req.uri_mut() = uri;
+            return self.proxy_upgrade(req).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e));
         }
 
         // Collect the incoming body first
@@ -320,19 +346,22 @@ impl Project {
         Ok(response.body(Full::new(resp_bytes))?)
     }
 
-    async fn forward_request<C>(
+    async fn forward_request(
         &self,
         req: Request<Incoming>,
-        client: &Client<C, Full<Bytes>>,
     ) -> Result<Response<Full<Bytes>>>
-    where
-        C: Connect + Clone + Send + Sync + 'static,
     {
+                
+        // Check if this is a WebSocket upgrade request
+        if is_upgrade_request(&req) {
+            return self.proxy_upgrade(req).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e));
+        }
+
         let (parts, body) = req.into_parts();
         let body_bytes = body.collect().await?.to_bytes();
         let req = Request::from_parts(parts, Full::new(body_bytes));
 
-        let resp = client.request(req).await?;
+        let resp = self.http_client.request(req).await?;
 
         let (parts, body) = resp.into_parts();
         let body_bytes = body.collect().await?.to_bytes();
@@ -340,34 +369,15 @@ impl Project {
         Ok(Response::from_parts(parts, Full::new(body_bytes)))
     }
 
-    async fn handle_application(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    async fn handle_application(&self, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         // Wait for port to be available (with timeout)
         let port = self.wait_for_port().await?;
-
-        // Proxy to application
-        let target = format!("http://localhost:{}", port);
         
-        // We need to construct the full URI: target + path + query
-        let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-        let uri_string = format!("{}{}", target, path_and_query);
-        let uri: hyper::Uri = uri_string.parse()?;
+        // Rewrite URI to point to localhost:port
+        let uri_string = format!("http://127.0.0.1:{}{}", port, req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+        *req.uri_mut() = uri_string.parse()?;
 
-        // Check if this is a WebSocket upgrade request
-        if is_upgrade_request(&req) {
-            return self.proxy_upgrade(req, uri).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e));
-        }
-
-        let (mut parts, body) = req.into_parts();
-        parts.uri = uri;
-        let req = Request::from_parts(parts, body);
-
-        // Get client from config
-        let client = match &self.config.project_type {
-            ProjectType::Application { http_client, .. } => http_client,
-            _ => unreachable!(),
-        };
-
-        self.forward_request(req, client).await
+        self.forward_request(req).await
     }
 
     async fn wait_for_port(&self) -> Result<u16> {
@@ -909,13 +919,7 @@ impl Project {
     async fn proxy_upgrade(
         &self,
         req: Request<Incoming>,
-        target_uri: hyper::Uri,
     ) -> Result<Response<Full<Bytes>>> {
-        let host = target_uri.host().unwrap_or("localhost").to_string();
-        let port = target_uri.port_u16().unwrap_or(80);
-        let addr = format!("{}:{}", host, port);
-        println!("Upgrading target_uri={} addr={}", target_uri, addr);
-
         let method = req.method().clone();
         let path = req
             .uri()
@@ -925,14 +929,15 @@ impl Project {
             .to_string();
         let headers = req.headers().clone();
         let logger = self.logger.clone();
+        let uri = req.uri().clone();
 
         // Get the upgrade future before we return a response
         let upgrade_fut = hyper::upgrade::on(req);
 
-        // Connect to backend and send upgrade request
-        let mut backend = tokio::net::TcpStream::connect(&addr)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to backend {}: {}", addr, e))?;
+        // Connect to backend
+        let mut connector = self.connector.clone();
+        let io = connector.call(uri).await?;
+        let mut backend = io.into_inner();
 
         // Build and send the upgrade request to backend
         let mut buf = Vec::new();
@@ -1138,4 +1143,104 @@ fn matches_pattern(path: &str, pattern: &str) -> bool {
     path == pattern
         || path.starts_with(&format!("{}/", pattern))
         || path.split('/').any(|part| part == pattern)
+}
+
+#[derive(Clone, Debug)]
+pub enum TargetedConnector {
+    Unix(String),
+    Tcp(String),
+    Standard(HttpConnector),
+}
+
+impl tower::Service<Uri> for TargetedConnector {
+    type Response = TokioIo<ProjectStream>;
+    type Error = std::io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        match self {
+            TargetedConnector::Standard(connector) => connector.poll_ready(cx).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+            _ => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn call(&mut self, req: Uri) -> Self::Future {
+        match self {
+            TargetedConnector::Unix(path) => {
+                let path = path.clone();
+                Box::pin(async move {
+                    let stream = tokio::net::UnixStream::connect(path).await?;
+                    Ok(TokioIo::new(ProjectStream::Unix(stream)))
+                })
+            }
+            TargetedConnector::Tcp(addr) => {
+                let addr = addr.clone();
+                Box::pin(async move {
+                    let stream = tokio::net::TcpStream::connect(addr).await?;
+                    Ok(TokioIo::new(ProjectStream::Tcp(stream)))
+                })
+            }
+            TargetedConnector::Standard(connector) => {
+                let fut = connector.call(req);
+                Box::pin(async move {
+                    let stream = fut.await.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    Ok(TokioIo::new(ProjectStream::Tcp(stream.into_inner())))
+                })
+            }
+        }
+    }
+}
+
+pub enum ProjectStream {
+    Unix(tokio::net::UnixStream),
+    Tcp(tokio::net::TcpStream),
+}
+
+impl AsyncRead for ProjectStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ProjectStream::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            ProjectStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ProjectStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            ProjectStream::Unix(s) => Pin::new(s).poll_write(cx, buf),
+            ProjectStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ProjectStream::Unix(s) => Pin::new(s).poll_flush(cx),
+            ProjectStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ProjectStream::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            ProjectStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+impl Connection for ProjectStream {
+    fn connected(&self) -> Connected {
+        match self {
+            ProjectStream::Unix(_) => Connected::new(),
+            ProjectStream::Tcp(_) => Connected::new(),
+        }
+    }
 }
