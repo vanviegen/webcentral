@@ -325,17 +325,25 @@ impl Server {
 
     async fn route_request(
         &self,
-        req: Request<hyper::body::Incoming>,
+        mut req: Request<hyper::body::Incoming>,
         from_https: bool,
     ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        let domain = match self.extract_domain(&req) {
-            Some(d) => d,
-            None => {
-                return Ok(Self::make_error(
-                    StatusCode::BAD_REQUEST,
-                    "Bad Request: Missing Host header",
-                ));
+        if let Some(host) = req.headers().get("host").and_then(|h| h.to_str().ok()) {
+            let scheme = if from_https { "https" } else { "http" };
+            let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+            let uri_string = format!("{}://{}{}", scheme, host, path_and_query);
+            if let Ok(uri) = uri_string.parse() {
+                *req.uri_mut() = uri;
             }
+        }
+
+        let domain = if let Some(d) = self.extract_domain(&req) {
+            d
+        } else {
+            return Ok(Self::make_error(
+                StatusCode::BAD_REQUEST,
+                "Bad Request: Missing Host header",
+            ));
         };
 
         let project = match self.get_project_for_domain(&domain).await {
@@ -391,13 +399,7 @@ impl Server {
     }
 
     fn extract_domain(&self, req: &Request<hyper::body::Incoming>) -> Option<String> {
-        let host = req.headers().get("host")?.to_str().ok()?;
-
-        // Strip port
-        let host = host.split(':').next().unwrap_or(host);
-
-        // Convert to lowercase
-        let host = host.to_lowercase();
+        let host = req.uri().host()?.to_lowercase();
 
         // Validate domain format
         if !VALID_DOMAIN.is_match(&host) {

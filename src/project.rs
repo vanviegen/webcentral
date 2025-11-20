@@ -182,8 +182,8 @@ impl Project {
         match &self.config.project_type {
             ProjectType::Redirect { target } => self.handle_redirect(req, target).await,
             ProjectType::Proxy { target } => self.proxy_request(req, target).await,
-            ProjectType::TcpForward { address } => self.handle_forward(req, address).await,
-            ProjectType::UnixForward { socket_path } => self.handle_unix_forward(req, socket_path).await,
+            ProjectType::TcpForward { .. } => self.forward_request(req).await,
+            ProjectType::UnixForward { .. } => self.forward_request(req).await,
             ProjectType::Application { .. } => self.handle_application(req).await,
             ProjectType::Static => self.handle_static(req).await,
         }
@@ -282,10 +282,13 @@ impl Project {
     ) -> Result<Response<Full<Bytes>>>
     {
         // Check if this is a WebSocket upgrade request
+        println!("Forwarding request: {} {}", req.method(), req.uri());
         if is_upgrade_request(&req) {
+            println!("Handling upgrade request");
             return self.proxy_upgrade(req).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e));
         }
 
+        // TODO: do we need this conversion from body to Full here?
         let (parts, body) = req.into_parts();
         let body_bytes = body.collect().await?.to_bytes();
         let req = Request::from_parts(parts, Full::new(body_bytes));
@@ -304,22 +307,6 @@ impl Project {
 
         // Rewrite URI to point to localhost:port
         let uri_string = format!("http://127.0.0.1:{}{}", port, req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
-        *req.uri_mut() = uri_string.parse()?;
-
-        self.forward_request(req).await
-    }
-
-    async fn handle_forward(&self, mut req: Request<Incoming>, address: &str) -> Result<Response<Full<Bytes>>> {
-        // Rewrite URI to absolute form for TCP forward
-        let uri_string = format!("http://{}{}", address, req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
-        *req.uri_mut() = uri_string.parse()?;
-
-        self.forward_request(req).await
-    }
-
-    async fn handle_unix_forward(&self, mut req: Request<Incoming>, _socket_path: &str) -> Result<Response<Full<Bytes>>> {
-        // For Unix sockets, use a dummy host in the URI since the connector will use the socket path
-        let uri_string = format!("http://localhost{}", req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
         *req.uri_mut() = uri_string.parse()?;
 
         self.forward_request(req).await
