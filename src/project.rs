@@ -1,11 +1,14 @@
 use crate::logger::Logger;
-use crate::project_config::{ConnectionTarget, DockerConfig, ProjectConfig, ProjectType};
+use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
+use crate::streams::AnyConnector;
+use tower::Service;
+
 use anyhow::Result;
 use bytes::Bytes;
-use http::{HeaderValue, Uri};
+use http::{HeaderValue};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request, Response};
-use hyper_util::client::legacy::connect::{HttpConnector, Connection, Connected};
+use hyper_util::client::legacy::connect::{HttpConnector};
 use hyper_util::{
     client::legacy::Client,
     rt::{TokioExecutor, TokioIo},
@@ -14,7 +17,7 @@ use nix::unistd::Uid;
 use notify::{Event as NotifyEvent, RecursiveMode, Watcher};
 use regex::Regex;
 use std::fs;
-use std::net::TcpStream;
+use std::net::TcpStream as StdTcpStream;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -23,12 +26,14 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tower::Service;
 
 lazy_static::lazy_static! {
-     static ref DEFAULT_HTTP_CLIENT: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http(); 
-     static ref DEFAULT_CONNECTOR: HttpConnector = HttpConnector::new();
+     static ref DEFAULT_HTTP_CLIENT: Client<AnyConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(AnyConnector::Http(HttpConnector::new()));
+     static ref DEFAULT_CONNECTOR: AnyConnector = AnyConnector::Http(HttpConnector::new());
 }
+
+
+// --- Project ---
 
 pub async fn create_project(
     dir: &Path,
@@ -57,17 +62,17 @@ pub async fn create_project(
             &format!("Proxy to {}", target)
         }
         ProjectType::TcpForward { address } => {
-            custom_connector = Some(FixedTcpHttpConnector::new(address.clone()));
+            custom_connector = Some(AnyConnector::FixedTcp(address.clone()));
             &format!("Forward to port {}", address)
         }
         ProjectType::UnixForward { socket_path } => {
-            custom_connector = Some(FixedUnixHttpConnector::new(socket_path.clone()));
+            custom_connector = Some(AnyConnector::FixedUnix(socket_path.clone()));
             &format!("Forward to unix socket {}", socket_path)
         }
         ProjectType::Application { .. } => {
             port = get_free_port()?;
-            let addr = &format!("127.0.0.1:{}", port);
-            custom_connector = Some(FixedTcpHttpConnector::new(addr.clone()));
+            let addr = format!("127.0.0.1:{}", port);
+            custom_connector = Some(AnyConnector::FixedTcp(addr.clone()));
             &format!("Application server on {}", addr)
         }
         ProjectType::Static => {
@@ -81,16 +86,10 @@ pub async fn create_project(
         logger.write("config", err);
     }
 
-    let http_client = if let Some(connector) = custom_connector {
-        Client::builder(TokioExecutor::new()).build(connector)
-    } else {
-        DEFAULT_HTTP_CLIENT
-    };
-    
     let connector = if let Some(connector) = custom_connector {
         connector
     } else {
-        DEFAULT_CONNECTOR
+        DEFAULT_CONNECTOR.clone()
     };
     
     let project = Arc::new(Project {
@@ -153,8 +152,8 @@ pub struct Project {
     process: Arc<Mutex<Option<tokio::process::Child>>>,
     workers: Arc<Mutex<Vec<tokio::process::Child>>>,
     last_activity: Arc<Mutex<Instant>>,
-    http_client: Client<TODO, Full<Bytes>>,
-    connector: TODO,
+    http_client: Client<AnyConnector, Full<Bytes>>,
+    connector: AnyConnector,
 }
 
 impl Project {
@@ -843,6 +842,8 @@ impl Project {
         req: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>> {
         let method = req.method().clone();
+        let uri = req.uri().clone();
+        let headers = req.headers().clone();
         let logger = self.logger.clone();
 
         // Get the upgrade future before we return a response
@@ -850,21 +851,20 @@ impl Project {
 
         // Connect to backend
         let mut connector = self.connector.clone();
-        let io = connector.call(req.uri()).await?;
-        let mut backend = io.into_inner();
+        let io = connector.call(uri.clone()).await.map_err(|e| anyhow::anyhow!("Connector error: {}", e))?;
+        let mut backend = io.into_tokio();
 
         // Build and send the upgrade request to backend
         let mut buf = Vec::new();
         use std::io::Write;
 
-        let path = req
-            .uri()
+        let path = uri
             .path_and_query()
             .map(|p| p.as_str())
             .unwrap_or("/")
             .to_string();
         write!(&mut buf, "{} {} HTTP/1.1\r\n", method, path).unwrap();
-        for (name, value) in req.headers() {
+        for (name, value) in &headers {
             write!(&mut buf, "{}: ", name).unwrap();
             buf.extend_from_slice(value.as_bytes());
             buf.extend_from_slice(b"\r\n");
@@ -997,7 +997,7 @@ async fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
-        if TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+        if StdTcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
             return true;
         }
         sleep(Duration::from_millis(200)).await;
@@ -1064,4 +1064,3 @@ fn matches_pattern(path: &str, pattern: &str) -> bool {
         || path.starts_with(&format!("{}/", pattern))
         || path.split('/').any(|part| part == pattern)
 }
-

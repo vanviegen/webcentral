@@ -3,6 +3,7 @@ mod logger;
 mod project;
 mod project_config;
 mod server;
+mod streams;
 
 use anyhow::Result;
 use clap::Parser;
