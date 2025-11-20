@@ -67,7 +67,6 @@ impl CertManager {
 
     pub async fn acquire_certificate(&self, domain: &str) -> Result<()> {
         println!("Acquiring certificate for {}", domain);
-        let start = std::time::Instant::now();
 
         let account = self.get_or_create_account().await?;
 
@@ -75,18 +74,18 @@ impl CertManager {
         let mut order = account
             .new_order(&NewOrder::new(&[Identifier::Dns(domain.to_string())]))
             .await
-            .context("Failed to create new order")?;
+            .with_context(|| format!("Failed to create new ACME order for {}", domain))?;
 
         // Get authorizations
         let mut authorizations = order.authorizations();
 
         while let Some(result) = authorizations.next().await {
-            let mut authz = result?;
+            let mut authz = result.with_context(|| format!("Failed to get authorization for {}", domain))?;
 
             // Find HTTP-01 challenge
             let mut challenge = authz
                 .challenge(ChallengeType::Http01)
-                .context("No HTTP-01 challenge found")?;
+                .with_context(|| format!("No HTTP-01 challenge found for {}", domain))?;
 
             let token = &challenge.token;
             let key_auth = challenge.key_authorization();
@@ -98,24 +97,33 @@ impl CertManager {
             }
 
             // Tell ACME server we're ready
-            challenge.set_ready().await?;
+            challenge.set_ready().await.with_context(|| format!("Failed to set challenge ready for {}", domain))?;
         }
 
-        // Clear challenges
+        // Wait for order to be ready (this is when ACME server validates the challenges)
+        use instant_acme::RetryPolicy;
+        order
+            .poll_ready(&RetryPolicy::default())
+            .await
+            .context("Failed to poll order ready - this usually means the HTTP-01 challenge failed. Check that DNS points to this server and port 80 is accessible.")?;
+
+        // Now we can clear challenges since validation is complete
         {
             let mut challenges = self.challenges.write().await;
             challenges.clear();
         }
 
-        // Wait for order to be ready, then finalize
-        use instant_acme::RetryPolicy;
-        order.poll_ready(&RetryPolicy::default()).await?;
-
         // Finalize order - this generates the private key and returns it
-        let private_key_pem = order.finalize().await?;
+        let private_key_pem = order
+            .finalize()
+            .await
+            .context("Failed to finalize order - the order may be in an invalid state")?;
 
         // Poll for certificate
-        let cert_chain_pem = order.poll_certificate(&RetryPolicy::default()).await?;
+        let cert_chain_pem = order
+            .poll_certificate(&RetryPolicy::default())
+            .await
+            .context("Failed to poll for certificate")?;
 
         // Save certificate and key
         let cert_path = self
@@ -127,11 +135,6 @@ impl CertManager {
         fs::write(&cert_path, &cert_chain_pem)?;
         fs::write(&key_path, &private_key_pem)?;
 
-        println!(
-            "  {}: Certificate acquired (took {:?})",
-            domain,
-            start.elapsed()
-        );
         Ok(())
     }
 
@@ -161,17 +164,38 @@ impl CertManager {
         Ok((certs, key))
     }
 
-    pub fn has_certificate(&self, domain: &str) -> bool {
-        let cert_path = self
-            .config_dir
-            .join("certs")
-            .join(format!("{}.pem", domain));
-        let key_path = self.config_dir.join("keys").join(format!("{}.pem", domain));
-        cert_path.exists() && key_path.exists()
-    }
+
 
     pub async fn get_challenge(&self, token: &str) -> Option<String> {
         let challenges = self.challenges.read().await;
         challenges.get(token).map(|(_, key_auth)| key_auth.clone())
+    }
+
+    pub fn get_certificate_expiration(&self, domain: &str) -> Result<std::time::SystemTime> {
+        let cert_path = self
+            .config_dir
+            .join("certs")
+            .join(format!("{}.pem", domain));
+
+        if !cert_path.exists() {
+            anyhow::bail!("Certificate not found for domain: {}", domain);
+        }
+
+        let cert_data = fs::read(&cert_path)?;
+        let (_, pem) = x509_parser::pem::parse_x509_pem(&cert_data)
+            .map_err(|e| anyhow::anyhow!("Failed to parse PEM: {}", e))?;
+        
+        let cert = pem.parse_x509()
+            .map_err(|e| anyhow::anyhow!("Failed to parse X.509 certificate: {}", e))?;
+
+        // Convert ASN.1 time to SystemTime
+        // x509-parser returns ASN1Time, which has a to_datetime() method returning OffsetDateTime
+        // We need to convert that to SystemTime
+        let expiration = cert.validity().not_after.to_datetime();
+        
+        // Convert time::OffsetDateTime to std::time::SystemTime
+        let system_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(expiration.unix_timestamp() as u64);
+        
+        Ok(system_time)
     }
 }

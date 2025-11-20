@@ -4,6 +4,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request, Response};
+use hyper_util::client::legacy::connect::{Connect, HttpConnector};
 use hyper_util::{
     client::legacy::Client,
     rt::{TokioExecutor, TokioIo},
@@ -12,17 +13,19 @@ use nix::unistd::Uid;
 use notify::{Event as NotifyEvent, RecursiveMode, Watcher};
 use regex::Regex;
 use std::fs;
-use std::future::Future;
 use std::net::TcpStream;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+
+lazy_static::lazy_static! {
+     static ref HTTP_CLIENT: Client<HttpConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http(); 
+}
 
 pub async fn create_project(
     dir: &Path,
@@ -39,42 +42,38 @@ pub async fn create_project(
     let logger = Arc::new(Logger::new(log_dir, uid, gid, prune_logs)?);
 
     // Log project type
-    match &config.project_type {
+    let descr = match &config.project_type {
         ProjectType::Redirect { target } => {
-            logger.write("", &format!("Redirect to {}", target))?;
+            &format!("Redirect to {}", target)
         }
         ProjectType::Proxy { target } => {
-            logger.write("", &format!("Proxy to {}", target))?;
+            &format!("Proxy to {}", target)
         }
-        ProjectType::Forward {
-            socket_path,
-            host,
-            port,
-        } => {
-            if !socket_path.is_empty() {
-                logger.write("", &format!("Forward to socket {}", socket_path))?;
-            } else {
-                logger.write("", &format!("Forward to http://{}:{}", host, port))?;
-            }
+        ProjectType::ForwardUnix { description, .. } => {
+            &format!("Forward to {}", description)
+        }
+        ProjectType::ForwardTcp { description, .. } => {
+            &format!("Forward to {}", description)
         }
         ProjectType::Application { .. } => {
-            // Will log when process starts
+            "Application server"
         }
         ProjectType::Static => {
-            logger.write("", "Static file server")?;
+            "Static file server"
         }
-    }
+    };
+    logger.write("", descr);
 
     // Log configuration errors
     for err in &config.config_errors {
-        logger.write("config", err)?;
+        logger.write("config", err);
     }
 
     let project = Arc::new(Project {
         domain: domain.clone(),
         dir: dir.to_string_lossy().to_string(),
         config: Arc::new(config.clone()),
-        logger: logger.clone(),
+        logger,
         uid,
         gid,
         use_firejail,
@@ -117,10 +116,10 @@ pub async fn create_project(
 
 #[derive(Debug)]
 pub struct Project {
-    domain: String,
-    dir: String,
     pub config: Arc<ProjectConfig>,
-    logger: Arc<Logger>,
+    pub logger: Arc<Logger>,
+    pub domain: String,
+    dir: String,
     uid: u32,
     gid: u32,
     use_firejail: bool,
@@ -135,20 +134,11 @@ impl Project {
         matches!(self.config.project_type, ProjectType::Application { .. })
     }
 
-    pub fn handle<'a>(
-        &'a self,
-        req: Request<Incoming>,
-    ) -> Pin<Box<dyn Future<Output = Result<Response<Full<Bytes>>>> + Send + 'a>> {
-        Box::pin(async move { self.handle_impl(req).await })
-    }
-
-    async fn handle_impl(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    pub async fn handle(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         *self.last_activity.lock().await = Instant::now();
 
         if self.config.log_requests {
-            let _ = self
-                .logger
-                .write("", &format!("{} {}", req.method(), req.uri().path()));
+            let _ = self.logger.write("", &format!("{} {}", req.method(), req.uri().path()));
         }
 
         // Apply URL rewrites
@@ -163,9 +153,10 @@ impl Project {
 
         // Determine handler based on configuration
         match &self.config.project_type {
-            ProjectType::Redirect { .. } => self.handle_redirect().await,
-            ProjectType::Proxy { .. } => self.handle_proxy_remote(req).await,
-            ProjectType::Forward { .. } => self.handle_forward(req).await,
+            ProjectType::Redirect { target } => self.handle_redirect(req, target).await,
+            ProjectType::Proxy { target } => self.proxy_request(req, target).await,
+            ProjectType::ForwardUnix { http_client, .. } => self.forward_request(req, http_client).await,
+            ProjectType::ForwardTcp { http_client, .. } => self.forward_request(req, http_client).await,
             ProjectType::Application { .. } => self.handle_application(req).await,
             ProjectType::Static => self.handle_static(req).await,
         }
@@ -189,15 +180,10 @@ impl Project {
         (path.to_string(), String::new())
     }
 
-    async fn handle_redirect(&self) -> Result<Response<Full<Bytes>>> {
-        let target = match &self.config.project_type {
-            ProjectType::Redirect { target } => target,
-            _ => unreachable!("handle_redirect called for non-Redirect project"),
-        };
-
+    async fn handle_redirect(&self, req: Request<Incoming>, target: &str) -> Result<Response<Full<Bytes>>> {
         Ok(Response::builder()
             .status(301)
-            .header("Location", target)
+            .header("Location", &format!("{}{}", target, req.uri().path()))
             .body(Full::new(Bytes::new()))?)
     }
 
@@ -231,37 +217,6 @@ impl Project {
         }
     }
 
-    async fn handle_forward(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-        let (socket_path, host, port) = match &self.config.project_type {
-            ProjectType::Forward {
-                socket_path,
-                host,
-                port,
-            } => (socket_path, host, port),
-            _ => unreachable!("handle_forward called for non-Forward project"),
-        };
-
-        // For forwards (static port/socket), just proxy directly
-        let target = if !socket_path.is_empty() {
-            format!("unix://{}", socket_path)
-        } else {
-            format!("http://{}:{}", host, port)
-        };
-
-        self.proxy_request(req, &target).await
-    }
-
-    async fn handle_proxy_remote(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-        let target = match &self.config.project_type {
-            ProjectType::Proxy { target } => target,
-            _ => unreachable!("handle_proxy_remote called for non-Proxy project"),
-        };
-
-        // Simplified proxy without retry logic
-        // (Retry would require request cloning which is complex with streaming bodies)
-        self.proxy_request(req, target).await
-    }
-
     async fn proxy_request(
         &self,
         req: Request<Incoming>,
@@ -283,15 +238,12 @@ impl Project {
         // Check if this is a WebSocket upgrade request
         let is_upgrade = is_upgrade_request(&req);
         if is_upgrade {
-            return self.proxy_upgrade(req, uri).await;
+            return self.proxy_upgrade(req, uri).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e));
         }
 
         // Collect the incoming body first
         let (parts, body) = req.into_parts();
         let body_bytes = body.collect().await?.to_bytes();
-
-        // Create HTTP client
-        let client = Client::builder(TokioExecutor::new()).build_http();
 
         // Build proxied request with collected body
         let mut proxy_req = hyper::Request::builder()
@@ -345,7 +297,10 @@ impl Project {
         let proxy_req = proxy_req.body(Full::new(body_bytes))?;
 
         // Send request
-        let resp = client.request(proxy_req).await?;
+        let resp = HTTP_CLIENT.clone()
+            .request(proxy_req)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to backend: {}", e))?;
 
         // Convert response
         let (resp_parts, resp_body) = resp.into_parts();
@@ -365,13 +320,54 @@ impl Project {
         Ok(response.body(Full::new(resp_bytes))?)
     }
 
+    async fn forward_request<C>(
+        &self,
+        req: Request<Incoming>,
+        client: &Client<C, Full<Bytes>>,
+    ) -> Result<Response<Full<Bytes>>>
+    where
+        C: Connect + Clone + Send + Sync + 'static,
+    {
+        let (parts, body) = req.into_parts();
+        let body_bytes = body.collect().await?.to_bytes();
+        let req = Request::from_parts(parts, Full::new(body_bytes));
+
+        let resp = client.request(req).await?;
+
+        let (parts, body) = resp.into_parts();
+        let body_bytes = body.collect().await?.to_bytes();
+
+        Ok(Response::from_parts(parts, Full::new(body_bytes)))
+    }
+
     async fn handle_application(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         // Wait for port to be available (with timeout)
         let port = self.wait_for_port().await?;
 
         // Proxy to application
         let target = format!("http://localhost:{}", port);
-        self.proxy_request(req, &target).await
+        
+        // We need to construct the full URI: target + path + query
+        let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        let uri_string = format!("{}{}", target, path_and_query);
+        let uri: hyper::Uri = uri_string.parse()?;
+
+        // Check if this is a WebSocket upgrade request
+        if is_upgrade_request(&req) {
+            return self.proxy_upgrade(req, uri).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e));
+        }
+
+        let (mut parts, body) = req.into_parts();
+        parts.uri = uri;
+        let req = Request::from_parts(parts, body);
+
+        // Get client from config
+        let client = match &self.config.project_type {
+            ProjectType::Application { http_client, .. } => http_client,
+            _ => unreachable!(),
+        };
+
+        self.forward_request(req, client).await
     }
 
     async fn wait_for_port(&self) -> Result<u16> {
@@ -388,13 +384,14 @@ impl Project {
     async fn start_process(&self) -> Result<()> {
         let port = get_free_port()?;
         self.logger
-            .write("", &format!("Starting on port {}", port))?;
+            .write("", &format!("Starting on port {}", port));
 
         let (command, docker, _workers) = match &self.config.project_type {
             ProjectType::Application {
                 command,
                 docker,
                 workers,
+                ..
             } => (command, docker, workers),
             _ => unreachable!("start_process called for non-Application project"),
         };
@@ -420,7 +417,7 @@ impl Project {
         process.stderr(std::process::Stdio::piped());
 
         self.logger
-            .write("", &format!("Starting application: {:?}", process))?;
+            .write("", &format!("Starting application: {:?}", process));
 
         let mut child = process.spawn()?;
 
@@ -431,7 +428,7 @@ impl Project {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = logger.write("out", &line);
+                    logger.write("stdout", &line);
                 }
             });
         }
@@ -442,7 +439,7 @@ impl Project {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = logger.write("out", &line);
+                    logger.write("stderr", &line);
                 }
             });
         }
@@ -453,11 +450,11 @@ impl Project {
         if !ready {
             child.kill().await?;
             self.logger
-                .write("", "Application failed to start listening on port")?;
+                .write("", "Application failed to start listening on port");
             anyhow::bail!("Port not ready");
         }
 
-        self.logger.write("", &format!("Ready on port {}", port))?;
+        self.logger.write("", &format!("Ready on port {}", port));
 
         // Start workers
         let workers = self.start_workers(port).await;
@@ -487,7 +484,7 @@ impl Project {
 
                         if kill(Pid::from_raw(pid as i32), None).is_err() {
                             // Process no longer exists
-                            let _ = logger.write("", "Process exited");
+                            logger.write("", "Process exited");
                             *port_clone.lock().await = None;
                             break;
                         }
@@ -515,8 +512,7 @@ impl Project {
         }
 
         self.logger
-            .write("", &format!("Starting {} worker(s)", workers_map.len()))
-            .unwrap();
+            .write("", &format!("Starting {} worker(s)", workers_map.len()));
 
         let mut workers = vec![];
 
@@ -552,7 +548,7 @@ impl Project {
                             let reader = BufReader::new(stdout);
                             let mut lines = reader.lines();
                             while let Ok(Some(line)) = lines.next_line().await {
-                                let _ = logger.write(&label, &line);
+                                logger.write(&label, &line);
                             }
                         });
                     }
@@ -562,7 +558,7 @@ impl Project {
                             let reader = BufReader::new(stderr);
                             let mut lines = reader.lines();
                             while let Ok(Some(line)) = lines.next_line().await {
-                                let _ = logger.write(&label, &line);
+                                logger.write(&label, &line);
                             }
                         });
                     }
@@ -682,7 +678,7 @@ impl Project {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            self.logger.write("build", &stderr)?;
+            self.logger.write("build", &stderr);
             anyhow::bail!("Docker build failed");
         }
 
@@ -770,16 +766,13 @@ impl Project {
                     self.logger.write(
                         "",
                         &format!("Stopping due to change in {}", rel_path.display()),
-                    )?;
+                    );
 
                     // Remove from DOMAINS map immediately so new requests create a fresh instance
                     crate::server::discard_project(&self.domain).await;
 
-                    // Stop the old process in background
-                    let project_clone = self.clone();
-                    tokio::spawn(async move {
-                        project_clone.stop().await;
-                    });
+                    // Stop the old process
+                    self.stop().await;
 
                     break; // Stop watching, will be recreated on reload
                 }
@@ -909,7 +902,7 @@ impl Project {
             }
             workers.clear();
             *port_clone.lock().await = None;
-            let _ = logger_clone.write("", "Stopped");
+            logger_clone.write("", "Stopped");
         });
     }
 
@@ -921,6 +914,7 @@ impl Project {
         let host = target_uri.host().unwrap_or("localhost").to_string();
         let port = target_uri.port_u16().unwrap_or(80);
         let addr = format!("{}:{}", host, port);
+        println!("Upgrading target_uri={} addr={}", target_uri, addr);
 
         let method = req.method().clone();
         let path = req
@@ -1024,7 +1018,7 @@ impl Project {
                             .write_all(&response_buf[header_end..bytes_read])
                             .await
                         {
-                            let _ = logger.write(
+                            logger.write(
                                 "error",
                                 &format!("Failed to write excess data to client: {}", e),
                             );
@@ -1036,7 +1030,7 @@ impl Project {
                     let _ = tokio::io::copy_bidirectional(&mut upgraded, &mut backend).await;
                 }
                 Err(e) => {
-                    let _ = logger.write("error", &format!("Client upgrade failed: {}", e));
+                    logger.write("error", &format!("Client upgrade failed: {}", e));
                 }
             }
         });
@@ -1053,27 +1047,6 @@ fn is_upgrade_request(req: &Request<Incoming>) -> bool {
         .map(|v| v.to_lowercase().contains("upgrade"))
         .unwrap_or(false)
 }
-
-// Make Project cloneable for Arc usage
-impl Clone for Project {
-    fn clone(&self) -> Self {
-        Project {
-            domain: self.domain.clone(),
-            dir: self.dir.clone(),
-            config: self.config.clone(),
-            logger: self.logger.clone(),
-            uid: self.uid,
-            gid: self.gid,
-            use_firejail: self.use_firejail,
-            port: self.port.clone(),
-            process: self.process.clone(),
-            workers: self.workers.clone(),
-            last_activity: self.last_activity.clone(),
-        }
-    }
-}
-
-// Helper functions
 
 fn get_free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;

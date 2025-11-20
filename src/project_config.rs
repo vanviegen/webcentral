@@ -1,4 +1,13 @@
 use anyhow::{Context, Result};
+use bytes::Bytes;
+use http::Uri;
+use http_body_util::Full;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioIo;
+use std::pin::Pin;
+use std::future::Future;
+use std::task::{Context as TaskContext, Poll};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -95,10 +104,20 @@ impl IniMap {
     }
 
     // Fetch a value and parse it as a type
-    fn fetch_parse<T: std::str::FromStr>(&mut self, key: &str, default: T) -> T {
+    fn fetch_parse_default<T: std::str::FromStr>(&mut self, key: &str, default: T) -> T {
         self.fetch(key)
             .and_then(|v| v.parse().ok())
             .unwrap_or(default)
+    }
+
+    // Fetch a value and parse it as a type
+    fn fetch_parse<T: std::str::FromStr>(&mut self, key: &str) -> Option<T> {
+        if let Some(value) = self.fetch(key) {
+            if let Ok(parse) = value.parse() {
+                return Some(parse);
+            }
+        }
+        return None;
     }
 
     // Fetch a boolean value (true/1/yes = true, anything else = false)
@@ -150,30 +169,83 @@ impl IniMap {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct UnixConnector(String);
+
+impl tower::Service<Uri> for UnixConnector {
+    type Response = TokioIo<tokio::net::UnixStream>;
+    type Error = std::io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _req: Uri) -> Self::Future {
+        let path = self.0.clone();
+        Box::pin(async move {
+            let stream = tokio::net::UnixStream::connect(path).await?;
+            Ok(TokioIo::new(stream))
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TcpConnector(String);
+
+impl tower::Service<Uri> for TcpConnector {
+    type Response = TokioIo<tokio::net::TcpStream>;
+    type Error = std::io::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _req: Uri) -> Self::Future {
+        let addr = self.0.clone();
+        Box::pin(async move {
+            let stream = tokio::net::TcpStream::connect(addr).await?;
+            Ok(TokioIo::new(stream))
+        })
+    }
+}
+
+impl ProjectType {
+    fn makeSocketForward(socket_path: String) -> Self {
+        let connector = UnixConnector(socket_path.clone());
+        ProjectType::ForwardUnix {
+            http_client: Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector),
+            description: format!("unix://{}", socket_path)
+        }
+    }
+
+    fn makePortForward(host: &str, port: i32) -> Self {
+        let addr = format!("{}:{}", host, port);
+        let connector = TcpConnector(addr);
+        ProjectType::ForwardTcp {
+            http_client: Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector),
+            description: format!("http://{}:{}", host, port)
+        }
+    }
+}
+
 // Build ProjectConfig directly from IniMap
 fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
     // Determine project type by checking for type-specific keys
     // Priority: redirect > proxy > forward (socket/port) > application > static
     let project_type = if let Some(target) = ini_map.fetch("redirect") {
-        ProjectType::Redirect { target }
+        ProjectType::Redirect { target: target.trim_end_matches('/').to_string() }
     } else if let Some(target) = ini_map.fetch("proxy") {
         ProjectType::Proxy { target }
     } else if let Some(socket_path) = ini_map.fetch("socket_path") {
-        ProjectType::Forward {
-            port: ini_map.fetch_parse("port", 0),
-            host: ini_map
-                .fetch("host")
-                .unwrap_or_else(|| "localhost".to_string()),
-            socket_path,
-        }
-    } else if ini_map.fetch_parse::<i32>("port", 0) > 0 {
-        ProjectType::Forward {
-            port: ini_map.fetch_parse("port", 0),
-            host: ini_map
-                .fetch("host")
-                .unwrap_or_else(|| "localhost".to_string()),
-            socket_path: String::new(),
-        }
+        ProjectType::makeSocketForward(socket_path)
+    } else if let Some(port) = ini_map.fetch_parse::<i32>("port") {
+        let host = ini_map.fetch("host").unwrap_or_else(|| "localhost".to_string());
+        ProjectType::makePortForward(&host, port)
+    } else if let Some(host) = ini_map.fetch("host") {
+        let port = ini_map.fetch_parse_default("port", 80);
+        ProjectType::makePortForward(&host, port)
     } else if let Some(command) = ini_map.fetch("command") {
         let mut workers = HashMap::new();
         if let Some(worker_cmd) = ini_map.fetch("worker") {
@@ -198,7 +270,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
                     .unwrap_or_else(|| "alpine".to_string()),
                 packages: ini_map.fetch_array("docker.packages"),
                 commands: ini_map.fetch_array("docker.commands"),
-                http_port: ini_map.fetch_parse("docker.http_port", 8000),
+                http_port: ini_map.fetch_parse_default("docker.http_port", 8000),
                 app_dir: ini_map
                     .fetch("docker.app_dir")
                     .unwrap_or_else(|| "/app".to_string()),
@@ -213,6 +285,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
             command,
             docker,
             workers,
+            http_client: Client::builder(hyper_util::rt::TokioExecutor::new()).build_http(),
         }
     } else if ini_map.map.keys().any(|k| k.starts_with("docker.")) {
         let mut workers = HashMap::new();
@@ -239,7 +312,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
                     .unwrap_or_else(|| "alpine".to_string()),
                 packages: ini_map.fetch_array("docker.packages"),
                 commands: ini_map.fetch_array("docker.commands"),
-                http_port: ini_map.fetch_parse("docker.http_port", 8000),
+                http_port: ini_map.fetch_parse_default("docker.http_port", 8000),
                 app_dir: ini_map
                     .fetch("docker.app_dir")
                     .unwrap_or_else(|| "/app".to_string()),
@@ -247,6 +320,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
                 mounts: ini_map.fetch_array("docker.mounts"),
             }),
             workers,
+            http_client: Client::builder(hyper_util::rt::TokioExecutor::new()).build_http(),
         }
     } else {
         ProjectType::Static
@@ -261,7 +335,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
         redirect_https: ini_map.fetch_bool("redirect_https"),
         environment: ini_map.fetch_prefix("environment"),
         reload: ReloadConfig {
-            timeout: ini_map.fetch_parse("reload.timeout", 300),
+            timeout: ini_map.fetch_parse_default("reload.timeout", 300),
             include: ini_map.fetch_array("reload.include"),
             exclude: ini_map.fetch_array("reload.exclude"),
         },
@@ -329,6 +403,7 @@ pub enum ProjectType {
         command: String,
         docker: Option<DockerConfig>,
         workers: HashMap<String, String>,
+        http_client: Client<HttpConnector, Full<Bytes>>,
     },
     // Static file server (serves from public/ directory)
     Static,
@@ -341,11 +416,14 @@ pub enum ProjectType {
         target: String,
     },
     // Forward to local port or unix socket
-    Forward {
-        port: i32,
-        host: String,
-        socket_path: String,
+    ForwardUnix {
+        http_client: Client<UnixConnector, Full<Bytes>>,
+        description: String,
     },
+    ForwardTcp {
+        http_client: Client<TcpConnector, Full<Bytes>>,
+        description: String,
+    }
 }
 
 #[derive(Debug, Clone)]
