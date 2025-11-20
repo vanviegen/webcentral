@@ -198,7 +198,7 @@ impl Server {
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
                 if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(
+                    .serve_connection_with_upgrades(
                         io,
                         service_fn(move |req| {
                             let server = server.clone();
@@ -253,7 +253,7 @@ impl Server {
 
                 let io = TokioIo::new(tls_stream);
                 if let Err(e) = auto::Builder::new(TokioExecutor::new())
-                    .serve_connection(
+                    .serve_connection_with_upgrades(
                         io,
                         service_fn(move |req| {
                             let server = server.clone();
