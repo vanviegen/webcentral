@@ -282,9 +282,7 @@ impl Project {
     ) -> Result<Response<Full<Bytes>>>
     {
         // Check if this is a WebSocket upgrade request
-        println!("Forwarding request: {} {}", req.method(), req.uri());
         if is_upgrade_request(&req) {
-            println!("Handling upgrade request");
             return self.proxy_upgrade(req).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e));
         }
 
@@ -859,6 +857,8 @@ impl Project {
         // Get the upgrade future before we return a response
         let upgrade_fut = hyper::upgrade::on(req);
 
+        println!("Upgrading connection to backend: {}", uri);
+
         // Connect to backend
         let mut connector = self.connector.clone();
         let io = connector.call(uri.clone()).await.map_err(|e| anyhow::anyhow!("Connector error: {}", e))?;
@@ -867,6 +867,8 @@ impl Project {
         // Build and send the upgrade request to backend
         let mut buf = Vec::new();
         use std::io::Write;
+
+        println!("Sending upgrade request to backend: {}", uri);
 
         let path = uri
             .path_and_query()
@@ -881,10 +883,14 @@ impl Project {
         }
         buf.extend_from_slice(b"\r\n");
 
+        println!("Upgrade request:\n{}", String::from_utf8_lossy(&buf));
+
         backend
             .write_all(&buf)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send upgrade request to backend: {}", e))?;
+
+        println!("Sent upgrade request to backend");
 
         // Read response headers from backend
         let mut response_buf = [0u8; 4096];
@@ -913,6 +919,7 @@ impl Project {
         };
 
         let response_str = String::from_utf8_lossy(&response_buf[..header_end]);
+        println!("Backend response:\n{}", response_str);
 
         // Parse backend response to extract status and headers
         let mut response_lines = response_str.lines();
