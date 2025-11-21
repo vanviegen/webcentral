@@ -1,4 +1,5 @@
 mod acme;
+mod file_watcher;
 mod logger;
 mod project;
 mod project_config;

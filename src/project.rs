@@ -1,3 +1,4 @@
+use crate::file_watcher;
 use crate::logger::Logger;
 use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
 use crate::streams::AnyConnector;
@@ -14,7 +15,6 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
 };
 use nix::unistd::Uid;
-use notify::{Event as NotifyEvent, RecursiveMode, Watcher};
 use regex::Regex;
 use std::fs;
 use std::net::TcpStream as StdTcpStream;
@@ -668,110 +668,49 @@ impl Project {
     }
 
     async fn watch_files(&self) -> Result<()> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
-
-        let mut watcher =
-            notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
-                if let Ok(event) = res {
-                    let _ = tx.blocking_send(event);
-                }
-            })?;
-
-        // Watch directory recursively. Note: notify crate doesn't support exclusion patterns,
-        // so we watch everything and filter unwanted paths in should_reload_for_file().
-        // This generates events for files in node_modules/, data/, etc. that we then ignore,
-        // but the overhead is acceptable and this approach is simpler than selectively watching
-        // only certain subdirectories.
-        watcher.watch(Path::new(&self.dir),  RecursiveMode::NonRecursive)?;
-
-        while let Some(event) = rx.recv().await {
-            use notify::EventKind;
-
-            // Only process modification, creation, and removal events (ignore Access events)
-            if matches!(event.kind, EventKind::Access(_)) {
-                continue;
-            }
-
-            if let Some(path) = event.paths.first() {
-                let rel_path = path.strip_prefix(&self.dir).unwrap_or(path);
-
-                // Skip events for the watched directory itself (empty relative path)
-                if rel_path.as_os_str().is_empty() {
-                    continue;
-                }
-
-                // Check if should reload
-                if self.should_reload_for_file(rel_path) {
-                    self.logger.write(
-                        "",
-                        &format!("Stopping due to change in {}", rel_path.display()),
-                    );
-
-                    // Remove from DOMAINS map immediately so new requests create a fresh instance
-                    crate::server::discard_project(&self.domain).await;
-
-                    // Stop the old process
-                    self.stop().await;
-
-                    break; // Stop watching, will be recreated on reload
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn should_reload_for_file(&self, rel_path: &Path) -> bool {
-        let path_str = rel_path.to_string_lossy();
-
-        // Default excludes
-        let default_excludes = vec![
-            "_webcentral_data/**",
-            "node_modules/**",
-            "**/*.log",
-            "**/.*",
-            "data/**",
-            "log/**",
-            "logs/**",
-        ];
-
-        // Check default excludes
-        for pattern in &default_excludes {
-            if matches_pattern(&path_str, pattern) {
-                return false;
-            }
-        }
-
-        // Check config excludes
-        for pattern in &self.config.reload.exclude {
-            if matches_pattern(&path_str, pattern.as_str()) {
-                return false;
-            }
-        }
-
-        // Includes
+        // Determine include patterns
         let includes = if self.config.reload.include.is_empty() {
             if self.needs_process_management() {
-                vec!["**/*"]
+                vec!["**/*".to_string()]
             } else {
-                vec!["webcentral.ini", "Procfile"]
+                vec!["webcentral.ini".to_string(), "Procfile".to_string()]
             }
         } else {
-            self.config
-                .reload
-                .include
-                .iter()
-                .map(|s| s.as_str())
-                .collect()
+            self.config.reload.include.clone()
         };
 
-        for pattern in &includes {
-            if matches_pattern(&path_str, pattern) {
-                return true;
-            }
-        }
+        // Get full exclude list (default excludes + config excludes)
+        let excludes = self.config.reload.get_full_excludes();
 
-        false
+        // Clone what we need for the callback
+        let domain = self.domain.clone();
+        let logger = self.logger.clone();
+
+        // Watch files with callback
+        file_watcher::build_watcher()
+            .set_base_dir(&self.dir)
+            .add_includes(includes)
+            .add_excludes(excludes)
+            .run_debounced(100, move || {
+                let domain = domain.clone();
+                let logger = logger.clone();
+
+                async move {
+                    logger.write(
+                        "",
+                        "Stopping due to file changes",
+                    );
+
+                    // Remove from DOMAINS map so new requests create a fresh instance
+                    crate::server::discard_project(&domain).await;
+
+                    // Note: We can't call self.stop() here because we don't have self
+                    // The project will be stopped when it's discarded from DOMAINS
+                }
+            })
+            .await?;
+
+        Ok(())
     }
 
     async fn inactivity_timer(&self) {
@@ -1023,61 +962,3 @@ async fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
-fn matches_pattern(path: &str, pattern: &str) -> bool {
-    let pattern = pattern.trim_end_matches('/');
-
-    if pattern.contains("**") {
-        let parts: Vec<_> = pattern.splitn(2, "**").collect();
-        let prefix = parts[0].trim_end_matches('/');
-        let suffix = parts
-            .get(1)
-            .map(|s| s.trim_start_matches('/'))
-            .unwrap_or("");
-
-        // Check prefix with directory boundary
-        if !prefix.is_empty() {
-            if path == prefix || path.starts_with(&format!("{}/", prefix)) {
-                // Prefix matches
-            } else {
-                return false;
-            }
-        }
-
-        if !suffix.is_empty() && suffix != "*" {
-            let check_path = if !prefix.is_empty() {
-                path.strip_prefix(prefix)
-                    .unwrap_or(path)
-                    .trim_start_matches('/')
-            } else {
-                path
-            };
-
-            return check_path == suffix
-                || check_path.ends_with(&format!("/{}", suffix))
-                || check_path.contains(&format!("/{}/", suffix));
-        }
-
-        return true;
-    }
-
-    if pattern.ends_with("/*") {
-        let dir = pattern.trim_end_matches("/*");
-        return path == dir
-            || (path.starts_with(&format!("{}/", dir)) && !path[dir.len() + 1..].contains('/'));
-    }
-
-    // Handle wildcard patterns like *.py, *.txt
-    if pattern.starts_with("*.") && !pattern.contains('/') {
-        let extension = &pattern[1..]; // includes the dot
-        return path.ends_with(extension) || path.split('/').any(|part| part.ends_with(extension));
-    }
-
-    if pattern.contains('/') {
-        return path == pattern || path.starts_with(&format!("{}/", pattern));
-    }
-
-    // Simple pattern matches name anywhere
-    path == pattern
-        || path.starts_with(&format!("{}/", pattern))
-        || path.split('/').any(|part| part == pattern)
-}

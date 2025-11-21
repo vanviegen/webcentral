@@ -368,6 +368,18 @@ pub struct DockerConfig {
     pub mounts: Vec<String>,
 }
 
+/// Default file patterns to exclude from file watching.
+/// These patterns are always excluded from triggering reloads.
+pub const DEFAULT_EXCLUDES: &[&str] = &[
+    "_webcentral_data/**",
+    "node_modules/**",
+    "**/*.log",
+    "**/.*",
+    "data/**",
+    "log/**",
+    "logs/**",
+];
+
 #[derive(Debug, Clone)]
 pub struct ReloadConfig {
     pub timeout: i64,
@@ -382,6 +394,15 @@ impl Default for ReloadConfig {
             include: Vec::new(),
             exclude: Vec::new(),
         }
+    }
+}
+
+impl ReloadConfig {
+    /// Get the full exclude list including default excludes.
+    pub fn get_full_excludes(&self) -> Vec<String> {
+        let mut excludes = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        excludes.extend(self.exclude.clone());
+        excludes
     }
 }
 

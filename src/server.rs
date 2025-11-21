@@ -9,7 +9,6 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use notify::{RecursiveMode, Watcher};
 use regex::Regex;
 use rustls::ServerConfig;
 use std::collections::HashSet;
@@ -523,62 +522,24 @@ impl Server {
     }
 
     async fn watch_project_directories(self: Arc<Self>) -> Result<()> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+        use crate::file_watcher;
 
-        let mut watcher =
-            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                if let Ok(event) = res {
-                    let _ = tx.blocking_send(event);
+        // Build include patterns for top-level directories only
+        let mut includes = Vec::new();
+        includes.push(format!("{}/*.*", self.config.projects));
+
+        let server = self.clone();
+        file_watcher::build_watcher()
+            .add_includes(includes)
+            .run_debounced(20, move || {
+                let server = server.clone();
+
+                async move {
+                    // Rescan all project directories
+                    server.clone().scan_all_project_directories().await;
                 }
-            })?;
-
-        // Find all project base directories and watch them
-        for entry in glob::glob(&self.config.projects)? {
-            let base_path = entry?;
-            watcher.watch(&base_path, RecursiveMode::NonRecursive)?;
-            println!("Watching for new projects in {}", base_path.display());
-        }
-
-        while let Some(event) = rx.recv().await {
-            let mut changed = false;
-
-            match event.kind {
-                notify::EventKind::Create(_) => {
-                    for path in event.paths {
-                        println!("New project directory detected: {}", path.display());
-                        self.process_project_directory(&path, None).await;
-                        changed = true;
-                    }
-                }
-                notify::EventKind::Remove(_) => {
-                    for path in event.paths {
-                        if let Some(domain) = path.file_name().and_then(|n| n.to_str()) {
-                            if VALID_DOMAIN.is_match(domain) {
-                                let domain = domain.to_lowercase();
-                                println!("Project directory removed: {}", domain);
-
-                                // Remove from DOMAINS
-                                DOMAINS.remove(&domain);
-                                changed = true;
-
-                                // Note: Certificate removal from ACME client would go here
-                                // For now, we just keep the certificate files
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-
-            // Write bindings after any changes
-            if changed {
-                if let Err(e) = self.write_bindings() {
-                    eprintln!("Failed to write bindings: {}", e);
-                }
-            }
-        }
-
-        Ok(())
+            })
+            .await
     }
 
     async fn manage_certificate(&self, domain: String) {

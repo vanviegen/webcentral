@@ -15,7 +15,9 @@ A reverse proxy that runs multiple web applications on a single server. Just put
 
 `src/logger.rs` - Daily-rotated logs with configurable retention
 
-`src/config.rs` - Parses `webcentral.ini`, `Procfile`, and `package.json`
+`src/project_config.rs` - Parses `webcentral.ini`, `Procfile`, and `package.json`
+
+`src/file_watcher.rs` - File system watching with include/exclude patterns
 
 `src/acme.rs` - ACME/Let's Encrypt certificate acquisition using HTTP-01 challenges
 
@@ -118,5 +120,6 @@ No explicit stopping state—process termination handled asynchronously in backg
 - Keep AGENTS.md up-to-date when making architectural changes. Be succinct—no repetition, no code examples, bullet points over paragraphs.
 - Build and test using `cargo build && ./test.py --firejail false` (or `--firejail true` if Firejail is installed).
 - Run `./test.py` to execute the test suite. To run a single test: `./test.py test_name_of_test`. For new features, add tests in `test.py`. Don't create ad-hoc test scripts. When writing tests, you should not need to sleep (except in test-apps being run by webcentral to simulate loading times) - use `await_log` and/or `assert_http` instead. If a test fails, don't just work around it in the test code, but investigate deeply if there may be an actual bug (or unexpected behavior) in webcentral.
-- When you notice unexpected behavior or a bug at any time, create an issue on your todo-list for later investigation. Never let bugs go uninvestigated nor work around them.
 - Add code comments only for explaining non-obvious logic, why things are done a certain way, and how thread-safety is ensured. Don't add comments describing what you're changing and why, as comments should reflect the final code, not the change history.
+- When you notice unexpected behavior or a bug at any time, create an issue on your todo-list for later investigation. Never let bugs go uninvestigated nor work around them.
+- When trying to debug problems, do not fiddle around with ad-hoc shell commands too much. The user needs to approve all of these. Instead, extend `test.py` to clearly demonstrate the problem, and if needed add (temporary, with a `TODO: remove` comment) logging to the code (but prefer to just improve error logging).

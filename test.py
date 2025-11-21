@@ -43,8 +43,16 @@ class TestRunner:
 
     def setup(self):
         """Set up test environment and start webcentral"""
-        # Create temporary directory
-        self.tmpdir = tempfile.mkdtemp(prefix='webcentral_test_')
+        # Use fixed test directory in current directory
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        self.tmpdir = os.path.join(cwd, '.maca-test')
+        
+        # Empty the directory if it exists
+        if os.path.exists(self.tmpdir):
+            shutil.rmtree(self.tmpdir)
+        
+        # Create the directory
+        os.makedirs(self.tmpdir)
         print(f"Test directory: {self.tmpdir}")
 
         # Create stdout and stderr redirect directories
