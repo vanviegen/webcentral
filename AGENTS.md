@@ -19,6 +19,8 @@ A reverse proxy that runs multiple web applications on a single server. Just put
 
 `src/file_watcher.rs` - File system watching with include/exclude patterns
 
+`src/streams.rs` - Stream abstraction (AnyConnector/AnyStream) for HTTP/TCP/Unix socket connections
+
 `src/acme.rs` - ACME/Let's Encrypt certificate acquisition using HTTP-01 challenges
 
 `test.py` - Test suite and harness
@@ -38,11 +40,11 @@ No explicit stopping state—process termination handled asynchronously in backg
 **Runtime:** Tokio async/await with task spawning
 
 **Per-project tasks:**
-1. **File watcher** - Spawned once, exits when reload triggered (recreated on new Project)
+1. **File watcher** - Spawned once, aborted on reload, handle stored in `watcher_task` mutex
 2. **Inactivity timer** - Periodic checks, stops project on timeout
 3. **Process monitor** - Polls process status, transitions to `Stopped` when process exits
 4. **Log streamers** - 2 per process (stdout/stderr), plus 2 per worker
-5. **Stop handler** - Background task for graceful shutdown (2.5s grace period)
+5. **Stop handler** - Background task for graceful shutdown (5s grace period)
 6. **Request handlers** - Hyper-managed tasks, wait for `ensure_started()` completion
 
 **Server-level tasks:**
@@ -56,6 +58,7 @@ No explicit stopping state—process termination handled asynchronously in backg
 **Project-level:**
 - `Arc<Mutex<ProjectState>>` - Serializes state transitions (Stopped/Starting/Running)
 - `Arc<Mutex<Instant>>` - Tracks last activity for timeout
+- `Mutex<Option<JoinHandle>>` - File watcher task handle for aborting on reload
 - State read during request handling, written during lifecycle transitions
 
 **Server-level:**
@@ -92,7 +95,7 @@ No explicit stopping state—process termination handled asynchronously in backg
 
 **Reload triggers:** Configurable includes/excludes, defaults to all files for applications, only config files for static/proxy
 
-**On change:** Project removes itself from DOMAINS map, old instance stops in background, new instance created on next request
+**On change:** Project calls `stop()` which uses `remove_project_if_current()` with Arc ptr equality to remove from DOMAINS only if still active, then aborts watcher task and kills processes. New instance created on next request.
 
 **Server-level:** Non-recursive watch on project parent directories for domain additions/removals
 
@@ -109,11 +112,15 @@ No explicit stopping state—process termination handled asynchronously in backg
 - Can disable Firejail with `--firejail=false` flag
 
 **Test patterns:**
-- Create project files with `t.write_file('example.com/path', 'content')`
-- Mark logs as read before changes: `t.mark_log_read('example.com')`
-- Wait for log entries: `t.await_log('example.com', 'text', timeout=2)`
-- Assert HTTP responses: `t.assert_http('example.com', '/path', check_body='text', check_code=200)`
-- Count log occurrences: `t.assert_log('example.com', 'text', count=1)`
+- Each test auto-creates domain from test name: `test_foo_bar` → `foo-bar.test`
+- Create files: `t.write_file('path', 'content')` (auto-prefixed with test domain)
+- Mark logs read: `t.mark_log_read()` (defaults to test domain)
+- Wait for log: `t.await_log('text', timeout=2)` (defaults to test domain)
+- Assert HTTP: `t.assert_http('/path', check_body='text')` (defaults to test domain)
+- Count logs: `t.assert_log('text', count=1)` (defaults to test domain)
+
+**file_watcher.rs** - Module with its own unit tests
+- Use: `cargo build && cargo test --lib file_watcher`
 
 ## Developers notes
 
@@ -123,3 +130,7 @@ No explicit stopping state—process termination handled asynchronously in backg
 - Add code comments only for explaining non-obvious logic, why things are done a certain way, and how thread-safety is ensured. Don't add comments describing what you're changing and why, as comments should reflect the final code, not the change history.
 - When you notice unexpected behavior or a bug at any time, create an issue on your todo-list for later investigation. Never let bugs go uninvestigated nor work around them.
 - When trying to debug problems, do not fiddle around with ad-hoc shell commands too much. The user needs to approve all of these. Instead, extend `test.py` to clearly demonstrate the problem, and if needed add (temporary, with a `TODO: remove` comment) logging to the code (but prefer to just improve error logging).
+
+## AI guidance
+
+- AI agents should be succinct in their textual output. Especially when in 'thinking' mode, they should restrict verbosity to the absolute minimum, leaving out social niceties and sacrificing grammar for brevity.

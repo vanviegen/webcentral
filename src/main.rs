@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
     println!("\nReceived shutdown signal, stopping...");
 
     server.stop().await;
-    server::stop_all_projects().await;
+    server::stop_all_projects();
 
     println!("Shutdown complete");
 

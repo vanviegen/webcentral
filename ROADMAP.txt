@@ -1,4 +1,8 @@
+- Prevent conversion between stream body types
+- Better way to serialize http request in proxy? Perhaps some way to take over the connection entirely?
+- Go over the projects dependencies, and for each, carefully consider how hard it would be to remove it (and replace its use by custom code or something in the stdlib). For dependencies that are easy to remove, and wouldn't add more than say 20 lines of code, do so.
 - When a Project shuts down or after 15 minutes of running, output some stats (at least request count, but other easy-to-gather stats would be nice as well) to its log file
+- Add a way to set a list of basic auth usernames+passwords for a project in webcentral.ini, and have webcentral enforce that for all requests to that project - the passwords should be stored using argon2
 - To verify that a project is actually running, don't just check if the port is open, but make sure you get a http 2xx, 3xx or 4xx back from the server
 - Make the URL to check configurable in webcentral.ini
 - Optionally do a periodic check on that URL after the project has started, forcing a shutdown if it's no longer responding

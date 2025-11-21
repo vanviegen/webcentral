@@ -49,18 +49,25 @@ lazy_static::lazy_static! {
     static ref VALID_DOMAIN: Regex = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$").unwrap();
 }
 
-// Called by Project when it shuts down to remove itself from DOMAINS
-pub async fn discard_project(domain: &str) {
+// Remove a project from DOMAINS only if it's still the active project for that domain
+// This prevents an old project instance from removing a newer one
+pub fn remove_project_if_current(domain: &str, project: &Arc<project::Project>) -> bool {
     if let Some(mut domain_info) = DOMAINS.get_mut(domain) {
-        domain_info.project = None;
+        if let Some(ref current) = domain_info.project {
+            if Arc::ptr_eq(current, project) {
+                domain_info.project = None;
+                return true;
+            }
+        }
     }
+    false
 }
 
 // Stop all running projects (called during shutdown)
-pub async fn stop_all_projects() {
+pub fn stop_all_projects() {
     for entry in DOMAINS.iter() {
-        if let Some(project) = entry.project.as_ref() {
-            project.stop().await;
+        if let Some(project) = entry.project.clone() {
+            project.stop();
         }
     }
 }
@@ -68,6 +75,7 @@ pub async fn stop_all_projects() {
 pub struct Server {
     config: crate::GlobalConfig,
     cert_manager: Option<Arc<CertManager>>,
+    bindings: HashSet<String>,
 }
 
 impl Server {
@@ -84,21 +92,23 @@ impl Server {
             None
         };
 
+        let bindings = Self::load_bindings(&config.data_dir);
+
         Ok(Server {
             config,
             cert_manager,
+            bindings
         })
     }
 
     // Read bindings.list file containing authorized project directories
-    fn read_bindings(data_dir: &str) -> Result<HashSet<String>> {
-        let bindings_path = PathBuf::from(data_dir).join("bindings.list");
+    fn load_bindings(data_dir: &str) -> HashSet<String> {
         let mut bindings = HashSet::new();
-
-        if bindings_path.exists() {
-            let file = fs::File::open(&bindings_path)?;
+        let bindings_path = PathBuf::from(data_dir).join("bindings.list");
+        
+        if let Ok(file) =  fs::File::open(&bindings_path) {
             let reader = std::io::BufReader::new(file);
-
+            
             for line in reader.lines() {
                 if let Ok(path) = line {
                     let path = path.trim();
@@ -113,8 +123,7 @@ impl Server {
                 bindings_path.display()
             );
         }
-
-        Ok(bindings)
+        bindings
     }
 
     // Write current DOMAINS mapping to bindings.list
@@ -387,12 +396,17 @@ impl Server {
         }
 
         // Handle request with project
+        let logger = project.logger.clone();
         match project.handle(req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
-                println!("Error for {}: {}", project.domain, e);
-                project.logger.write("handler", e.to_string().as_str());
-                Ok(Self::make_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"))
+                let msg = e.to_string();
+                logger.write("error", &msg);
+                if msg.starts_with("502 ") {
+                    Ok(Self::make_error(StatusCode::BAD_GATEWAY, "Bad Gateway"))
+                } else {
+                    Ok(Self::make_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"))
+                }
             }
         }
     }
@@ -426,10 +440,10 @@ impl Server {
             // Was project was created in the mean time.
             return Ok(project.clone());
         }
-        
+
         // Create or recreate project
-        let project = project::create_project(
-            &PathBuf::from(&DOMAINS.get(domain).unwrap().directory),
+        let project = project::Project::new(
+            &PathBuf::from(&domain_info.directory),
             domain.to_string(),
             self.config.firejail,
             self.config.prune_logs,
@@ -445,16 +459,15 @@ impl Server {
     async fn process_project_directory(
         self: &Arc<Self>,
         path: &std::path::Path,
-        bindings: Option<&HashSet<String>>,
-    ) {
+    ) -> bool {
         if !path.is_dir() {
-            return; // It's a file
+            return false; // It's a file
         }
         let Some(domain_name) = path.file_name().and_then(|n| n.to_str()) else {
-            return; // Shouldn't happen?
+            return false; // Shouldn't happen?
         };
         if !VALID_DOMAIN.is_match(domain_name) {
-            return; // It doesn't look like a domain name
+            return false; // It doesn't look like a domain name
         }
         
         let directory = path.to_string_lossy().to_string();
@@ -463,13 +476,13 @@ impl Server {
         // Check if domain exists and if transfer is allowed
         if let Some(existing) = DOMAINS.get(&domain) {
             let existing_dir_gone = !std::path::Path::new(&existing.directory).exists();
-            let authorized = bindings.map_or(false, |b| b.contains(&directory));
+            let authorized = self.bindings.contains(&directory);
             if !existing_dir_gone && !authorized {
                 println!(
                     "Rejecting domain override attempt for {} from unauthorized directory {}",
                     domain, directory
                 );
-                return;
+                return false;
             }
             println!(
                 "Overriding domain {} from {} to {}{}",
@@ -497,18 +510,16 @@ impl Server {
         };
 
         DOMAINS.insert(domain, DomainInfo::new(directory, cert_task));
+        return true;
     }
 
     async fn scan_all_project_directories(self: Arc<Self>) {
         // Read authorized bindings from previous run
-        let bindings =
-            Self::read_bindings(&self.config.data_dir).unwrap_or_else(|_e| HashSet::new());
-
         for entry in glob::glob(&self.config.projects).unwrap() {
             if let Ok(base_path) = entry {
                 if let Ok(entries) = fs::read_dir(base_path) {
                     for entry in entries.flatten() {
-                        self.process_project_directory(&entry.path(), Some(&bindings))
+                        self.process_project_directory(&entry.path())
                             .await;
                     }
                 }
@@ -524,20 +535,44 @@ impl Server {
     async fn watch_project_directories(self: Arc<Self>) -> Result<()> {
         use crate::file_watcher;
 
-        // Build include patterns for top-level directories only
-        let mut includes = Vec::new();
-        includes.push(format!("{}/*.*", self.config.projects));
-
         let server = self.clone();
-        file_watcher::build_watcher()
-            .add_includes(includes)
-            .run_debounced(20, move || {
+        file_watcher::WatchBuilder::new()
+            .set_base_dir("/")
+            .add_include(format!("{}/*.*", self.config.projects))
+            .return_absolute(true)
+            .run(move |_event, path| {
                 let server = server.clone();
+                tokio::spawn(async move {
+                    let Some(domain) = path.file_name().and_then(|n| n.to_str()) else {
+                        return;
+                    };
+                    if !VALID_DOMAIN.is_match(domain) {
+                        return;
+                    }
+                    let domain = domain.to_string();
 
-                async move {
-                    // Rescan all project directories
-                    server.clone().scan_all_project_directories().await;
-                }
+                    if path.exists() && path.is_dir() {
+                        // Check if already exists with same directory
+                        let path_str = path.to_string_lossy().to_string();
+                        if let Some(info) = DOMAINS.get(&domain) {
+                            eprintln!("DEBUG: Comparing paths for domain {}: existing='{}' new='{}'", domain, info.directory, path_str);
+                            if info.directory == path_str {
+                                return;
+                            }
+                        }
+
+                        let result  = server.process_project_directory(&path).await;
+                        if result {
+                            println!("Domain {} added ({:?})", domain, path.to_string_lossy());
+                        }
+                    } else if !path.exists() {
+                        // Handle deletion
+                        if DOMAINS.contains_key(&domain) {
+                            println!("Domain {} removed ({:?})", domain, path.to_string_lossy());
+                            DOMAINS.remove(&domain);
+                        }
+                    }
+                });
             })
             .await
     }

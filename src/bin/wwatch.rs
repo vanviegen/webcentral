@@ -32,6 +32,14 @@ struct Args {
     #[arg(long = "modify", default_value = "true", action = clap::ArgAction::Set)]
     watch_modify: bool,
 
+    /// Match regular files
+    #[arg(long = "files", default_value = "true", action = clap::ArgAction::Set)]
+    match_files: bool,
+
+    /// Match directories
+    #[arg(long = "dirs", default_value = "true", action = clap::ArgAction::Set)]
+    match_dirs: bool,
+
     /// Output format: 'default' (CREATE/DELETE/UPDATE + path), 'path' (path only), 'silent' (no output)
     #[arg(short = 'f', long = "format", value_name = "FORMAT", default_value = "default")]
     format: String,
@@ -84,31 +92,6 @@ impl EventType {
     }
 }
 
-fn detect_event_type(path: &std::path::Path, base_dir: &std::path::Path) -> EventType {
-    let full_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base_dir.join(path)
-    };
-
-    if full_path.exists() {
-        // File exists - could be create or update
-        // We'll use a simple heuristic: if the file has content, it's likely an update
-        // Otherwise it's a create. This isn't perfect but works for most cases.
-        if let Ok(metadata) = full_path.metadata() {
-            if metadata.len() > 0 || metadata.is_dir() {
-                EventType::Update
-            } else {
-                EventType::Create
-            }
-        } else {
-            EventType::Create
-        }
-    } else {
-        EventType::Delete
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -144,80 +127,78 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("---");
     }
 
-    let base_dir = args.path.clone();
-
     // Build the watcher
-    let builder = webcentral::file_watcher::build_watcher()
+    let builder = webcentral::file_watcher::WatchBuilder::new()
         .set_base_dir(&args.path)
         .add_includes(includes)
         .add_excludes(args.excludes)
         .watch_create(args.watch_create)
         .watch_delete(args.watch_delete)
-        .watch_update(args.watch_modify);
+        .watch_update(args.watch_modify)
+        .match_files(args.match_files)
+        .match_dirs(args.match_dirs);
 
     // Handle combine mode (debounced)
     if let Some(debounce_ms) = args.combine {
         if exit_on_first {
             // In combine mode with exit-on-first, we just wait for the first CHANGES output
             builder.run_debounced(debounce_ms, move || {
-                async move {
-                    // In combine mode, just output "CHANGES"
-                    println!("CHANGES");
-                    std::process::exit(0);
-                }
+                // In combine mode, just output "CHANGES"
+                println!("CHANGES");
+                std::process::exit(0);
             }).await?;
         } else {
             // In combine mode without exit, run forever
             builder.run_debounced(debounce_ms, move || {
-                async move {
-                    println!("CHANGES");
-                }
+                println!("CHANGES");
             }).await?;
         }
     } else {
         // Normal mode - output individual changes
         if exit_on_first {
-            builder.run(move |path| {
-                let base_dir = base_dir.clone();
-                async move {
-                    // Determine event type
-                    let event_type = detect_event_type(&path, &base_dir);
-                    
-                    // Output based on format
-                    match format {
-                        OutputFormat::Default => {
-                            println!("{} {}", event_type.as_str(), path.display());
-                        }
-                        OutputFormat::Path => {
-                            println!("{}", path.display());
-                        }
-                        OutputFormat::Silent => {
-                            // No output
-                        }
+            builder.run(move |event, path| {
+                let event_type = match event {
+                    webcentral::file_watcher::WatchEvent::Create => EventType::Create,
+                    webcentral::file_watcher::WatchEvent::Delete => EventType::Delete,
+                    webcentral::file_watcher::WatchEvent::Update => EventType::Update,
+                    webcentral::file_watcher::WatchEvent::DebugWatch => return, // Ignore debug events
+                };
+                
+                // Output based on format
+                match format {
+                    OutputFormat::Default => {
+                        println!("{} {}", event_type.as_str(), path.display());
                     }
-                    
-                    // Exit immediately after first change
-                    std::process::exit(0);
+                    OutputFormat::Path => {
+                        println!("{}", path.display());
+                    }
+                    OutputFormat::Silent => {
+                        // No output
+                    }
                 }
+                
+                // Exit immediately after first change
+                std::process::exit(0);
             }).await?;
         } else {
-            builder.run(move |path| {
-                let base_dir = base_dir.clone();
-                async move {
-                    // Determine event type
-                    let event_type = detect_event_type(&path, &base_dir);
-                    
-                    // Output based on format
-                    match format {
-                        OutputFormat::Default => {
-                            println!("{} {}", event_type.as_str(), path.display());
-                        }
-                        OutputFormat::Path => {
-                            println!("{}", path.display());
-                        }
-                        OutputFormat::Silent => {
-                            // No output
-                        }
+            builder.run(move |event, path| {
+                let event_type = match event {
+                    webcentral::file_watcher::WatchEvent::Create => EventType::Create,
+                    webcentral::file_watcher::WatchEvent::Delete => EventType::Delete,
+                    webcentral::file_watcher::WatchEvent::Update => EventType::Update,
+                    webcentral::file_watcher::WatchEvent::DebugWatch => return, // Ignore debug events
+                };
+                
+                // Output based on format
+                match format {
+                    OutputFormat::Default => {
+                        println!("{} {}", event_type.as_str(), path.display());
+                    }
+                    OutputFormat::Path => {
+                        println!("{}", path.display());
+                    }
+                    OutputFormat::Silent => {
+                        // No output
                     }
                 }
             }).await?;

@@ -6,8 +6,9 @@ use tower::Service;
 
 use anyhow::Result;
 use bytes::Bytes;
-use http::{HeaderValue};
+use http::HeaderValue;
 use http_body_util::{BodyExt, Full};
+use std::error::Error as StdError;
 use hyper::{body::Incoming, Request, Response};
 use hyper_util::client::legacy::connect::{HttpConnector};
 use hyper_util::{
@@ -24,7 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::time::sleep;
 
 lazy_static::lazy_static! {
@@ -35,110 +36,6 @@ lazy_static::lazy_static! {
 
 // --- Project ---
 
-pub fn create_project(
-    dir: &Path,
-    domain: String,
-    use_firejail: bool,
-    prune_logs: i64,
-) -> Result<Arc<Project>> {
-    // Load configuration
-    let config = ProjectConfig::load(dir)?;
-    let (uid, gid) = get_ownership(dir);
-
-    // Create logger
-    let log_dir = dir.join("_webcentral_data/log");
-    let logger = Arc::new(Logger::new(log_dir, uid, gid, prune_logs)?);
-
-    // Create connector
-    let mut custom_connector = None;
-    let mut port = 0u16;
-
-    // Log project type
-    let descr = match &config.project_type {
-        ProjectType::Redirect { target } => {
-            &format!("Redirect to {}", target)
-        }
-        ProjectType::Proxy { target } => {
-            &format!("Proxy to {}", target)
-        }
-        ProjectType::TcpForward { address } => {
-            custom_connector = Some(AnyConnector::FixedTcp(address.clone()));
-            &format!("Forward to port {}", address)
-        }
-        ProjectType::UnixForward { socket_path } => {
-            custom_connector = Some(AnyConnector::FixedUnix(socket_path.clone()));
-            &format!("Forward to unix socket {}", socket_path)
-        }
-        ProjectType::Application { .. } => {
-            port = get_free_port()?;
-            let addr = format!("localhost:{}", port);
-            custom_connector = Some(AnyConnector::FixedTcp(addr.clone()));
-            &format!("Application server on {}", addr)
-        }
-        ProjectType::Static => {
-            "Static file server"
-        }
-    };
-    logger.write("", descr);
-
-    // Log configuration errors
-    for err in &config.config_errors {
-        logger.write("config", err);
-    }
-
-    let connector = if let Some(connector) = custom_connector {
-        connector
-    } else {
-        DEFAULT_CONNECTOR.clone()
-    };
-    
-    let project = Arc::new(Project {
-        domain: domain.clone(),
-        dir: dir.to_string_lossy().to_string(),
-        config: Arc::new(config.clone()),
-        logger,
-        uid,
-        gid,
-        use_firejail,
-        port: Arc::new(Mutex::new(None)),
-        process: Arc::new(Mutex::new(None)),
-        workers: Arc::new(Mutex::new(Vec::new())),
-        last_activity: Arc::new(Mutex::new(Instant::now())),
-        http_client: Client::builder(TokioExecutor::new()).build(connector.clone()),
-        connector,
-    });
-
-    // Start file watcher
-    let proj = project.clone();
-    tokio::spawn(async move {
-        if let Err(e) = proj.watch_files().await {
-            let _ = proj.logger.write("", &format!("File watcher error: {}", e));
-        }
-    });
-
-    // Start inactivity timer if configured
-    if project.config.reload.timeout > 0 {
-        let proj = project.clone();
-        tokio::spawn(async move {
-            proj.inactivity_timer().await;
-        });
-    }
-
-    // Start application process if needed
-    if let ProjectType::Application { .. } = config.project_type {
-        let proj = project.clone();
-        tokio::spawn(async move {
-            if let Err(e) = proj.start_process(port).await {
-                let _ = proj
-                    .logger
-                    .write("", &format!("Failed to start process: {}", e));
-            }
-        });
-    }
-
-    Ok(project)
-}
-
 #[derive(Debug)]
 pub struct Project {
     pub config: Arc<ProjectConfig>,
@@ -148,24 +45,138 @@ pub struct Project {
     uid: u32,
     gid: u32,
     use_firejail: bool,
-    port: Arc<Mutex<Option<u16>>>, // None means the app is still starting
+    port: u16,
+    app_ready: watch::Receiver<bool>, // Receives true when application is ready
+    app_ready_tx: watch::Sender<bool>, // Sends true when application is ready
     process: Arc<Mutex<Option<tokio::process::Child>>>,
     workers: Arc<Mutex<Vec<tokio::process::Child>>>,
     last_activity: Arc<Mutex<Instant>>,
     http_client: Client<AnyConnector, Full<Bytes>>,
     connector: AnyConnector,
+    watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Project {
-    fn needs_process_management(&self) -> bool {
-        matches!(self.config.project_type, ProjectType::Application { .. })
+    pub fn new(
+        dir: &Path,
+        domain: String,
+        use_firejail: bool,
+        prune_logs: i64,
+    ) -> Result<Arc<Project>> {
+        // Load configuration
+        let config = ProjectConfig::load(dir)?;
+        let (uid, gid) = get_ownership(dir);
+
+        // Create logger
+        let log_dir = dir.join("_webcentral_data/log");
+        let logger = Arc::new(Logger::new(log_dir, uid, gid, prune_logs)?);
+
+        // Create connector
+        let mut custom_connector = None;
+        let mut port = 0u16;
+
+        // Log project type
+        let descr = match &config.project_type {
+            ProjectType::Redirect { target } => {
+                &format!("Redirect to {}", target)
+            }
+            ProjectType::Proxy { target } => {
+                &format!("Proxy to {}", target)
+            }
+            ProjectType::TcpForward { address } => {
+                custom_connector = Some(AnyConnector::FixedTcp(address.clone()));
+                &format!("Forward to port {}", address)
+            }
+            ProjectType::UnixForward { socket_path } => {
+                custom_connector = Some(AnyConnector::FixedUnix(socket_path.clone()));
+                &format!("Forward to unix socket {}", socket_path)
+            }
+            ProjectType::Application { .. } => {
+                port = get_free_port()?;
+                let addr = format!("localhost:{}", port);
+                custom_connector = Some(AnyConnector::FixedTcp(addr.clone()));
+                &format!("Application server on {}", addr)
+            }
+            ProjectType::Static => {
+                "Static file server"
+            }
+        };
+        logger.write("supervisor", descr);
+
+        // Log configuration errors
+        for err in &config.config_errors {
+            logger.write("supervisor", err);
+        }
+
+        let (connector, http_client) = if let Some(connector) = custom_connector {
+            (connector.clone(), Client::builder(TokioExecutor::new()).build(connector))
+        } else {
+            (DEFAULT_CONNECTOR.clone(), DEFAULT_HTTP_CLIENT.clone())
+        };
+        
+        let (app_ready_tx, app_ready) = watch::channel(false);
+        
+        let project = Arc::new(Project {
+            domain: domain.clone(),
+            dir: dir.to_string_lossy().to_string(),
+            config: Arc::new(config.clone()),
+            logger,
+            uid,
+            gid,
+            use_firejail,
+            port,
+            app_ready,
+            app_ready_tx,
+            process: Arc::new(Mutex::new(None)),
+            workers: Arc::new(Mutex::new(Vec::new())),
+            last_activity: Arc::new(Mutex::new(Instant::now())),
+            http_client,
+            connector,
+            watcher_task: Mutex::new(None),
+        });
+
+        // Start file watcher
+        let proj = project.clone();
+        let watcher_handle = tokio::spawn(async move {
+            if let Err(e) = proj.clone().watch_files().await {
+                let _ = proj.logger.write("supervisor", &format!("File watcher error: {}", e));
+            }
+        });
+        
+        // Store the watcher handle (we're in sync context, so use blocking_lock or try_lock)
+        // Since we just created the project, no one else has a reference yet
+        if let Ok(mut guard) = project.watcher_task.try_lock() {
+            *guard = Some(watcher_handle);
+        }
+
+        // Start inactivity timer if configured
+        if project.config.reload.timeout > 0 {
+            let proj = project.clone();
+            tokio::spawn(async move {
+                proj.inactivity_timer().await;
+            });
+        }
+
+        // Start application process if needed
+        if let ProjectType::Application { .. } = config.project_type {
+            let proj = project.clone();
+            tokio::spawn(async move {
+                if let Err(e) = proj.start_process(port).await {
+                    let _ = proj
+                        .logger
+                        .write("supervisor", &format!("Failed to start process: {}", e));
+                }
+            });
+        }
+
+        Ok(project)
     }
 
-    pub async fn handle(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
         *self.last_activity.lock().await = Instant::now();
 
         if self.config.log_requests {
-            let _ = self.logger.write("", &format!("{} {}", req.method(), req.uri().path()));
+            let _ = self.logger.write("request", &format!("{} {}", req.method(), req.uri().path()));
         }
 
         // Apply URL rewrites
@@ -181,10 +192,10 @@ impl Project {
         // Determine handler based on configuration
         match &self.config.project_type {
             ProjectType::Redirect { target } => self.handle_redirect(req, target).await,
-            ProjectType::Proxy { target } => self.proxy_request(req, target).await,
+            ProjectType::Proxy { target } => self.clone().proxy_request(req, target).await,
             ProjectType::TcpForward { .. } => self.forward_request(req).await,
             ProjectType::UnixForward { .. } => self.forward_request(req).await,
-            ProjectType::Application { .. } => self.handle_application(req).await,
+            ProjectType::Application { .. } => self.clone().handle_application(req).await,
             ProjectType::Static => self.handle_static(req).await,
         }
     }
@@ -245,7 +256,7 @@ impl Project {
     }
 
     async fn proxy_request(
-        &self,
+        self: Arc<Self>,
         req: Request<Incoming>,
         target: &str,
     ) -> Result<Response<Full<Bytes>>> {
@@ -277,7 +288,7 @@ impl Project {
     }
 
     async fn forward_request(
-        &self,
+        self: &Arc<Self>,
         req: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>>
     {
@@ -291,7 +302,18 @@ impl Project {
         let body_bytes = body.collect().await?.to_bytes();
         let req = Request::from_parts(parts, Full::new(body_bytes));
 
-        let resp = self.http_client.request(req).await?;
+        let resp = match self.http_client.request(req).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                if e.is_connect() {
+                    // Upstream refused connection - stop the project and return specific error
+                    self.clone().stop();
+                    let source = StdError::source(&e).map(|s| s.to_string()).unwrap_or_default();
+                    anyhow::bail!("502 upstream connect failed: {}", source);
+                }
+                return Err(e.into());
+            }
+        };
 
         let (parts, body) = resp.into_parts();
         let body_bytes = body.collect().await?.to_bytes();
@@ -299,31 +321,23 @@ impl Project {
         Ok(Response::from_parts(parts, Full::new(body_bytes)))
     }
 
-    async fn handle_application(&self, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-        // Wait for port to be available (with timeout)
-        let port = self.wait_for_port().await?;
+    async fn handle_application(self: Arc<Self>, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+        // Wait for application to be ready (with timeout)
+        let mut rx = self.app_ready.clone();
+        tokio::time::timeout(Duration::from_secs(30), rx.wait_for(|&ready| ready))
+            .await
+            .map_err(|_| anyhow::anyhow!("Application startup timeout"))?
+            .map_err(|_| anyhow::anyhow!("Application startup failed"))?;
 
         // Rewrite URI to point to localhost:port
-        let uri_string = format!("http://localhost:{}{}", port, req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+        let uri_string = format!("http://localhost:{}{}", self.port, req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
         *req.uri_mut() = uri_string.parse()?;
 
         self.forward_request(req).await
     }
 
-    async fn wait_for_port(&self) -> Result<u16> {
-        for _ in 0..300 {
-            // 30 second timeout
-            if let Some(port) = *self.port.lock().await {
-                return Ok(port);
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        anyhow::bail!("Application startup timeout")
-    }
-
     async fn start_process(&self, port: u16) -> Result<()> {
-        self.logger
-            .write("", &format!("Starting on port {}", port));
+        self.logger.write("supervisor", &format!("Starting on port {}", port));
 
         let (command, docker, _workers) = match &self.config.project_type {
             ProjectType::Application {
@@ -355,8 +369,7 @@ impl Project {
         process.stdout(std::process::Stdio::piped());
         process.stderr(std::process::Stdio::piped());
 
-        self.logger
-            .write("", &format!("Starting application: {:?}", process));
+        self.logger.write("supervisor", &format!("Starting application: {:?}", process));
 
         let mut child = process.spawn()?;
 
@@ -389,26 +402,27 @@ impl Project {
         if !ready {
             child.kill().await?;
             self.logger
-                .write("", "Application failed to start listening on port");
+                .write("supervisor", "Application failed to start listening on port");
             anyhow::bail!("Port not ready");
         }
 
-        self.logger.write("", &format!("Ready on port {}", port));
+        self.logger.write("supervisor", &format!("Ready on port {}", port));
 
         // Start workers
         let workers = self.start_workers(port).await;
 
-        // Store process, workers, and port (now that we're ready)
+        // Store process and workers
         *self.process.lock().await = Some(child);
         *self.workers.lock().await = workers;
-        *self.port.lock().await = Some(port);
+
+        // Signal that application is ready
+        let _ = self.app_ready_tx.send(true);
 
         // Monitor process exit in background - extract process ID before spawning
         let child_id = self.process.lock().await.as_ref().and_then(|p| p.id());
 
         if let Some(pid) = child_id {
             let logger = self.logger.clone();
-            let port_clone = self.port.clone();
 
             tokio::spawn(async move {
                 // Periodically check if process is still running
@@ -423,15 +437,9 @@ impl Project {
 
                         if kill(Pid::from_raw(pid as i32), None).is_err() {
                             // Process no longer exists
-                            logger.write("", "Process exited");
-                            *port_clone.lock().await = None;
+                            logger.write("process", "Process exited");
                             break;
                         }
-                    }
-
-                    // Check if we still have a port (project might have been stopped)
-                    if port_clone.lock().await.is_none() {
-                        break;
                     }
                 }
             });
@@ -451,7 +459,7 @@ impl Project {
         }
 
         self.logger
-            .write("", &format!("Starting {} worker(s)", workers_map.len()));
+            .write("supervisor", &format!("Starting {} worker(s)", workers_map.len()));
 
         let mut workers = vec![];
 
@@ -461,7 +469,7 @@ impl Project {
                 Err(e) => {
                     let _ = self
                         .logger
-                        .write("", &format!("Failed to build worker {}: {}", name, e));
+                        .write("supervisor", &format!("Failed to build worker {}: {}", name, e));
                     continue;
                 }
             };
@@ -507,7 +515,7 @@ impl Project {
                 Err(e) => {
                     let _ = self
                         .logger
-                        .write("", &format!("Failed to start worker {}: {}", name, e));
+                        .write("supervisor", &format!("Failed to start worker {}: {}", name, e));
                 }
             }
         }
@@ -617,7 +625,7 @@ impl Project {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            self.logger.write("build", &stderr);
+            self.logger.write("docker", &stderr);
             anyhow::bail!("Docker build failed");
         }
 
@@ -667,53 +675,28 @@ impl Project {
         Ok(cmd)
     }
 
-    async fn watch_files(&self) -> Result<()> {
-        // Determine include patterns
-        let includes = if self.config.reload.include.is_empty() {
-            if self.needs_process_management() {
-                vec!["**/*".to_string()]
-            } else {
-                vec!["webcentral.ini".to_string(), "Procfile".to_string()]
-            }
-        } else {
-            self.config.reload.include.clone()
-        };
-
-        // Get full exclude list (default excludes + config excludes)
-        let excludes = self.config.reload.get_full_excludes();
-
+    async fn watch_files(self: Arc<Self>) -> Result<()> {
         // Clone what we need for the callback
-        let domain = self.domain.clone();
-        let logger = self.logger.clone();
+        let proj = self.clone();
 
         // Watch files with callback
-        file_watcher::build_watcher()
+        file_watcher::WatchBuilder::new()
             .set_base_dir(&self.dir)
-            .add_includes(includes)
-            .add_excludes(excludes)
+            .add_includes(&self.config.reload.include)
+            .add_excludes(&self.config.reload.exclude)
             .run_debounced(100, move || {
-                let domain = domain.clone();
-                let logger = logger.clone();
-
-                async move {
-                    logger.write(
-                        "",
-                        "Stopping due to file changes",
-                    );
-
-                    // Remove from DOMAINS map so new requests create a fresh instance
-                    crate::server::discard_project(&domain).await;
-
-                    // Note: We can't call self.stop() here because we don't have self
-                    // The project will be stopped when it's discarded from DOMAINS
-                }
+                proj.logger.write(
+                    "supervisor",
+                    "Stopping due to file changes",
+                );
+                proj.clone().stop();
             })
             .await?;
 
         Ok(())
     }
 
-    async fn inactivity_timer(&self) {
+    async fn inactivity_timer(self: &Arc<Self>) {
         let timeout = Duration::from_secs(self.config.reload.timeout as u64);
         let check_interval = Duration::from_secs((self.config.reload.timeout / 10).max(1) as u64);
 
@@ -722,33 +705,50 @@ impl Project {
 
             let last = *self.last_activity.lock().await;
             if last.elapsed() > timeout {
-                let _ = self.logger.write("", "Stopping due to inactivity");
+                let _ = self.logger.write("supervisor", "Stopping due to inactivity");
 
-                // Stop and remove from DOMAINS map so it will be recreated on next request
-                let domain = self.domain.clone();
-                self.stop().await;
-                crate::server::discard_project(&domain).await;
+                self.clone().stop();
                 break;
             }
         }
     }
 
-    pub async fn stop(&self) {
-        // Send SIGTERM first, then force kill after delay
-        let pids: Vec<u32> = {
+    /// Stop this project and remove it from DOMAINS if it's still the active project
+    pub fn stop(self: Arc<Self>) {
+        // Remove from DOMAINS only if we're still the active project for this domain
+        if !crate::server::remove_project_if_current(&self.domain, &self) {
+            return; // Already stopped
+        }
+        self.logger.write("supervisor", "Stopping app");
+
+        // Abort the file watcher task
+        if let Ok(mut guard) = self.watcher_task.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+
+        // Take ownership of processes synchronously using try_lock, collecting PIDs and Child handles
+        let (pids, processes): (Vec<u32>, Vec<tokio::process::Child>) = {
             let mut pids = vec![];
-            if let Some(process) = self.process.lock().await.as_ref() {
-                if let Some(pid) = process.id() {
-                    pids.push(pid);
+            let mut processes = vec![];
+            if let Ok(mut guard) = self.process.try_lock() {
+                if let Some(process) = guard.take() {
+                    if let Some(pid) = process.id() {
+                        pids.push(pid);
+                    }
+                    processes.push(process);
                 }
             }
-            let workers = self.workers.lock().await;
-            for worker in workers.iter() {
-                if let Some(pid) = worker.id() {
-                    pids.push(pid);
+            if let Ok(mut workers) = self.workers.try_lock() {
+                for worker in workers.drain(..) {
+                    if let Some(pid) = worker.id() {
+                        pids.push(pid);
+                    }
+                    processes.push(worker);
                 }
             }
-            pids
+            (pids, processes)
         };
 
         // Send SIGTERM to all processes
@@ -763,24 +763,17 @@ impl Project {
         }
 
         // Wait for graceful shutdown (but don't block - do it in background)
-        let process_clone = self.process.clone();
-        let workers_clone = self.workers.clone();
-        let port_clone = self.port.clone();
         let logger_clone = self.logger.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(2500)).await;
+            // Give processes 5s total to exit gracefully
+            tokio::time::sleep(Duration::from_millis(5000)).await;
 
-            // Force kill if still running
-            if let Some(mut process) = process_clone.lock().await.take() {
-                let _ = process.kill().await;
+            // Force kill any still running and reap to avoid zombies
+            for mut process in processes {
+                let _ = process.kill();
+                let _ = process.wait().await;
             }
-            let mut workers = workers_clone.lock().await;
-            for worker in workers.iter_mut() {
-                let _ = worker.kill().await;
-            }
-            workers.clear();
-            *port_clone.lock().await = None;
-            logger_clone.write("", "Stopped");
+            logger_clone.write("supervisor", "Stopped app");
         });
     }
 
@@ -796,8 +789,6 @@ impl Project {
         // Get the upgrade future before we return a response
         let upgrade_fut = hyper::upgrade::on(req);
 
-        println!("Upgrading connection to backend: {}", uri);
-
         // Connect to backend
         let mut connector = self.connector.clone();
         let io = connector.call(uri.clone()).await.map_err(|e| anyhow::anyhow!("Connector error: {}", e))?;
@@ -806,8 +797,6 @@ impl Project {
         // Build and send the upgrade request to backend
         let mut buf = Vec::new();
         use std::io::Write;
-
-        println!("Sending upgrade request to backend: {}", uri);
 
         let path = uri
             .path_and_query()
@@ -822,14 +811,10 @@ impl Project {
         }
         buf.extend_from_slice(b"\r\n");
 
-        println!("Upgrade request:\n{}", String::from_utf8_lossy(&buf));
-
         backend
             .write_all(&buf)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send upgrade request to backend: {}", e))?;
-
-        println!("Sent upgrade request to backend");
 
         // Read response headers from backend
         let mut response_buf = [0u8; 4096];
@@ -858,7 +843,6 @@ impl Project {
         };
 
         let response_str = String::from_utf8_lossy(&response_buf[..header_end]);
-        println!("Backend response:\n{}", response_str);
 
         // Parse backend response to extract status and headers
         let mut response_lines = response_str.lines();
@@ -899,10 +883,7 @@ impl Project {
                             .write_all(&response_buf[header_end..bytes_read])
                             .await
                         {
-                            logger.write(
-                                "error",
-                                &format!("Failed to write excess data to client: {}", e),
-                            );
+                            logger.write("error", &format!("Failed to write excess data to client: {}", e));
                             return;
                         }
                     }
@@ -930,7 +911,13 @@ fn is_upgrade_request(req: &Request<Incoming>) -> bool {
 }
 
 fn get_free_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind("localhost:0")?;
+    use std::os::unix::io::AsRawFd;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    // Allow immediate port reuse - without this, ~5% failure rate in tests
+    unsafe {
+        libc::setsockopt(listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR,
+            &1i32 as *const _ as _, std::mem::size_of::<i32>() as _);
+    }
     Ok(listener.local_addr()?.port())
 }
 
@@ -956,7 +943,7 @@ async fn wait_for_port(port: u16, timeout: Duration) -> bool {
         if StdTcpStream::connect(format!("localhost:{}", port)).is_ok() {
             return true;
         }
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(100)).await;
     }
 
     false

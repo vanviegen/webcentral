@@ -98,6 +98,16 @@ impl Logger {
 
         *file = Some(new_file);
 
+        #[cfg(unix)]
+        {
+            // Create/update 'current' symlink
+            let symlink_path = self.dir.join("current");
+            let log_filename = format!("{}.log", date);
+            let _ = fs::remove_file(&symlink_path); // Remove old symlink if exists
+            use std::os::unix::fs::symlink;
+            let _ = symlink(&log_filename, &symlink_path);
+        }
+
         // Clean up old log files if pruning is enabled
         if self.prune_days > 0 {
             let dir = self.dir.clone();

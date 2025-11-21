@@ -254,6 +254,20 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
         ProjectType::Static
     };
 
+    let include = if ini_map.map.contains_key("reload.include") {
+        ini_map.fetch_array("reload.include")
+    } else {
+        // Default includes when not specified
+        if let ProjectType::Application { .. } = project_type {
+            vec!["**/*".to_string()]
+        } else {
+            vec!["/webcentral.ini".to_string(), "/Procfile".to_string()]
+        }
+    };
+
+    let mut exclude = ini_map.fetch_array("reload.exclude");
+    exclude.extend(DEFAULT_EXCLUDES.iter().map(|s| s.to_string()));
+
     // Read common configuration
     let mut config = ProjectConfig {
         dir,
@@ -264,8 +278,8 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
         environment: ini_map.fetch_prefix("environment"),
         reload: ReloadConfig {
             timeout: ini_map.fetch_parse_default("reload.timeout", 300),
-            include: ini_map.fetch_array("reload.include"),
-            exclude: ini_map.fetch_array("reload.exclude"),
+            include,
+            exclude,
         },
         rewrites: ini_map.fetch_prefix("rewrite"),
         config_errors: ini_map.errors.clone(),
@@ -371,13 +385,15 @@ pub struct DockerConfig {
 /// Default file patterns to exclude from file watching.
 /// These patterns are always excluded from triggering reloads.
 pub const DEFAULT_EXCLUDES: &[&str] = &[
-    "_webcentral_data/**",
-    "node_modules/**",
-    "**/*.log",
-    "**/.*",
-    "data/**",
-    "log/**",
-    "logs/**",
+    "/_webcentral_data",
+    "node_modules",
+    "*.bak",
+    "*.sw?", // vim swap files
+    ".*", // hidden files
+    "data",
+    "*.log",
+    "log",
+    "logs",
 ];
 
 #[derive(Debug, Clone)]
@@ -394,15 +410,6 @@ impl Default for ReloadConfig {
             include: Vec::new(),
             exclude: Vec::new(),
         }
-    }
-}
-
-impl ReloadConfig {
-    /// Get the full exclude list including default excludes.
-    pub fn get_full_excludes(&self) -> Vec<String> {
-        let mut excludes = DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        excludes.extend(self.exclude.clone());
-        excludes
     }
 }
 
