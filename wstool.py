@@ -242,6 +242,8 @@ class WebSocketServer:
                     headers[key.lower()] = value
                     
             if 'sec-websocket-key' not in headers:
+                # Not a WebSocket upgrade request - return 404
+                client.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
                 client.close()
                 return
                 

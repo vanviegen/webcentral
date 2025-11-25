@@ -33,6 +33,7 @@ class TestRunner:
         self.log_positions = {}  # project -> position in log file
         self.use_firejail = True
         self.current_test_domain = None  # Set during test execution
+        self.current_test_domains = set()  # All domains used in current test
 
     def find_free_port(self):
         """Find a random free port"""
@@ -65,9 +66,8 @@ class TestRunner:
         print(f"Test port: {self.port}")
 
         # Start webcentral process
-        today = datetime.now().strftime('%Y-%m-%d')
-        stdout_log = f"{self.tmpdir}/stdout/_webcentral_data/logs/{today}.log"
-        stderr_log = f"{self.tmpdir}/stderr/_webcentral_data/logs/{today}.log"
+        stdout_log = f"{self.tmpdir}/stdout/_webcentral_data/logs/current"
+        stderr_log = f"{self.tmpdir}/stderr/_webcentral_data/logs/current"
 
         stdout_f = open(stdout_log, 'w')
         stderr_f = open(stderr_log, 'w')
@@ -124,11 +124,10 @@ class TestRunner:
 
     def get_log_path(self, project):
         """Get the log file path for a project"""
-        today = datetime.now().strftime('%Y-%m-%d')
         if project in ['stdout', 'stderr']:
-            return f"{self.tmpdir}/{project}/_webcentral_data/logs/{today}.log"
+            return f"{self.tmpdir}/{project}/_webcentral_data/logs/current"
         else:
-            return f"{self.tmpdir}/{project}/_webcentral_data/log/{today}.log"
+            return f"{self.tmpdir}/{project}/_webcentral_data/log/current"
 
     def get_log_content(self, project, from_pos=0):
         """Read log content from a given position"""
@@ -147,10 +146,15 @@ class TestRunner:
             return 0
         return os.path.getsize(log_path)
 
-    def write_file(self, path, content, absolute=False):
-        """Write a file in the test directory. Path is prefixed with test domain unless absolute=True."""
-        if not absolute and self.current_test_domain and not path.startswith(self.current_test_domain):
-            path = f"{self.current_test_domain}/{path}"
+    def write_file(self, path, content, domain=None):
+        """Write a file in the test directory. Path is prefixed with domain (defaults to current_test_domain)."""
+        if domain is None:
+            domain = self.current_test_domain
+        if domain:
+            # Track this domain
+            self.current_test_domains.add(domain)
+            if not path.startswith(domain):
+                path = f"{domain}/{path}"
         full_path = os.path.join(self.tmpdir, path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         with open(full_path, 'w') as f:
@@ -163,59 +167,75 @@ class TestRunner:
         self.log_positions[project] = self.get_current_log_position(project)
 
     def mark_all_logs_read(self):
-        """Mark all existing log files at current position"""
-        import glob
-        today = datetime.now().strftime('%Y-%m-%d')
-
-        # Find all project log files
-        log_pattern = f"{self.tmpdir}/**/_webcentral_data/log/{today}.log"
-        for log_file in glob.glob(log_pattern, recursive=True):
-            # Extract project name from path
-            rel_path = os.path.relpath(log_file, self.tmpdir)
-            project = rel_path.split(os.sep)[0]
-            self.log_positions[project] = os.path.getsize(log_file) if os.path.exists(log_file) else 0
+        """Mark all log files for current test domains at current position"""
+        # Mark logs for all domains used in this test
+        for domain in self.current_test_domains:
+            self.log_positions[domain] = self.get_current_log_position(domain)
 
         # Also mark stdout/stderr
         for special in ['stdout', 'stderr']:
             self.log_positions[special] = self.get_current_log_position(special)
 
     def show_all_new_logs(self):
-        """Show all log files that have new content since last mark"""
-        today = datetime.now().strftime('%Y-%m-%d')
-
+        """Show complete logs for all domains in current test, with read parts in gray"""
         # Small delay to give webcentral opportunity to log everything it wants to log
         from time import sleep
         sleep(0.5)
 
+        DARK_GRAY = '\033[38;5;240m'
         has_output = False
 
-        # Check project logs
-        log_pattern = f"{self.tmpdir}/**/_webcentral_data/log/{today}.log"
-        for log_file in glob.glob(log_pattern, recursive=True):
-            rel_path = os.path.relpath(log_file, self.tmpdir)
-            project = rel_path.split(os.sep)[0]
+        # Check logs for all domains used in this test
+        for domain in self.current_test_domains:
+            log_path = self.get_log_path(domain)
+            if not os.path.exists(log_path):
+                continue
 
-            start_pos = self.log_positions.get(project, 0)
-            content = self.get_log_content(project, start_pos)
+            full_content = self.get_log_content(domain, 0)
+            if not full_content.strip():
+                continue
 
-            if content.strip():
-                if not has_output:
-                    print(f"\n{YELLOW}=== Log output ==={RESET}")
-                    has_output = True
-                print(f"\n{YELLOW}--- {project} ---{RESET}")
-                print(content)
+            if not has_output:
+                print(f"\n{YELLOW}=== Log output ==={RESET}")
+                has_output = True
+
+            read_pos = self.log_positions.get(domain, 0)
+            read_content = full_content[:read_pos] if read_pos > 0 else ""
+            new_content = full_content[read_pos:]
+
+            print(f"\n{YELLOW}--- {domain} ---{RESET}")
+            if read_content:
+                print(f"{DARK_GRAY}{read_content}{RESET}", end='')
+            if new_content:
+                print(new_content, end='')
+            if not full_content.endswith('\n'):
+                print()
 
         # Check stdout/stderr
         for special in ['stdout', 'stderr']:
-            start_pos = self.log_positions.get(special, 0)
-            content = self.get_log_content(special, start_pos)
+            log_path = self.get_log_path(special)
+            if not os.path.exists(log_path):
+                continue
 
-            if content.strip():
-                if not has_output:
-                    print(f"\n{YELLOW}=== Log output ==={RESET}")
-                    has_output = True
-                print(f"\n{YELLOW}--- {special} ---{RESET}")
-                print(content)
+            full_content = self.get_log_content(special, 0)
+            if not full_content.strip():
+                continue
+
+            if not has_output:
+                print(f"\n{YELLOW}=== Log output ==={RESET}")
+                has_output = True
+
+            read_pos = self.log_positions.get(special, 0)
+            read_content = full_content[:read_pos] if read_pos > 0 else ""
+            new_content = full_content[read_pos:]
+
+            print(f"\n{YELLOW}--- {special} ---{RESET}")
+            if read_content:
+                print(f"{DARK_GRAY}{read_content}{RESET}", end='')
+            if new_content:
+                print(new_content, end='')
+            if not full_content.endswith('\n'):
+                print()
 
     def assert_log(self, text_or_project, text=None, count=1):
         """Assert that text appears in log exactly 'count' times. 
@@ -327,6 +347,7 @@ class TestRunner:
                 # Derive domain from test name: test_foo_bar -> foo-bar.test
                 domain = test_name.replace('test_', '').replace('_', '-') + '.test'
                 self.current_test_domain = domain
+                self.current_test_domains = {domain}  # Reset and add initial domain
                 
                 try:
                     # Mark all logs at current position before test
@@ -563,12 +584,12 @@ def test_redirect_configuration(t):
 @test
 def test_multiple_projects_isolation(t):
     """Multiple projects run independently"""
-    # This test needs multiple domains, so use absolute paths
-    t.write_file('project1.test/public/index.html', '<h1>Project 1</h1>', absolute=True)
-    t.write_file('project2.test/public/index.html', '<h1>Project 2</h1>', absolute=True)
-    t.write_file('project3.test/webcentral.ini',
-                 'command=python3 -u -m http.server $PORT', absolute=True)
-    t.write_file('project3.test/index.html', '<h1>Project 3</h1>', absolute=True)
+    # This test needs multiple domains
+    t.write_file('public/index.html', '<h1>Project 1</h1>', domain='project1.test')
+    t.write_file('public/index.html', '<h1>Project 2</h1>', domain='project2.test')
+    t.write_file('webcentral.ini',
+                 'command=python3 -u -m http.server $PORT', domain='project3.test')
+    t.write_file('index.html', '<h1>Project 3</h1>', domain='project3.test')
 
     # Wait for all domains to be registered
     t.await_log('stdout', 'Domain project1.test added')
@@ -1570,7 +1591,7 @@ include[]=src/package.json
 @test
 def test_www_redirect_to_apex(t):
     """www subdomain redirects to apex domain"""
-    t.write_file('example.com/public/index.html', '<h1>Apex Domain</h1>', absolute=True)
+    t.write_file('public/index.html', '<h1>Apex Domain</h1>', domain='example.com')
 
     # Request to www.example.com should redirect to example.com
     conn = http.client.HTTPConnection('localhost', t.port)
@@ -1590,7 +1611,7 @@ def test_www_redirect_to_apex(t):
 @test
 def test_apex_redirect_to_www(t):
     """Apex domain redirects to www subdomain"""
-    t.write_file('www.example.net/public/index.html', '<h1>WWW Domain</h1>', absolute=True)
+    t.write_file('public/index.html', '<h1>WWW Domain</h1>', domain='www.example.net')
 
     # Request to example.net should redirect to www.example.net
     conn = http.client.HTTPConnection('localhost', t.port)
@@ -1662,12 +1683,6 @@ def test_websocket_proxy(t):
     # Start wstool server in echo mode
     t.write_file('Procfile', 'web: python3 -u wstool.py server $PORT')
 
-    t.mark_log_read()
-
-    # Use wstool client to connect
-    # We need to wait a bit for the server to start
-    time.sleep(0.5)
-
     # Connect to localhost but use test domain as the Host header for routing
     client = wstool.WebSocketClient(
         f'ws://{t.current_test_domain}/',
@@ -1678,6 +1693,7 @@ def test_websocket_proxy(t):
     
     try:
         client.connect()
+        t.await_log('Ready on port')
         
         # Test single message
         message1 = 'h%madsd4v$'
@@ -1813,7 +1829,7 @@ with socketserver.TCPServer(("", PORT), SimpleHandler) as httpd:
     backend_port = port_match.group(1)
 
     # Now create a forward that points to this backend
-    t.write_file('forwarder.test/webcentral.ini', f'port={backend_port}', absolute=True)
+    t.write_file('webcentral.ini', f'port={backend_port}', domain='forwarder.test')
 
     # Make request through the forwarder
     response = t.assert_http('/api/endpoint', check_code=200, host='forwarder.test')
@@ -1870,7 +1886,7 @@ with socketserver.TCPServer(("", PORT), HeaderEchoHandler) as httpd:
     backend_port = port_match.group(1)
 
     # Create a proxy that points to this backend
-    t.write_file('proxy-test.test/webcentral.ini', f'proxy=http://localhost:{backend_port}', absolute=True)
+    t.write_file('webcentral.ini', f'proxy=http://localhost:{backend_port}', domain='proxy-test.test')
 
     # Make request through the proxy
     response = t.assert_http('/api/data', check_code=200, host='proxy-test.test')
@@ -1926,10 +1942,10 @@ with socketserver.TCPServer(("", PORT), PathHandler) as httpd:
     backend_port = port_match.group(1)
 
     # Create forward
-    t.write_file('path-forward.test/webcentral.ini', f'port={backend_port}', absolute=True)
+    t.write_file('webcentral.ini', f'port={backend_port}', domain='path-forward.test')
 
     # Create proxy
-    t.write_file('path-proxy.test/webcentral.ini', f'proxy=http://localhost:{backend_port}', absolute=True)
+    t.write_file('webcentral.ini', f'proxy=http://localhost:{backend_port}', domain='path-proxy.test')
 
     # Test that both preserve paths with query strings
     forward_response = t.assert_http('/some/path?query=value', check_code=200, host='path-forward.test')

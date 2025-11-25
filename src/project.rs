@@ -417,34 +417,6 @@ impl Project {
 
         // Signal that application is ready
         let _ = self.app_ready_tx.send(true);
-
-        // Monitor process exit in background - extract process ID before spawning
-        let child_id = self.process.lock().await.as_ref().and_then(|p| p.id());
-
-        if let Some(pid) = child_id {
-            let logger = self.logger.clone();
-
-            tokio::spawn(async move {
-                // Periodically check if process is still running
-                loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-
-                    // Check if process still exists
-                    #[cfg(unix)]
-                    {
-                        use nix::sys::signal::kill;
-                        use nix::unistd::Pid;
-
-                        if kill(Pid::from_raw(pid as i32), None).is_err() {
-                            // Process no longer exists
-                            logger.write("process", "Process exited");
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-
         Ok(())
     }
 
@@ -940,8 +912,27 @@ async fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
-        if StdTcpStream::connect(format!("localhost:{}", port)).is_ok() {
-            return true;
+        // Try to make an HTTP request and check for non-5xx response
+        if let Ok(mut stream) = StdTcpStream::connect(format!("localhost:{}", port)) {
+            use std::io::{Read, Write};
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            
+            if stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").is_ok() {
+                let mut buf = [0u8; 32];
+                if let Ok(n) = stream.read(&mut buf) {
+                    // Check for "HTTP/1.x NNN" where NNN is not 5xx
+                    if n >= 12 {
+                        let response = &buf[..n];
+                        if response.starts_with(b"HTTP/1.") {
+                            // Status code starts at position 9
+                            if response[9] != b'5' {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
         }
         sleep(Duration::from_millis(100)).await;
     }
