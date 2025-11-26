@@ -533,7 +533,7 @@ impl Server {
     }
 
     async fn watch_project_directories(self: Arc<Self>) -> Result<()> {
-        use crate::file_watcher;
+        use include_exclude_watcher as file_watcher;
 
         let server = self.clone();
         file_watcher::WatchBuilder::new()
@@ -574,7 +574,8 @@ impl Server {
                     }
                 });
             })
-            .await
+            .await?;
+        Ok(())
     }
 
     async fn manage_certificate(&self, domain: String) {
@@ -652,13 +653,6 @@ impl rustls::server::ResolvesServerCert for CertResolver {
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let server_name = client_hello.server_name()?;
         let domain: &str = server_name.as_ref();
-
-        // Check if domain exists in DOMAINS
-        if !DOMAINS.contains_key(domain) {
-            // Domain not configured
-            eprintln!("Unconfigured domain: {}", domain);
-            return None;
-        }
 
         // Load certificate for the requested domain
         let (certs, key) = match self.cert_manager.get_certificate(domain) {

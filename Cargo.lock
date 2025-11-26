@@ -699,6 +699,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "include-exclude-watcher"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08273d7f87ccd95f6c9c9816c6645da06d7736feceed94e3cb61e435be1da586"
+dependencies = [
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1722,6 +1732,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "include-exclude-watcher",
  "instant-acme",
  "lazy_static",
  "libc",

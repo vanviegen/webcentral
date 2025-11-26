@@ -1,4 +1,4 @@
-use crate::file_watcher;
+use include_exclude_watcher as file_watcher;
 use crate::logger::Logger;
 use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
 use crate::streams::AnyConnector;

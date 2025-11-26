@@ -1,2 +1,2 @@
 // Library exports for webcentral
-pub mod file_watcher;
+pub use include_exclude_watcher as file_watcher;
