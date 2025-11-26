@@ -1,7 +1,16 @@
 [package]
 name = "webcentral"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2021"
+authors = ["Frank van Viegen <oss@vanviegen.net>"]
+description = "A reverse proxy that runs multiple web applications on a single server with on-demand startup, sandboxing, auto-reload, and Let's Encrypt certificates"
+license = "ISC"
+repository = "https://github.com/vanviegen/webcentral"
+homepage = "https://github.com/vanviegen/webcentral"
+readme = "README.md"
+keywords = ["reverse-proxy", "web-server", "https", "lets-encrypt", "docker", "firejail", "auto-reload", "sandboxing"]
+categories = ["web-programming::http-server", "network-programming"]
+rust-version = "1.75"
 
 [dependencies]
 tokio = { version = "1.48", features = ["full"] }
@@ -36,3 +45,8 @@ include-exclude-watcher = "0.1.0"
 opt-level = 3
 lto = true
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

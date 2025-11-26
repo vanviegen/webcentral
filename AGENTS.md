@@ -1,6 +1,6 @@
 # Webcentral
 
-A reverse proxy that runs multiple web applications on a single server. Just put your apps in directories named after their domains (like `myapp.example.com`), point its DNS at the server, and you're done! The apps will start (and shutdown) on-demand, and reload when their files change.
+A reverse proxy that runs multiple web applications for multiple users on a single server. Just put your app in a directory named like the target domain (eg `myapp.example.com/`), point DNS at the server, and you're done! The app will start (and shutdown) on-demand, and reload when its files change.
 
 
 ## Architecture

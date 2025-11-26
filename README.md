@@ -1,6 +1,6 @@
 # Webcentral
 
-A reverse proxy that runs multiple web applications on a single server. Just put your apps in directories named after their domains (like `myapp.example.com`), point its DNS at the server, and you're done! The apps will start (and shutdown) on-demand, and reload when their files change.
+A reverse proxy that runs multiple web applications for multiple users on a single server. Just put your app in a directory named like the target domain (eg `myapp.example.com/`), point DNS at the server, and you're done! The app will start (and shutdown) on-demand, and reload when its files change.
 
 
 ## Features
@@ -54,6 +54,28 @@ Create a directory at `~/webcentral-projects/someapp.yourdomain.com/` with eithe
 - A `webcentral.ini` for custom configuration
 
 Point DNS for `someapp.yourdomain.com` at your server. Up and running!
+
+---
+
+## Comparison with Alternatives
+
+| Feature | Webcentral | Caddy | Traefik | Nginx | Dokku | Coolify |
+|---------|------------|-------|---------|-------|-------|-------|
+| Auto HTTPS (Let's Encrypt) | ✓ | ✓ | ✓ | Manual | ✓ (plugin) | ✓ |
+| Zero-config static sites | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| On-demand app startup | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Auto-reload on file change | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ (git&nbsp;push) |
+| Idle shutdown | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Multi-user (shared port 80/443) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Built-in sandboxing | Docker or Firejail | ✗ | Docker | ✗ | Docker | Docker |
+| Config complexity | Minimal | Low | Medium | High | Medium | Medium |
+| Container orchestration | ✗ | ✗ | ✓ | ✗ | ✓ | ✓ |
+
+**Caddy/Nginx/Traefik** are pure reverse proxies—they route traffic but don't manage application lifecycles. You need separate tools (systemd, Docker Compose, Kubernetes) to run your apps.
+
+**Dokku/Coolify** are self-hosted PaaS platforms with git-push deployment, but require more setup and resources. They're better suited for team environments with CI/CD pipelines.
+
+**Webcentral** fills the gap for developers who want to quickly host multiple small apps/sites on a single VPS without container orchestration overhead. Just drop files in a folder and go.
 
 ---
 
