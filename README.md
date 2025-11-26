@@ -57,6 +57,28 @@ Point DNS for `someapp.yourdomain.com` at your server. Up and running!
 
 ---
 
+## Comparison with Alternatives
+
+| Feature | Webcentral | Caddy | Traefik | Nginx | Dokku | Coolify |
+|---------|------------|-------|---------|-------|-------|
+| Auto HTTPS (Let's Encrypt) | ✓ | ✓ | ✓ | Manual | ✓ (plugin) | ✓ |
+| Zero-config static sites | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| On-demand app startup | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Auto-reload on file change | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Idle shutdown | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ (git push) |
+| Multi-user (shared port 80/443) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Built-in sandboxing | Docker or Firejail | ✗ | Docker | ✗ | Docker | Docker |
+| Config complexity | Minimal | Low | Medium | High | Medium | Medium |
+| Container orchestration | ✗ | ✗ | ✓ | ✗ | ✓ | ✓ |
+
+**Caddy/Nginx/Traefik** are pure reverse proxies—they route traffic but don't manage application lifecycles. You need separate tools (systemd, Docker Compose, Kubernetes) to run your apps.
+
+**Dokku/Coolify** are self-hosted PaaS platforms with git-push deployment, but require more setup and resources. They're better suited for team environments with CI/CD pipelines.
+
+**Webcentral** fills the gap for developers who want to quickly host multiple small apps/sites on a single VPS without container orchestration overhead. Just drop files in a folder and go.
+
+---
+
 ## Non-root vs root usage
 
 When run as a regular user, by default Webcentral searches `~/webcentral-projects/` for project directories. When run as root, it searches all users' `webcentral-projects` directories by default and runs each project with its owner's permissions. This allows multiple users to share the precious ports 80 and 443, without having to give them privileged access to the server.
