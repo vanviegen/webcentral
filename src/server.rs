@@ -158,6 +158,25 @@ impl Server {
     }
 
     pub async fn start(self: Arc<Self>) -> Result<()> {
+        // Bind listeners early so we fail fast if ports are in use
+        let http_listener = if self.config.http > 0 {
+            let addr = format!("0.0.0.0:{}", self.config.http);
+            Some(TcpListener::bind(&addr).await.map_err(|e| {
+                anyhow::anyhow!("Failed to bind HTTP server on port {}: {}", self.config.http, e)
+            })?)
+        } else {
+            None
+        };
+
+        let https_listener = if self.config.https > 0 {
+            let addr = format!("0.0.0.0:{}", self.config.https);
+            Some(TcpListener::bind(&addr).await.map_err(|e| {
+                anyhow::anyhow!("Failed to bind HTTPS server on port {}: {}", self.config.https, e)
+            })?)
+        } else {
+            None
+        };
+
         // Start directory watcher to maintain DOMAINS
         let server = self.clone();
         tokio::spawn(async move {
@@ -171,34 +190,31 @@ impl Server {
         server.scan_all_project_directories().await;
 
         // Start HTTP server
-        if self.config.http > 0 {
+        if let Some(listener) = http_listener {
+            println!("HTTP server listening on port {}", self.config.http);
             let server = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = server.run_http_server().await {
+                if let Err(e) = server.run_http_server(listener).await {
                     eprintln!("HTTP server error: {}", e);
                 }
             });
-            println!("HTTP server listening on port {}", self.config.http);
         }
 
         // Start HTTPS server
-        if self.config.https > 0 {
+        if let Some(listener) = https_listener {
+            println!("HTTPS server listening on port {}", self.config.https);
             let server = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = server.run_https_server().await {
+                if let Err(e) = server.run_https_server(listener).await {
                     eprintln!("HTTPS server error: {}", e);
                 }
             });
-            println!("HTTPS server listening on port {}", self.config.https);
         }
 
         Ok(())
     }
 
-    async fn run_http_server(self: Arc<Self>) -> Result<()> {
-        let addr = format!("0.0.0.0:{}", self.config.http);
-        let listener = TcpListener::bind(&addr).await?;
-
+    async fn run_http_server(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         loop {
             let (stream, _) = listener.accept().await?;
             let server = self.clone();
@@ -221,10 +237,7 @@ impl Server {
         }
     }
 
-    async fn run_https_server(self: Arc<Self>) -> Result<()> {
-        let addr = format!("0.0.0.0:{}", self.config.https);
-        let listener = TcpListener::bind(&addr).await?;
-
+    async fn run_https_server(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         // Create TLS config with SNI resolver
         let cert_manager = self
             .cert_manager
@@ -540,6 +553,7 @@ impl Server {
             .set_base_dir("/")
             .add_include(format!("{}/*.*", self.config.projects))
             .return_absolute(true)
+            .match_files(false)
             .run(move |_event, path| {
                 let server = server.clone();
                 tokio::spawn(async move {

@@ -551,71 +551,54 @@ impl Project {
         let mut hasher = DefaultHasher::new();
         self.dir.hash(&mut hasher);
         let hash = hasher.finish();
-
         let container_name = format!("webcentral-{:x}", hash);
-        let image_name = format!("{}:latest", container_name);
 
-        // Build Dockerfile
-        let mut dockerfile = format!("FROM {}\n", dc.base);
+        let image_name = if dc.packages.is_empty() && dc.commands.is_empty() {
+            // Just use the base image
+            dc.base.clone()
+        } else {
+            // Create our own Dockerfile, as we need some RUN commands
+            let image_name = format!("{}:latest", container_name);
 
-        if !dc.packages.is_empty() {
-            let packages = dc.packages.join(" ");
-            dockerfile.push_str(&format!(
-                "RUN if command -v apk > /dev/null ; then apk update && apk add --no-cache {} ; \
-                elif command -v apt-get > /dev/null ; then apt-get update && apt-get install --no-install-recommends --yes {} ; \
-                elif command -v dnf > /dev/null ; then dnf install -y {} ; \
-                elif command -v yum > /dev/null ; then yum install -y {} ; \
-                else echo 'No supported package manager found' && exit 1 ; fi\n",
-                packages, packages, packages, packages
-            ));
-        }
+            // Build Dockerfile
+            let mut dockerfile = format!("FROM {}\n", dc.base);
 
-        if dc.mount_app_dir {
-            dockerfile.push_str(&format!("WORKDIR {}\n", dc.app_dir));
-            if !dc.commands.is_empty() {
-                dockerfile.push_str("COPY . .\n");
-                for cmd in &dc.commands {
-                    dockerfile.push_str(&format!("RUN {}\n", cmd));
-                }
+            for cmd in &dc.commands {
+                dockerfile.push_str(&format!("RUN {}\n", cmd));
             }
-        }
 
-        dockerfile.push_str(&format!("EXPOSE {}\n", dc.http_port));
+            // Write Dockerfile
+            let dockerfile_path = PathBuf::from(&self.dir).join("_webcentral_data/Dockerfile");
+            fs::create_dir_all(dockerfile_path.parent().unwrap())?;
+            fs::write(&dockerfile_path, dockerfile)?;
 
-        // Write Dockerfile
-        let dockerfile_path = PathBuf::from(&self.dir).join("_webcentral_data/Dockerfile");
-        fs::create_dir_all(dockerfile_path.parent().unwrap())?;
-        fs::write(&dockerfile_path, dockerfile)?;
+            // Build image
+            let output = Command::new(get_docker_path())
+                .args(&["build", "-t", &image_name, "-f"])
+                .arg(&dockerfile_path)
+                .arg(&self.dir)
+                .output()
+                .await?;
 
-        // Build image
-        let output = Command::new("docker")
-            .args(&["build", "-t", &image_name, "-f"])
-            .arg(&dockerfile_path)
-            .arg(&self.dir)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            self.logger.write("docker", &stderr);
-            anyhow::bail!("Docker build failed");
-        }
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                self.logger.write("docker", &stderr);
+                anyhow::bail!("Docker build failed");
+            }
+            image_name
+        };
 
         // Prepare run command
-        let mut cmd = Command::new("docker");
+        let mut cmd = Command::new(get_docker_path());
         cmd.args(&["run", "--rm", "--name", &container_name]);
-
-        // Mount /etc/passwd and /etc/group
-        cmd.args(&["--mount", "type=bind,src=/etc/passwd,dst=/etc/passwd"]);
-        cmd.args(&["--mount", "type=bind,ro,src=/etc/group,dst=/etc/group"]);
 
         // Port mapping
         cmd.args(&["-p", &format!("{}:{}", port, dc.http_port)]);
 
-        // User and app directory mount
+        // App directory mount
         if dc.mount_app_dir {
-            cmd.args(&["--user", &format!("{}:{}", self.uid, self.gid)]);
             cmd.args(&["-v", &format!("{}:{}", self.dir, dc.app_dir)]);
+            cmd.args(&["-w", &dc.app_dir]);
         }
 
         // Additional mounts
@@ -627,7 +610,7 @@ impl Project {
             };
             let host_path = PathBuf::from(&self.dir)
                 .join("_webcentral_data/mounts")
-                .join(&container_path);
+                .join(&container_path.trim_start_matches('/'));
             fs::create_dir_all(&host_path)?;
             cmd.args(&["-v", &format!("{}:{}", host_path.display(), container_path)]);
         }
@@ -940,3 +923,28 @@ async fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
+/// Returns the path to podman or docker, checking PATH on first call.
+/// Prefers podman if available, falls back to docker, warns if neither found.
+fn get_docker_path() -> &'static str {
+    use std::sync::OnceLock;
+    use std::os::unix::fs::PermissionsExt;
+    static DOCKER_PATH: OnceLock<String> = OnceLock::new();
+
+    DOCKER_PATH.get_or_init(|| {
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        // Check for podman first (preferred), then docker
+        for cmd in &["podman", "docker"] {
+            for dir in path_var.split(':') {
+                let full_path = PathBuf::from(dir).join(cmd);
+                if let Ok(meta) = fs::metadata(&full_path) {
+                    if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 {
+                        return full_path.to_string_lossy().to_string();
+                    }
+                }
+            }
+        }
+        // Neither found, warn and fall back to "docker"
+        println!("Warning: neither podman nor docker found in PATH, using 'docker'");
+        "docker".to_string()
+    })
+}

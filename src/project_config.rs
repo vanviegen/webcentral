@@ -176,18 +176,14 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
     } else if let Some(host) = ini_map.fetch("host") {
         let port = ini_map.fetch_parse_default("port", 80);
         ProjectType::TcpForward { address: format!("{}:{}", host, port) }
-    } else if let Some(command) = ini_map.fetch("command") {
+    } else if ini_map.map.contains_key("command") || ini_map.map.keys().any(|k| k.starts_with("docker.")) {
+        let command = ini_map.fetch("command").unwrap_or_default();
+
         let mut workers = HashMap::new();
         if let Some(worker_cmd) = ini_map.fetch("worker") {
             workers.insert("default".to_string(), worker_cmd);
         }
-        for key in ini_map
-            .map
-            .keys()
-            .filter(|k| k.starts_with("worker:"))
-            .cloned()
-            .collect::<Vec<_>>()
-        {
+        for key in ini_map.map.keys().filter(|k| k.starts_with("worker:")).cloned().collect::<Vec<_>>() {
             if let Some(cmd) = ini_map.fetch(&key) {
                 workers.insert(key[7..].to_string(), cmd);
             }
@@ -195,15 +191,11 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
 
         let docker = if ini_map.map.keys().any(|k| k.starts_with("docker.")) {
             Some(DockerConfig {
-                base: ini_map
-                    .fetch("docker.base")
-                    .unwrap_or_else(|| "alpine".to_string()),
+                base: ini_map.fetch("docker.base").unwrap_or_else(|| "alpine".to_string()),
                 packages: ini_map.fetch_array("docker.packages"),
                 commands: ini_map.fetch_array("docker.commands"),
                 http_port: ini_map.fetch_parse_default("docker.http_port", 8000),
-                app_dir: ini_map
-                    .fetch("docker.app_dir")
-                    .unwrap_or_else(|| "/app".to_string()),
+                app_dir: ini_map.fetch("docker.app_dir").unwrap_or_else(|| "/app".to_string()),
                 mount_app_dir: ini_map.fetch_bool("docker.mount_app_dir").unwrap_or(true),
                 mounts: ini_map.fetch_array("docker.mounts"),
             })
@@ -211,45 +203,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
             None
         };
 
-        ProjectType::Application {
-            command,
-            docker,
-            workers,
-        }
-    } else if ini_map.map.keys().any(|k| k.starts_with("docker.")) {
-        let mut workers = HashMap::new();
-        if let Some(worker_cmd) = ini_map.fetch("worker") {
-            workers.insert("default".to_string(), worker_cmd);
-        }
-        for key in ini_map
-            .map
-            .keys()
-            .filter(|k| k.starts_with("worker:"))
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            if let Some(cmd) = ini_map.fetch(&key) {
-                workers.insert(key[7..].to_string(), cmd);
-            }
-        }
-
-        ProjectType::Application {
-            command: String::new(),
-            docker: Some(DockerConfig {
-                base: ini_map
-                    .fetch("docker.base")
-                    .unwrap_or_else(|| "alpine".to_string()),
-                packages: ini_map.fetch_array("docker.packages"),
-                commands: ini_map.fetch_array("docker.commands"),
-                http_port: ini_map.fetch_parse_default("docker.http_port", 8000),
-                app_dir: ini_map
-                    .fetch("docker.app_dir")
-                    .unwrap_or_else(|| "/app".to_string()),
-                mount_app_dir: ini_map.fetch_bool("docker.mount_app_dir").unwrap_or(true),
-                mounts: ini_map.fetch_array("docker.mounts"),
-            }),
-            workers,
-        }
+        ProjectType::Application { command, docker, workers }
     } else {
         ProjectType::Static
     };
