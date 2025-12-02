@@ -58,16 +58,22 @@ class TestRunner:
         print(f"Test directory: {self.tmpdir}")
 
         # Create stdout and stderr redirect directories
-        os.makedirs(f"{self.tmpdir}/stdout/_webcentral_data/logs", exist_ok=True)
-        os.makedirs(f"{self.tmpdir}/stderr/_webcentral_data/logs", exist_ok=True)
+        os.makedirs(f"{self.tmpdir}/stdout/_webcentral_data/log")
+        os.makedirs(f"{self.tmpdir}/stderr/_webcentral_data/log")
+
+        # Create path for pre-existing directory test
+        pre = f"{self.tmpdir}/pre-existing-directory.test/public"
+        os.makedirs(pre)
+        with open(pre+"/index.html", 'w') as f:
+            f.write("I was already here")
 
         # Find free port
         self.port = self.find_free_port()
         print(f"Test port: {self.port}")
 
         # Start webcentral process
-        stdout_log = f"{self.tmpdir}/stdout/_webcentral_data/logs/current"
-        stderr_log = f"{self.tmpdir}/stderr/_webcentral_data/logs/current"
+        stdout_log = f"{self.tmpdir}/stdout/_webcentral_data/log/current"
+        stderr_log = f"{self.tmpdir}/stderr/_webcentral_data/log/current"
 
         stdout_f = open(stdout_log, 'w')
         stderr_f = open(stderr_log, 'w')
@@ -124,10 +130,7 @@ class TestRunner:
 
     def get_log_path(self, project):
         """Get the log file path for a project"""
-        if project in ['stdout', 'stderr']:
-            return f"{self.tmpdir}/{project}/_webcentral_data/logs/current"
-        else:
-            return f"{self.tmpdir}/{project}/_webcentral_data/log/current"
+        return f"{self.tmpdir}/{project}/_webcentral_data/log/current"
 
     def get_log_content(self, project, from_pos=0):
         """Read log content from a given position"""
@@ -417,6 +420,11 @@ def test(func):
 # ============================================================================
 # TESTS
 # ============================================================================
+
+@test
+def test_pre_existing_project(t):
+    """Project with pre-existing directory is served correctly"""
+    t.assert_http('/', check_body='I was already here', host='pre-existing-directory.test')
 
 @test
 def test_static_file_serving(t):

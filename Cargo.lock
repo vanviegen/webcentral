@@ -700,9 +700,9 @@ dependencies = [
 
 [[package]]
 name = "include-exclude-watcher"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c5e50370419792f8c9c23754ca1e9e79f7a1c75d63f223e21a79946e5863032"
+checksum = "93600477b836eedb33f8b6d1d2aa5cd579020a52f0b7d59d7fe622dd0df3e523"
 dependencies = [
  "libc",
  "tokio",
@@ -1720,7 +1720,7 @@ dependencies = [
 
 [[package]]
 name = "webcentral"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "anyhow",
  "bytes",

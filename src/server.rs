@@ -17,6 +17,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 
 // Domain information stored in the global DOMAINS map
@@ -76,6 +77,7 @@ pub struct Server {
     config: crate::GlobalConfig,
     cert_manager: Option<Arc<CertManager>>,
     bindings: HashSet<String>,
+    write_bindings_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Server {
@@ -97,7 +99,8 @@ impl Server {
         Ok(Server {
             config,
             cert_manager,
-            bindings
+            bindings,
+            write_bindings_task: Mutex::new(None),
         })
     }
 
@@ -157,6 +160,26 @@ impl Server {
         Ok(())
     }
 
+    // Schedule write_bindings to run 500ms after the last call (debounced)
+    fn schedule_write_bindings(self: &Arc<Self>) {
+        let server = self.clone();
+        tokio::spawn(async move {
+            let mut guard = server.write_bindings_task.lock().await;
+            // Abort any pending write task
+            if let Some(task) = guard.take() {
+                task.abort();
+            }
+            // Spawn new delayed task
+            let server_clone = server.clone();
+            *guard = Some(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Err(e) = server_clone.write_bindings() {
+                    eprintln!("Failed to write bindings: {}", e);
+                }
+            }));
+        });
+    }
+
     pub async fn start(self: Arc<Self>) -> Result<()> {
         // Bind listeners early so we fail fast if ports are in use
         let http_listener = if self.config.http > 0 {
@@ -180,14 +203,22 @@ impl Server {
         // Start directory watcher to maintain DOMAINS
         let server = self.clone();
         tokio::spawn(async move {
-            if let Err(e) = server.watch_project_directories().await {
+            use include_exclude_watcher as file_watcher;
+
+            if let Err(e) = file_watcher::Watcher::new()
+                .set_base_dir("/")
+                .add_include(format!("{}/*.*", server.config.projects))
+                .return_absolute(true)
+                .match_files(false)
+                .watch_update(false)
+                .watch_initial(true)
+                .run(move |_event, path| {
+                    server.process_project_directory(&path);
+                })
+                .await {
                 eprintln!("Directory watcher error: {}", e);
             }
         });
-
-        // Do initial scan to populate DOMAINS
-        let server = self.clone();
-        server.scan_all_project_directories().await;
 
         // Start HTTP server
         if let Some(listener) = http_listener {
@@ -469,22 +500,32 @@ impl Server {
     }
 
     // Process a directory path, validating domain and setting up project + certificate
-    async fn process_project_directory(
+    fn process_project_directory(
         self: &Arc<Self>,
         path: &std::path::Path,
-    ) -> bool {
+    ) {
         if !path.is_dir() {
-            return false; // It's a file
+            return; // It's a file
         }
         let Some(domain_name) = path.file_name().and_then(|n| n.to_str()) else {
-            return false; // Shouldn't happen?
+            return ; // Shouldn't happen?
         };
         if !VALID_DOMAIN.is_match(domain_name) {
-            return false; // It doesn't look like a domain name
+            return; // It doesn't look like a domain name
+        }
+        let domain = domain_name.to_lowercase();
+
+        if !path.exists() {
+            // Handle deletion
+            if DOMAINS.contains_key(&domain) {
+                println!("Domain {} removed ({:?})", domain, path.to_string_lossy());
+                DOMAINS.remove(&domain);
+                self.schedule_write_bindings();
+            }
+            return;
         }
         
         let directory = path.to_string_lossy().to_string();
-        let domain = domain_name.to_lowercase();
         
         // Check if domain exists and if transfer is allowed
         if let Some(existing) = DOMAINS.get(&domain) {
@@ -495,7 +536,7 @@ impl Server {
                     "Rejecting domain override attempt for {} from unauthorized directory {}",
                     domain, directory
                 );
-                return false;
+                return;
             }
             println!(
                 "Overriding domain {} from {} to {}{}",
@@ -522,74 +563,9 @@ impl Server {
             None
         };
 
+        println!("Domain {} added ({:?})", &domain, directory);
         DOMAINS.insert(domain, DomainInfo::new(directory, cert_task));
-        return true;
-    }
-
-    async fn scan_all_project_directories(self: Arc<Self>) {
-        // Read authorized bindings from previous run
-        for entry in glob::glob(&self.config.projects).unwrap() {
-            if let Ok(base_path) = entry {
-                if let Ok(entries) = fs::read_dir(base_path) {
-                    for entry in entries.flatten() {
-                        self.process_project_directory(&entry.path())
-                            .await;
-                    }
-                }
-            }
-        }
-
-        // Write current bindings to file
-        if let Err(e) = self.write_bindings() {
-            eprintln!("Failed to write bindings: {}", e);
-        }
-    }
-
-    async fn watch_project_directories(self: Arc<Self>) -> Result<()> {
-        use include_exclude_watcher as file_watcher;
-
-        let server = self.clone();
-        file_watcher::WatchBuilder::new()
-            .set_base_dir("/")
-            .add_include(format!("{}/*.*", self.config.projects))
-            .return_absolute(true)
-            .match_files(false)
-            .run(move |_event, path| {
-                let server = server.clone();
-                tokio::spawn(async move {
-                    let Some(domain) = path.file_name().and_then(|n| n.to_str()) else {
-                        return;
-                    };
-                    if !VALID_DOMAIN.is_match(domain) {
-                        return;
-                    }
-                    let domain = domain.to_string();
-
-                    if path.exists() && path.is_dir() {
-                        // Check if already exists with same directory
-                        let path_str = path.to_string_lossy().to_string();
-                        if let Some(info) = DOMAINS.get(&domain) {
-                            eprintln!("DEBUG: Comparing paths for domain {}: existing='{}' new='{}'", domain, info.directory, path_str);
-                            if info.directory == path_str {
-                                return;
-                            }
-                        }
-
-                        let result  = server.process_project_directory(&path).await;
-                        if result {
-                            println!("Domain {} added ({:?})", domain, path.to_string_lossy());
-                        }
-                    } else if !path.exists() {
-                        // Handle deletion
-                        if DOMAINS.contains_key(&domain) {
-                            println!("Domain {} removed ({:?})", domain, path.to_string_lossy());
-                            DOMAINS.remove(&domain);
-                        }
-                    }
-                });
-            })
-            .await?;
-        Ok(())
+        self.schedule_write_bindings();
     }
 
     async fn manage_certificate(&self, domain: String) {

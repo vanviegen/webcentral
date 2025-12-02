@@ -386,12 +386,16 @@ Make sure no other services are using ports 80 or 443.
 
 ## Changelog
 
+2025-12-02 (2.1.1):
+ - Keep bindings.json up-to-date when domains are added/removed
+ - Code reduction
 
-2025-11-27 (2.0.1):
+2025-11-27 (2.1.0):
  - Fix for unnecessary inotify watchers
  - Docker configurations without custom RUN commands or packages don't use a custom build anymore
  - Use Podman (preferred) it it's installed
  - No more Docker user mapping - root inside the container for compatibility
+ - Exit immediately if ports cannot be bound
 
 2025-11-26 (2.0.0):
  - Initial AI-driven Rust reimplementation of the [original Node.js version](https://github.com/vanviegen/webcentral/tree/nodejs). It was born out of Node.js dependency rot frustration. It also adds multi-threading, and should be fully compatible with original configuration format and project structure.

@@ -635,16 +635,16 @@ impl Project {
         let proj = self.clone();
 
         // Watch files with callback
-        file_watcher::WatchBuilder::new()
+        file_watcher::Watcher::new()
             .set_base_dir(&self.dir)
             .add_includes(&self.config.reload.include)
             .add_excludes(&self.config.reload.exclude)
             .run_debounced(100, move || {
+                proj.clone().stop();
                 proj.logger.write(
                     "supervisor",
                     "Stopping due to file changes",
                 );
-                proj.clone().stop();
             })
             .await?;
 
