@@ -1,6 +1,6 @@
 [package]
 name = "webcentral"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2021"
 authors = ["Frank van Viegen <oss@vanviegen.net>"]
 description = "A reverse proxy that runs multiple web applications on a single server with on-demand startup, sandboxing, auto-reload, and Let's Encrypt certificates"

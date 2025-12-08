@@ -386,6 +386,10 @@ Make sure no other services are using ports 80 or 443.
 
 ## Changelog
 
+2025-12-08 (2.1.2):
+ - Await process shutdown before restarting
+ - More robust process lifecycle management
+
 2025-12-02 (2.1.1):
  - Keep bindings.json up-to-date when domains are added/removed
  - Code reduction

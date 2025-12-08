@@ -22,11 +22,54 @@ use std::net::TcpStream as StdTcpStream;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, watch};
 use tokio::time::sleep;
+
+/// Monitors a process and handles graceful shutdown.
+/// Completes when the process exits (either naturally or after stop signal).
+/// When stop_rx receives `true`, sends SIGTERM then SIGKILL after 5s if needed.
+async fn monitor_process(
+    mut process: tokio::process::Child,
+    mut stop_rx: watch::Receiver<bool>,
+    logger: Arc<Logger>,
+    label: &str,
+) {
+    let pid = process.id();
+    
+    // Wait for either process exit or stop signal
+    tokio::select! {
+        status = process.wait() => {
+            // Process exited on its own
+            if let Ok(status) = status {
+                logger.write("supervisor", &format!("{} exited: {}", label, status));
+            }
+            return;
+        }
+        _ = stop_rx.wait_for(|&stopped| stopped) => {}
+    }
+    
+    // Stop signal received - send SIGTERM
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+    }
+    
+    // Wait up to 5s for graceful exit
+    tokio::select! {
+        _ = process.wait() => {}
+        _ = sleep(Duration::from_secs(5)) => {
+            // Force kill after timeout
+            let _ = process.kill();
+            let _ = process.wait().await;
+        }
+    }
+}
 
 lazy_static::lazy_static! {
      static ref DEFAULT_HTTP_CLIENT: Client<AnyConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(AnyConnector::Http(HttpConnector::new()));
@@ -36,24 +79,33 @@ lazy_static::lazy_static! {
 
 // --- Project ---
 
+/// Runtime state that changes on restart (port-dependent)
+#[derive(Debug)]
+struct RuntimeState {
+    port: u16,
+    http_client: Client<AnyConnector, Full<Bytes>>,
+    connector: AnyConnector,
+}
+
 #[derive(Debug)]
 pub struct Project {
     pub config: Arc<ProjectConfig>,
     pub logger: Arc<Logger>,
     pub domain: String,
-    dir: String,
+    dir: PathBuf,
     uid: u32,
     gid: u32,
     use_firejail: bool,
-    port: u16,
     app_ready: watch::Receiver<bool>, // Receives true when application is ready
     app_ready_tx: watch::Sender<bool>, // Sends true when application is ready
-    process: Arc<Mutex<Option<tokio::process::Child>>>,
-    workers: Arc<Mutex<Vec<tokio::process::Child>>>,
+    stop_tx: watch::Sender<bool>,      // Send true to signal all processes to stop
+    stop_rx: watch::Receiver<bool>,    // Subscribe to stop signal
+    process_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     last_activity: Arc<Mutex<Instant>>,
-    http_client: Client<AnyConnector, Full<Bytes>>,
-    connector: AnyConnector,
     watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    stopping: AtomicBool,              // True while stop() is in progress
+    pending_requests: AtomicUsize,     // Count of requests waiting for app_ready
+    runtime: std::sync::Mutex<RuntimeState>, // Port-dependent state, updated on restart
 }
 
 impl Project {
@@ -71,105 +123,120 @@ impl Project {
         let log_dir = dir.join("_webcentral_data/log");
         let logger = Arc::new(Logger::new(log_dir, uid, gid, prune_logs)?);
 
-        // Create connector
-        let mut custom_connector = None;
-        let mut port = 0u16;
-
-        // Log project type
-        let descr = match &config.project_type {
-            ProjectType::Redirect { target } => {
-                &format!("Redirect to {}", target)
-            }
-            ProjectType::Proxy { target } => {
-                &format!("Proxy to {}", target)
-            }
-            ProjectType::TcpForward { address } => {
-                custom_connector = Some(AnyConnector::FixedTcp(address.clone()));
-                &format!("Forward to port {}", address)
-            }
-            ProjectType::UnixForward { socket_path } => {
-                custom_connector = Some(AnyConnector::FixedUnix(socket_path.clone()));
-                &format!("Forward to unix socket {}", socket_path)
-            }
-            ProjectType::Application { .. } => {
-                port = get_free_port()?;
-                let addr = format!("localhost:{}", port);
-                custom_connector = Some(AnyConnector::FixedTcp(addr.clone()));
-                &format!("Application server on {}", addr)
-            }
-            ProjectType::Static => {
-                "Static file server"
-            }
-        };
-        logger.write("supervisor", descr);
+        // Create runtime state (port, connector, client)
+        let runtime = Self::create_runtime_state(&config, &logger)?;
 
         // Log configuration errors
         for err in &config.config_errors {
             logger.write("supervisor", err);
         }
 
-        let (connector, http_client) = if let Some(connector) = custom_connector {
-            (connector.clone(), Client::builder(TokioExecutor::new()).build(connector))
-        } else {
-            (DEFAULT_CONNECTOR.clone(), DEFAULT_HTTP_CLIENT.clone())
-        };
-        
         let (app_ready_tx, app_ready) = watch::channel(false);
+        let (stop_tx, stop_rx) = watch::channel(false);
         
         let project = Arc::new(Project {
             domain: domain.clone(),
-            dir: dir.to_string_lossy().to_string(),
+            dir: dir.to_path_buf(),
             config: Arc::new(config.clone()),
             logger,
             uid,
             gid,
             use_firejail,
-            port,
             app_ready,
             app_ready_tx,
-            process: Arc::new(Mutex::new(None)),
-            workers: Arc::new(Mutex::new(Vec::new())),
+            stop_tx,
+            stop_rx,
+            process_handles: Mutex::new(Vec::new()),
             last_activity: Arc::new(Mutex::new(Instant::now())),
-            http_client,
-            connector,
             watcher_task: Mutex::new(None),
+            stopping: AtomicBool::new(false),
+            pending_requests: AtomicUsize::new(0),
+            runtime: std::sync::Mutex::new(runtime),
         });
 
+        project.clone().start_tasks();
+
+        Ok(project)
+    }
+
+    /// Create runtime state (port, connector, http_client) based on project type
+    fn create_runtime_state(config: &ProjectConfig, logger: &Logger) -> Result<RuntimeState> {
+        let mut custom_connector = None;
+        let mut port = 0u16;
+
+        // Log project type
+        let descr = match &config.project_type {
+            ProjectType::Redirect { target } => {
+                format!("Redirect to {}", target)
+            }
+            ProjectType::Proxy { target } => {
+                format!("Proxy to {}", target)
+            }
+            ProjectType::TcpForward { address } => {
+                custom_connector = Some(AnyConnector::FixedTcp(address.clone()));
+                format!("Forward to port {}", address)
+            }
+            ProjectType::UnixForward { socket_path } => {
+                custom_connector = Some(AnyConnector::FixedUnix(socket_path.clone()));
+                format!("Forward to unix socket {}", socket_path)
+            }
+            ProjectType::Application { .. } => {
+                port = get_free_port()?;
+                let addr = format!("localhost:{}", port);
+                custom_connector = Some(AnyConnector::FixedTcp(addr.clone()));
+                format!("Application server on {}", addr)
+            }
+            ProjectType::Static => {
+                "Static file server".to_string()
+            }
+        };
+        logger.write("supervisor", &descr);
+
+        let (connector, http_client) = if let Some(connector) = custom_connector {
+            (connector.clone(), Client::builder(TokioExecutor::new()).build(connector))
+        } else {
+            (DEFAULT_CONNECTOR.clone(), DEFAULT_HTTP_CLIENT.clone())
+        };
+
+        Ok(RuntimeState { port, http_client, connector })
+    }
+
+    /// Start background tasks (file watcher, inactivity timer, application process)
+    /// Called from new() and after restart
+    fn start_tasks(self: Arc<Self>) {
         // Start file watcher
-        let proj = project.clone();
+        let proj = self.clone();
         let watcher_handle = tokio::spawn(async move {
             if let Err(e) = proj.clone().watch_files().await {
                 let _ = proj.logger.write("supervisor", &format!("File watcher error: {}", e));
             }
         });
         
-        // Store the watcher handle (we're in sync context, so use blocking_lock or try_lock)
-        // Since we just created the project, no one else has a reference yet
-        if let Ok(mut guard) = project.watcher_task.try_lock() {
+        // Store the watcher handle
+        if let Ok(mut guard) = self.watcher_task.try_lock() {
             *guard = Some(watcher_handle);
         }
 
         // Start inactivity timer if configured
-        if project.config.reload.timeout > 0 {
-            let proj = project.clone();
+        if self.config.reload.timeout > 0 {
+            let proj = self.clone();
             tokio::spawn(async move {
                 proj.inactivity_timer().await;
             });
         }
 
         // Start application process if needed
-        if let ProjectType::Application { .. } = config.project_type {
-            let proj = project.clone();
+        if let ProjectType::Application { .. } = self.config.project_type {
+            let proj = self.clone();
+            let port = self.runtime.lock().unwrap().port;
             tokio::spawn(async move {
-                if let Err(e) = proj.start_process(port).await {
+                if let Err(e) = proj.clone().start_process(port).await {
                     let _ = proj
                         .logger
                         .write("supervisor", &format!("Failed to start process: {}", e));
                 }
             });
         }
-
-        Ok(project)
     }
 
     pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
@@ -195,7 +262,7 @@ impl Project {
             ProjectType::Proxy { target } => self.clone().proxy_request(req, target).await,
             ProjectType::TcpForward { .. } => self.forward_request(req).await,
             ProjectType::UnixForward { .. } => self.forward_request(req).await,
-            ProjectType::Application { .. } => self.clone().handle_application(req).await,
+            ProjectType::Application { .. } => self.handle_application(req).await,
             ProjectType::Static => self.handle_static(req).await,
         }
     }
@@ -226,7 +293,7 @@ impl Project {
     }
 
     async fn handle_static(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-        let public_dir = PathBuf::from(&self.dir).join("public");
+        let public_dir = self.dir.join("public");
         if !public_dir.exists() {
             return Ok(Response::builder()
                 .status(404)
@@ -302,7 +369,8 @@ impl Project {
         let body_bytes = body.collect().await?.to_bytes();
         let req = Request::from_parts(parts, Full::new(body_bytes));
 
-        let resp = match self.http_client.request(req).await {
+        let http_client = self.runtime.lock().unwrap().http_client.clone();
+        let resp = match http_client.request(req).await {
             Ok(resp) => resp,
             Err(e) => {
                 if e.is_connect() {
@@ -321,22 +389,24 @@ impl Project {
         Ok(Response::from_parts(parts, Full::new(body_bytes)))
     }
 
-    async fn handle_application(self: Arc<Self>, mut req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-        // Wait for application to be ready (with timeout)
+    async fn handle_application(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+        // Track that we're waiting for app_ready (used during stop to determine restart)
+        self.pending_requests.fetch_add(1, Ordering::SeqCst);
+        
+        // Wait for application to be ready
         let mut rx = self.app_ready.clone();
-        tokio::time::timeout(Duration::from_secs(30), rx.wait_for(|&ready| ready))
-            .await
+        let result = tokio::time::timeout(Duration::from_secs(30), rx.wait_for(|&ready| ready)).await;
+        
+        self.pending_requests.fetch_sub(1, Ordering::SeqCst);
+        
+        result
             .map_err(|_| anyhow::anyhow!("Application startup timeout"))?
             .map_err(|_| anyhow::anyhow!("Application startup failed"))?;
-
-        // Rewrite URI to point to localhost:port
-        let uri_string = format!("http://localhost:{}{}", self.port, req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
-        *req.uri_mut() = uri_string.parse()?;
 
         self.forward_request(req).await
     }
 
-    async fn start_process(&self, port: u16) -> Result<()> {
+    async fn start_process(self: Arc<Self>, port: u16) -> Result<()> {
         self.logger.write("supervisor", &format!("Starting on port {}", port));
 
         let (command, docker, _workers) = match &self.config.project_type {
@@ -373,7 +443,7 @@ impl Project {
 
         let mut child = process.spawn()?;
 
-        // Stream logs
+        // Stream stdout to log
         if let Some(stdout) = child.stdout.take() {
             let logger = self.logger.clone();
             tokio::spawn(async move {
@@ -385,6 +455,7 @@ impl Project {
             });
         }
 
+        // Stream stderr to log
         if let Some(stderr) = child.stderr.take() {
             let logger = self.logger.clone();
             tokio::spawn(async move {
@@ -396,44 +467,50 @@ impl Project {
             });
         }
 
+        // Spawn process monitor
+        let stop_rx = self.stop_rx.clone();
+        let logger = self.logger.clone();
+        let proj = self.clone();
+        let handle = tokio::spawn(async move {
+            monitor_process(child, stop_rx, logger, "main process").await;
+            proj.stop();
+        });
+        self.process_handles.lock().await.push(handle);
+
         // Wait for port to be ready
         let ready = wait_for_port(port, Duration::from_secs(30)).await;
 
         if !ready {
-            child.kill().await?;
             self.logger
                 .write("supervisor", "Application failed to start listening on port");
+            let _ = self.app_ready_tx.send(false); // Signal startup failed
+            self.stop();
             anyhow::bail!("Port not ready");
         }
 
         self.logger.write("supervisor", &format!("Ready on port {}", port));
 
         // Start workers
-        let workers = self.start_workers(port).await;
-
-        // Store process and workers
-        *self.process.lock().await = Some(child);
-        *self.workers.lock().await = workers;
+        self.start_workers(port).await;
 
         // Signal that application is ready
         let _ = self.app_ready_tx.send(true);
+
         Ok(())
     }
 
-    async fn start_workers(&self, port: u16) -> Vec<tokio::process::Child> {
+    async fn start_workers(&self, port: u16) {
         let workers_map = match &self.config.project_type {
             ProjectType::Application { workers, .. } => workers,
-            _ => return vec![],
+            _ => return,
         };
 
         if workers_map.is_empty() {
-            return vec![];
+            return;
         }
 
         self.logger
             .write("supervisor", &format!("Starting {} worker(s)", workers_map.len()));
-
-        let mut workers = vec![];
 
         for (name, cmd) in workers_map {
             let mut process = match self.build_shell_command(cmd) {
@@ -472,6 +549,7 @@ impl Project {
                         });
                     }
                     if let Some(stderr) = child.stderr.take() {
+                        let logger = logger.clone();
                         let label = label.clone();
                         tokio::spawn(async move {
                             let reader = BufReader::new(stderr);
@@ -482,7 +560,12 @@ impl Project {
                         });
                     }
 
-                    workers.push(child);
+                    // Spawn process monitor for worker
+                    let stop_rx = self.stop_rx.clone();
+                    let handle = tokio::spawn(async move {
+                        monitor_process(child, stop_rx, logger, &label).await;
+                    });
+                    self.process_handles.lock().await.push(handle);
                 }
                 Err(e) => {
                     let _ = self
@@ -491,8 +574,6 @@ impl Project {
                 }
             }
         }
-
-        workers
     }
 
     fn build_shell_command(&self, command: &str) -> Result<Command> {
@@ -513,9 +594,9 @@ impl Project {
                 "--private-tmp",
                 "--private-dev",
                 &format!("--private={}", home),
-                &format!("--whitelist={}", self.dir),
+                &format!("--whitelist={}", self.dir.display()),
                 "--read-only=/",
-                &format!("--read-write={}", self.dir),
+                &format!("--read-write={}", self.dir.display()),
                 "--",
                 "/bin/sh",
                 "-c",
@@ -568,7 +649,7 @@ impl Project {
             }
 
             // Write Dockerfile
-            let dockerfile_path = PathBuf::from(&self.dir).join("_webcentral_data/Dockerfile");
+            let dockerfile_path = self.dir.join("_webcentral_data/Dockerfile");
             fs::create_dir_all(dockerfile_path.parent().unwrap())?;
             fs::write(&dockerfile_path, dockerfile)?;
 
@@ -597,7 +678,7 @@ impl Project {
 
         // App directory mount
         if dc.mount_app_dir {
-            cmd.args(&["-v", &format!("{}:{}", self.dir, dc.app_dir)]);
+            cmd.args(&["-v", &format!("{}:{}", self.dir.display(), dc.app_dir)]);
             cmd.args(&["-w", &dc.app_dir]);
         }
 
@@ -608,7 +689,7 @@ impl Project {
             } else {
                 format!("{}/{}", dc.app_dir, mount)
             };
-            let host_path = PathBuf::from(&self.dir)
+            let host_path = self.dir
                 .join("_webcentral_data/mounts")
                 .join(&container_path.trim_start_matches('/'));
             fs::create_dir_all(&host_path)?;
@@ -668,13 +749,17 @@ impl Project {
         }
     }
 
-    /// Stop this project and remove it from DOMAINS if it's still the active project
+    /// Stop this project. If there are pending requests, restart; otherwise deregister from DOMAINS.
     pub fn stop(self: Arc<Self>) {
-        // Remove from DOMAINS only if we're still the active project for this domain
-        if !crate::server::remove_project_if_current(&self.domain, &self) {
-            return; // Already stopped
+        // Prevent duplicate stop calls using atomic compare-exchange
+        if self.stopping.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return; // Already stopping
         }
+        
         self.logger.write("supervisor", "Stopping app");
+
+        // Reset app_ready to false so new requests will stall and be counted
+        let _ = self.app_ready_tx.send(false);
 
         // Abort the file watcher task
         if let Ok(mut guard) = self.watcher_task.try_lock() {
@@ -683,53 +768,62 @@ impl Project {
             }
         }
 
-        // Take ownership of processes synchronously using try_lock, collecting PIDs and Child handles
-        let (pids, processes): (Vec<u32>, Vec<tokio::process::Child>) = {
-            let mut pids = vec![];
-            let mut processes = vec![];
-            if let Ok(mut guard) = self.process.try_lock() {
-                if let Some(process) = guard.take() {
-                    if let Some(pid) = process.id() {
-                        pids.push(pid);
-                    }
-                    processes.push(process);
-                }
-            }
-            if let Ok(mut workers) = self.workers.try_lock() {
-                for worker in workers.drain(..) {
-                    if let Some(pid) = worker.id() {
-                        pids.push(pid);
-                    }
-                    processes.push(worker);
-                }
-            }
-            (pids, processes)
+        // Take process handles and signal all to stop
+        let handles: Vec<_> = if let Ok(mut guard) = self.process_handles.try_lock() {
+            guard.drain(..).collect()
+        } else {
+            vec![]
         };
 
-        // Send SIGTERM to all processes
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::{kill, Signal};
-            use nix::unistd::Pid;
+        // Signal all processes to stop
+        let _ = self.stop_tx.send(true);
 
-            for pid in &pids {
-                let _ = kill(Pid::from_raw(*pid as i32), Signal::SIGTERM);
+        // Spawn task to await process termination and decide on restart vs deregister
+        let proj = self.clone();
+        tokio::spawn(async move {
+            // Wait for all processes to finish
+            for handle in handles {
+                let _ = handle.await;
+            }
+            proj.logger.write("supervisor", "Stopped app");
+
+            // Check if there are pending requests waiting
+            if proj.pending_requests.load(Ordering::SeqCst) > 0 {
+                proj.logger.write("supervisor", "Restarting due to pending requests");
+                proj.restart();
+            } else {
+                // No pending requests - deregister from DOMAINS
+                // There's a tiny race condition here. Requests arriving in
+                // an unfortunate microsecond will be dropped. Oh well. :-)
+                crate::server::remove_project_if_current(&proj.domain, &proj);
+            }
+        });
+    }
+
+    /// Restart this project (gets new port and restarts processes)
+    fn restart(self: Arc<Self>) {
+        // Reset stopping flag so we can stop again later
+        self.stopping.store(false, Ordering::SeqCst);
+        
+        // Reset stop signal for new processes
+        let _ = self.stop_tx.send(false);
+        
+        // Get a new port for applications
+        if let ProjectType::Application { .. } = self.config.project_type {
+            match Self::create_runtime_state(&self.config, &self.logger) {
+                Ok(new_runtime) => {
+                    *self.runtime.lock().unwrap() = new_runtime;
+                }
+                Err(e) => {
+                    self.logger.write("supervisor", &format!("Failed to get new port: {}", e));
+                    crate::server::remove_project_if_current(&self.domain, &self);
+                    return;
+                }
             }
         }
-
-        // Wait for graceful shutdown (but don't block - do it in background)
-        let logger_clone = self.logger.clone();
-        tokio::spawn(async move {
-            // Give processes 5s total to exit gracefully
-            tokio::time::sleep(Duration::from_millis(5000)).await;
-
-            // Force kill any still running and reap to avoid zombies
-            for mut process in processes {
-                let _ = process.kill();
-                let _ = process.wait().await;
-            }
-            logger_clone.write("supervisor", "Stopped app");
-        });
+        
+        // Start tasks again (file watcher, processes, etc.)
+        self.start_tasks();
     }
 
     async fn proxy_upgrade(
@@ -745,7 +839,7 @@ impl Project {
         let upgrade_fut = hyper::upgrade::on(req);
 
         // Connect to backend
-        let mut connector = self.connector.clone();
+        let mut connector = self.runtime.lock().unwrap().connector.clone();
         let io = connector.call(uri.clone()).await.map_err(|e| anyhow::anyhow!("Connector error: {}", e))?;
         let mut backend = io.into_tokio();
 

@@ -860,8 +860,8 @@ def test_config_unknown_key_in_docker(t):
         # Even if request fails, the config should have been loaded and error logged
         pass
 
-    # Verify the config error was logged
-    t.assert_log("Unexpected key 'docker.invalid_docker_key'", count=1)
+    # Verify the config error was logged at least once (may appear multiple times due to restarts)
+    t.await_log("Unexpected key 'docker.invalid_docker_key'", timeout=2)
 
 
 @test
