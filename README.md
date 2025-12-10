@@ -386,6 +386,9 @@ Make sure no other services are using ports 80 or 443.
 
 ## Changelog
 
+2025-12-10 (2.1.4):
+ - Static file server now sends MIME types based on file extensions
+
 2025-12-08 (2.1.3):
  - Fix config reload on file change (was reusing stale config)
  - Simplified process lifecycle: new Project replaces old, waits for predecessor to stop

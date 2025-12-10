@@ -297,8 +297,12 @@ impl Project {
 
         if file_path.starts_with(&public_dir) && file_path.exists() && file_path.is_file() {
             let content = tokio::fs::read(&file_path).await?;
+            let mime = mime_guess::from_path(&file_path)
+                .first_or_octet_stream()
+                .to_string();
             Ok(Response::builder()
                 .status(200)
+                .header("Content-Type", mime)
                 .body(Full::new(Bytes::from(content)))?)
         } else {
             Ok(Response::builder()

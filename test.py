@@ -283,8 +283,9 @@ class TestRunner:
             f"Timeout waiting for '{text}' in {project} logs after {timeout}s."
         )
 
-    def assert_http(self, path, check_body=None, check_code=200, method='GET', data=None, timeout=5, host=None):
-        """Make HTTP request and assert response. Host defaults to current test domain."""
+    def assert_http(self, path, check_body=None, check_code=200, check_header=None, method='GET', data=None, timeout=5, host=None):
+        """Make HTTP request and assert response. Host defaults to current test domain.
+        check_header: tuple of (header_name, expected_value) to verify a response header."""
         if host is None:
             host = self.current_test_domain
         print(f"{CLEAR_LINE}{GRAY}→ HTTP {method} {host}{path}{RESET}", end='', flush=True)
@@ -307,6 +308,14 @@ class TestRunner:
                 raise AssertionError(
                     f"Expected body to contain '{check_body}', got:\n{body}"
                 )
+
+            if check_header is not None:
+                header_name, expected_value = check_header
+                actual_value = response.getheader(header_name)
+                if actual_value != expected_value:
+                    raise AssertionError(
+                        f"Expected header '{header_name}' to be '{expected_value}', got '{actual_value}'"
+                    )
 
             return body
         finally:
@@ -435,9 +444,11 @@ def test_static_file_serving(t):
 
 @test
 def test_static_file_nested(t):
-    """Serve nested static files"""
+    """Serve nested static files with correct MIME types"""
     t.write_file('public/css/style.css', 'body { color: red; }')
-    t.assert_http('/css/style.css', check_body='color: red')
+    t.assert_http('/css/style.css', check_body='color: red', check_header=('Content-Type', 'text/css'))
+    t.write_file('public/app.js', 'console.log("hello");')
+    t.assert_http('/app.js', check_body='hello', check_header=('Content-Type', 'text/javascript'))
 
 
 @test
