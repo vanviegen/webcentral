@@ -465,8 +465,8 @@ impl Project {
         });
         self.process_handles.lock().await.push(handle);
 
-        // Wait for port to be ready
-        let ready = wait_for_port(port, Duration::from_secs(30)).await;
+        // Wait for port to be ready (abort early if stop signal received)
+        let ready = wait_for_port(port, Duration::from_secs(30), self.stop_rx.clone()).await;
 
         if !ready {
             self.logger
@@ -937,10 +937,15 @@ fn get_user_home(uid: u32) -> String {
         .unwrap_or_else(|| "/tmp".to_string())
 }
 
-async fn wait_for_port(port: u16, timeout: Duration) -> bool {
+async fn wait_for_port(port: u16, timeout: Duration, stop_rx: watch::Receiver<bool>) -> bool {
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {
+        // Check if stop signal received (process exited)
+        if *stop_rx.borrow() {
+            return false;
+        }
+        
         // Try to make an HTTP request and check for non-5xx response
         if let Ok(mut stream) = StdTcpStream::connect(format!("localhost:{}", port)) {
             use std::io::{Read, Write};

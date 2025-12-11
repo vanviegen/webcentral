@@ -1991,6 +1991,38 @@ def test_forward_upstream_connect_error(t):
     t.await_log('upstream connect failed')
 
 
+@test
+def test_process_exit_during_startup_fast_restart(t):
+    """Process that exits during startup should log failure, not restart loop"""
+    # Create a script that exits immediately without opening a port
+    t.write_file('server.py', '''
+import sys
+import time
+print("Starting but will exit immediately", flush=True)
+time.sleep(0.2)  # Small delay to ensure log is written
+sys.exit(1)
+''')
+    
+    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    t.write_file('public/index.html', '<h1>Static Fallback</h1>')
+    
+    # First request triggers startup, process exits
+    # With the fix, wait_for_port should detect the stop signal and return false
+    # This should log "Application failed to start listening on port"
+    try:
+        t.assert_http('/', check_code=200, timeout=5)
+    except:
+        pass  # Expected to fail since process exits
+    
+    # Verify the process exited and was detected
+    t.await_log('Starting but will exit immediately', timeout=2)
+    
+    # Key assertion: with the fix, we should see this message because wait_for_port
+    # detects the stop signal and returns false. Without the fix, the project gets
+    # replaced before wait_for_port can return, so this message is never logged.
+    t.await_log('Application failed to start listening on port', timeout=3)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run webcentral tests')
     parser.add_argument('--firejail', type=str, choices=['true', 'false'], default='true',
