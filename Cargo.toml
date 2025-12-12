@@ -1,6 +1,6 @@
 [package]
 name = "webcentral"
-version = "2.1.4"
+version = "2.1.5"
 edition = "2021"
 authors = ["Frank van Viegen <oss@vanviegen.net>"]
 description = "A reverse proxy that runs multiple web applications on a single server with on-demand startup, sandboxing, auto-reload, and Let's Encrypt certificates"
@@ -8,9 +8,10 @@ license = "ISC"
 repository = "https://github.com/vanviegen/webcentral"
 homepage = "https://github.com/vanviegen/webcentral"
 readme = "README.md"
-keywords = ["reverse-proxy", "web-server", "https", "lets-encrypt", "docker", "firejail", "auto-reload", "sandboxing"]
+keywords = ["reverse-proxy", "web-server", "lets-encrypt", "auto-reload", "sandbox"]
 categories = ["web-programming::http-server", "network-programming"]
 rust-version = "1.75"
+exclude = ["/webcentral"]
 
 [dependencies]
 tokio = { version = "1.48", features = ["full"] }
