@@ -18,12 +18,12 @@ use hyper_util::{
 use nix::unistd::Uid;
 use regex::Regex;
 use std::fs;
-use std::net::TcpStream as StdTcpStream;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::{Mutex, oneshot, watch};
 use tokio::time::sleep;
@@ -937,41 +937,73 @@ fn get_user_home(uid: u32) -> String {
         .unwrap_or_else(|| "/tmp".to_string())
 }
 
-async fn wait_for_port(port: u16, timeout: Duration, stop_rx: watch::Receiver<bool>) -> bool {
-    let deadline = Instant::now() + timeout;
+async fn wait_for_port(port: u16, timeout: Duration, mut stop_rx: watch::Receiver<bool>) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let addr = format!("localhost:{}", port);
 
-    while Instant::now() < deadline {
-        // Check if stop signal received (process exited)
+    // One overall deadline for the whole readiness check.
+    // Individual operations (connect/write/read) are canceled by selecting on this deadline.
+    let deadline_sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(deadline_sleep);
+
+    macro_rules! await_or_abort {
+        ($fut:expr) => {{
+            tokio::select! {
+                out = $fut => Some(out),
+                _ = &mut deadline_sleep => return false,
+                changed = stop_rx.changed() => {
+                    if changed.is_ok() && *stop_rx.borrow() {
+                        return false;
+                    }
+                    None
+                }
+            }
+        }};
+    }
+
+    macro_rules! backoff_continue {
+        () => {{
+            let _ = await_or_abort!(sleep(Duration::from_millis(50)));
+            continue;
+        }};
+    }
+
+    macro_rules! await_ok_or_backoff_continue {
+        ($fut:expr) => {{
+            match await_or_abort!($fut) {
+                Some(Ok(v)) => v,
+                _ => backoff_continue!(),
+            }
+        }};
+    }
+
+    loop {
         if *stop_rx.borrow() {
             return false;
         }
-        
-        // Try to make an HTTP request and check for non-5xx response
-        if let Ok(mut stream) = StdTcpStream::connect(format!("localhost:{}", port)) {
-            use std::io::{Read, Write};
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-            
-            if stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").is_ok() {
-                let mut buf = [0u8; 32];
-                if let Ok(n) = stream.read(&mut buf) {
-                    // Check for "HTTP/1.x NNN" where NNN is not 5xx
-                    if n >= 12 {
-                        let response = &buf[..n];
-                        if response.starts_with(b"HTTP/1.") {
-                            // Status code starts at position 9
-                            if response[9] != b'5' {
-                                return true;
-                            }
-                        }
-                    }
-                }
+
+        // Connect
+        let mut stream = await_ok_or_backoff_continue!(TcpStream::connect(&addr));
+
+        // Write probe
+        let () = await_ok_or_backoff_continue!(
+            stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        );
+
+        // Read probe
+        let mut buf = [0u8; 32];
+        let n = await_ok_or_backoff_continue!(stream.read(&mut buf));
+
+        // Check for "HTTP/1.x NNN" where NNN is not 5xx
+        if n >= 12 && buf.starts_with(b"HTTP/1.") {
+            // Status code starts at position 9
+            if buf[9] != b'5' {
+                return true;
             }
         }
-        sleep(Duration::from_millis(100)).await;
-    }
 
-    false
+        let _ = await_or_abort!(sleep(Duration::from_millis(50)));
+    }
 }
 
 /// Returns the path to podman or docker, checking PATH on first call.

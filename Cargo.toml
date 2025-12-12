@@ -35,7 +35,6 @@ anyhow = "1.0"
 bytes = "1.11"
 libc = "0.2"
 nix = { version = "0.30", features = ["user", "process", "signal"] }
-glob = "0.3"
 lazy_static = "1.5"
 x509-parser = "0.18.0"
 rand = "0.9.2"
