@@ -126,6 +126,7 @@ Non-Application types (Static, Proxy, Forward, Redirect) don't have a lifecycle_
 
 - Keep AGENTS.md up-to-date when making architectural changes. Be succinct—no repetition, no code examples, bullet points over paragraphs.
 - Build and test using `cargo build && ./test.py --firejail false` (or `--firejail true` if Firejail is installed).
+- For async task debugging, build with `cargo build --features console` and connect via `~/.cargo/bin/tokio-console` (install with `cargo install tokio-console`).
 - Run `./test.py` to execute the test suite. To run a single test: `./test.py test_name_of_test`. For new features, add tests in `test.py`. Don't create ad-hoc test scripts. When writing tests, you should not need to sleep (except in test-apps being run by webcentral to simulate loading times) - use `await_log` and/or `assert_http` instead. If a test fails, don't just work around it in the test code, but investigate deeply if there may be an actual bug (or unexpected behavior) in webcentral.
 - Add code comments only for explaining non-obvious logic, why things are done a certain way, and how thread-safety is ensured. Don't add comments describing what you're changing and why, as comments should reflect the final code, not the change history.
 - When you notice unexpected behavior or a bug at any time, create an issue on your todo-list for later investigation. Never let bugs go uninvestigated nor work around them.

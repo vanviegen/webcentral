@@ -87,6 +87,9 @@ impl GlobalConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(feature = "console")]
+    console_subscriber::init();
+
     let config = GlobalConfig::parse();
 
     if config.https > 0 && config.email.is_none() {
