@@ -3,12 +3,13 @@ use crate::project::{self, Project};
 use anyhow::Result;
 use bytes::Bytes;
 use dashmap::DashMap;
-use http_body_util::Full;
+use http_body_util::{Full, BodyExt};
 
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
+use lazy_static::lazy_static;
 use regex::Regex;
 use rustls::ServerConfig;
 use std::collections::HashSet;
@@ -20,23 +21,23 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 
+lazy_static! {
+    pub static ref SHARED_EXECUTOR: TokioExecutor = TokioExecutor::new();
+}
+
 // Domain information stored in the global DOMAINS map
 struct DomainInfo {
     directory: String,
     project: Option<Arc<Project>>,
     cert_task: Option<tokio::task::JoinHandle<()>>,
-    use_firejail: bool,
-    prune_logs: i64,
 }
 
 impl DomainInfo {
-    fn new(directory: String, cert_task: Option<tokio::task::JoinHandle<()>>, use_firejail: bool, prune_logs: i64) -> Self {
+    fn new(directory: String, cert_task: Option<tokio::task::JoinHandle<()>>) -> Self {
         Self {
             directory,
             project: None,
             cert_task,
-            use_firejail,
-            prune_logs,
         }
     }
 }
@@ -54,43 +55,14 @@ lazy_static::lazy_static! {
     static ref VALID_DOMAIN: Regex = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$").unwrap();
 }
 
-/// Replace a project with a new one. The new project will wait for the provided
-/// receiver before starting its process. Returns the oneshot sender that should
-/// be signaled when the old project has fully stopped.
-pub fn replace_project(
-    domain: &str,
-    old_project: &Arc<project::Project>,
-) -> Option<tokio::sync::oneshot::Sender<()>> {
-    let mut domain_info = DOMAINS.get_mut(domain)?;
-    
-    // Only replace if old_project is still current
-    if let Some(ref current) = domain_info.project {
-        if !Arc::ptr_eq(current, old_project) {
-            return None; // Already replaced by someone else
-        }
-    } else {
-        return None; // No current project
-    }
-    
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    
-    // Create new project that will wait for predecessor
-    match project::Project::new(
-        &PathBuf::from(&domain_info.directory),
-        domain.to_string(),
-        domain_info.use_firejail,
-        domain_info.prune_logs,
-        Some(rx),
-    ) {
-        Ok(new_project) => {
-            domain_info.project = Some(new_project);
-            Some(tx)
-        }
-        Err(e) => {
-            // Failed to create new project - just remove old one
-            eprintln!("Failed to create replacement project for {}: {}", domain, e);
-            domain_info.project = None;
-            None
+/// Deregister a project (only if it's still the current one for the domain).
+/// Called when a project enters Failed state or on file change.
+pub fn deregister_project(domain: &str, project: &Arc<project::Project>) {
+    if let Some(mut domain_info) = DOMAINS.get_mut(domain) {
+        if let Some(ref current) = domain_info.project {
+            if Arc::ptr_eq(current, project) {
+                domain_info.project = None;
+            }
         }
     }
 }
@@ -283,7 +255,7 @@ impl Server {
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
-                if let Err(e) = auto::Builder::new(TokioExecutor::new())
+                if let Err(e) = auto::Builder::new(SHARED_EXECUTOR.clone())
                     .serve_connection_with_upgrades(
                         io,
                         service_fn(move |req| {
@@ -335,7 +307,7 @@ impl Server {
                 };
 
                 let io = TokioIo::new(tls_stream);
-                if let Err(e) = auto::Builder::new(TokioExecutor::new())
+                if let Err(e) = auto::Builder::new(SHARED_EXECUTOR.clone())
                     .serve_connection_with_upgrades(
                         io,
                         service_fn(move |req| {
@@ -473,7 +445,20 @@ impl Server {
         // Handle request with project
         let logger = project.logger.clone();
         match project.handle(req).await {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                // Convert StreamBody to Full<Bytes> for Hyper compatibility
+                // When client disconnects, this collect() is cancelled, which drops
+                // the upstream body and closes the connection.
+                let (parts, body) = resp.into_parts();
+                let bytes = match body.collect().await {
+                    Ok(collected) => collected.to_bytes(),
+                    Err(e) => {
+                        logger.write("error", &format!("Body collection error: {}", e));
+                        return Ok(Self::make_error(StatusCode::BAD_GATEWAY, "Bad Gateway"));
+                    }
+                };
+                Ok(Response::from_parts(parts, Full::new(bytes)))
+            }
             Err(e) => {
                 let msg = e.to_string();
                 logger.write("error", &msg);
@@ -522,7 +507,6 @@ impl Server {
             domain.to_string(),
             self.config.firejail,
             self.config.prune_logs,
-            None,
         )?;
 
         // Store in domain info
@@ -596,7 +580,7 @@ impl Server {
         };
 
         println!("Domain {} added ({:?})", &domain, directory);
-        DOMAINS.insert(domain, DomainInfo::new(directory, cert_task, self.config.firejail, self.config.prune_logs));
+        DOMAINS.insert(domain, DomainInfo::new(directory, cert_task));
         self.schedule_write_bindings();
     }
 

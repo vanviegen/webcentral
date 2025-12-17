@@ -1,19 +1,22 @@
 use include_exclude_watcher as file_watcher;
 use crate::logger::Logger;
 use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
+use crate::server::SHARED_EXECUTOR;
 use crate::streams::AnyConnector;
 use tower::Service;
 
 use anyhow::Result;
 use bytes::Bytes;
 use http::HeaderValue;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use std::error::Error as StdError;
 use hyper::{body::Incoming, Request, Response};
+
+type StreamBody = BoxBody<Bytes, anyhow::Error>;
 use hyper_util::client::legacy::connect::{HttpConnector};
 use hyper_util::{
     client::legacy::Client,
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioIo},
 };
 use nix::unistd::Uid;
 use regex::Regex;
@@ -25,58 +28,43 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::sync::{Mutex, oneshot, watch};
+use tokio::sync::{mpsc, Mutex, Notify, watch};
 use tokio::time::sleep;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Monitors a process and handles graceful shutdown.
-/// Completes when the process exits (either naturally or after stop signal).
-/// When stop_rx receives `true`, sends SIGTERM then SIGKILL after 5s if needed.
-async fn monitor_process(
-    mut process: tokio::process::Child,
-    mut stop_rx: watch::Receiver<bool>,
-    logger: Arc<Logger>,
-    label: &str,
-) {
-    let pid = process.id();
-    
-    // Wait for either process exit or stop signal
-    tokio::select! {
-        status = process.wait() => {
-            // Process exited on its own
-            if let Ok(status) = status {
-                logger.write("supervisor", &format!("{} exited: {}", label, status));
-            }
-            return;
-        }
-        _ = stop_rx.wait_for(|&stopped| stopped) => {}
-    }
-    
-    // Stop signal received - send SIGTERM
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        use nix::sys::signal::{kill, Signal};
-        use nix::unistd::Pid;
-        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-    }
-    
-    // Wait up to 5s for graceful exit
-    tokio::select! {
-        _ = process.wait() => {}
-        _ = sleep(Duration::from_secs(5)) => {
-            // Force kill after timeout
-            let _ = process.kill();
-            let _ = process.wait().await;
-        }
-    }
+/// Application lifecycle state for Application-type projects
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppState {
+    Stopped,   // No process running, will start on demand
+    Starting,  // Process spawning, waiting for port
+    Running,   // Process running and accepting requests
+    Failed,    // Startup failed twice, project should be deregistered
+}
+
+/// Reasons for stopping the application
+#[derive(Debug, Clone, Copy)]
+pub enum StopReason {
+    FileChange,
+    Inactivity,
+    ProcessExit,
+    Shutdown,  // Server shutdown
 }
 
 lazy_static::lazy_static! {
-     static ref DEFAULT_HTTP_CLIENT: Client<AnyConnector, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(AnyConnector::Http(HttpConnector::new()));
+     static ref DEFAULT_HTTP_CLIENT: Client<AnyConnector, Full<Bytes>> = Client::builder(SHARED_EXECUTOR.clone()).build(AnyConnector::Http(HttpConnector::new()));
      static ref DEFAULT_CONNECTOR: AnyConnector = AnyConnector::Http(HttpConnector::new());
 }
 
 
 // --- Project ---
+
+/// Connection info for Application projects - updated on each restart with new port
+#[derive(Debug)]
+struct AppConnection {
+    port: u16,
+    http_client: Client<AnyConnector, Full<Bytes>>,
+    connector: AnyConnector,
+}
 
 #[derive(Debug)]
 pub struct Project {
@@ -87,17 +75,20 @@ pub struct Project {
     uid: u32,
     gid: u32,
     use_firejail: bool,
-    port: u16,
-    http_client: Client<AnyConnector, Full<Bytes>>,
-    connector: AnyConnector,
-    app_ready: watch::Receiver<bool>, // Receives true when application is ready
-    app_ready_tx: watch::Sender<bool>, // Sends true when application is ready
-    stop_tx: watch::Sender<bool>,      // Send true to signal all processes to stop
-    stop_rx: watch::Receiver<bool>,    // Subscribe to stop signal
-    process_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    last_activity: Arc<Mutex<Instant>>,
+    // For non-Application projects: static connection info
+    // For Application projects: None (uses app_connection instead)
+    static_http_client: Option<Client<AnyConnector, Full<Bytes>>>,
+    static_connector: Option<AnyConnector>,
+    // For Application projects: connection info updated on each restart
+    app_connection: Mutex<Option<AppConnection>>,
+    // Application state (only meaningful for Application type projects)
+    state_tx: watch::Sender<AppState>,
+    state_rx: watch::Receiver<AppState>,
+    stop_tx: mpsc::Sender<StopReason>,  // Send to request stop
+    pending_requests: AtomicU64,        // Requests currently being handled
+    last_activity: Mutex<Instant>,
     watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    wait_for_predecessor: Mutex<Option<oneshot::Receiver<()>>>, // Wait before starting process
+    state_changed: Notify,              // Notified when pending_requests changes
 }
 
 impl Project {
@@ -106,7 +97,6 @@ impl Project {
         domain: String,
         use_firejail: bool,
         prune_logs: i64,
-        wait_for_predecessor: Option<oneshot::Receiver<()>>,
     ) -> Result<Arc<Project>> {
         // Load configuration
         let config = ProjectConfig::load(dir)?;
@@ -117,40 +107,37 @@ impl Project {
         let logger = Arc::new(Logger::new(log_dir, uid, gid, prune_logs)?);
 
         // Create connector based on project type
-        let mut custom_connector = None;
-        let mut port = 0u16;
-
-        let descr = match &config.project_type {
-            ProjectType::Redirect { target } => {
-                format!("Redirect to {}", target)
-            }
-            ProjectType::Proxy { target } => {
-                format!("Proxy to {}", target)
-            }
-            ProjectType::TcpForward { address } => {
-                custom_connector = Some(AnyConnector::FixedTcp(address.clone()));
-                format!("Forward to port {}", address)
-            }
-            ProjectType::UnixForward { socket_path } => {
-                custom_connector = Some(AnyConnector::FixedUnix(socket_path.clone()));
-                format!("Forward to unix socket {}", socket_path)
-            }
-            ProjectType::Application { .. } => {
-                port = get_free_port()?;
-                let addr = format!("localhost:{}", port);
-                custom_connector = Some(AnyConnector::FixedTcp(addr.clone()));
-                format!("Application server on {}", addr)
-            }
-            ProjectType::Static => {
-                "Static file server".to_string()
-            }
-        };
-        logger.write("supervisor", &descr);
-
-        let (connector, http_client) = if let Some(connector) = custom_connector {
-            (connector.clone(), Client::builder(TokioExecutor::new()).build(connector))
+        // For Application types, connector is created dynamically on each start
+        let is_application = matches!(config.project_type, ProjectType::Application { .. });
+        let (static_connector, static_http_client) = if is_application {
+            logger.write("supervisor", "Application server (port assigned on start)");
+            (None, None)
         } else {
-            (DEFAULT_CONNECTOR.clone(), DEFAULT_HTTP_CLIENT.clone())
+            let (connector, descr) = match &config.project_type {
+                ProjectType::Redirect { target } => {
+                    (None, format!("Redirect to {}", target))
+                }
+                ProjectType::Proxy { target } => {
+                    (None, format!("Proxy to {}", target))
+                }
+                ProjectType::TcpForward { address } => {
+                    (Some(AnyConnector::FixedTcp(address.clone())), format!("Forward to port {}", address))
+                }
+                ProjectType::UnixForward { socket_path } => {
+                    (Some(AnyConnector::FixedUnix(socket_path.clone())), format!("Forward to unix socket {}", socket_path))
+                }
+                ProjectType::Static => {
+                    (None, "Static file server".to_string())
+                }
+                ProjectType::Application { .. } => unreachable!(),
+            };
+            logger.write("supervisor", &descr);
+
+            if let Some(c) = connector {
+                (Some(c.clone()), Some(Client::builder(SHARED_EXECUTOR.clone()).build(c)))
+            } else {
+                (Some(DEFAULT_CONNECTOR.clone()), Some(DEFAULT_HTTP_CLIENT.clone()))
+            }
         };
 
         // Log configuration errors
@@ -158,8 +145,8 @@ impl Project {
             logger.write("supervisor", err);
         }
 
-        let (app_ready_tx, app_ready) = watch::channel(false);
-        let (stop_tx, stop_rx) = watch::channel(false);
+        let (state_tx, state_rx) = watch::channel(AppState::Stopped);
+        let (stop_tx, stop_rx) = mpsc::channel(8);
         
         let project = Arc::new(Project {
             domain: domain.clone(),
@@ -169,62 +156,80 @@ impl Project {
             uid,
             gid,
             use_firejail,
-            port,
-            http_client,
-            connector,
-            app_ready,
-            app_ready_tx,
+            static_http_client,
+            static_connector,
+            app_connection: Mutex::new(None),
+            state_tx,
+            state_rx,
             stop_tx,
-            stop_rx,
-            process_handles: Mutex::new(Vec::new()),
-            last_activity: Arc::new(Mutex::new(Instant::now())),
+            pending_requests: 0.into(),
+            last_activity: Mutex::new(Instant::now()),
             watcher_task: Mutex::new(None),
-            wait_for_predecessor: Mutex::new(wait_for_predecessor),
+            state_changed: Notify::new(),
         });
 
-        project.clone().start_tasks();
-
-        Ok(project)
-    }
-
-    /// Start background tasks (file watcher, inactivity timer, application process)
-    fn start_tasks(self: Arc<Self>) {
         // Start file watcher
-        let proj = self.clone();
+        let proj = project.clone();
+        let proj_for_watcher = project.clone();
         let watcher_handle = tokio::spawn(async move {
             if let Err(e) = proj.clone().watch_files().await {
                 let _ = proj.logger.write("supervisor", &format!("File watcher error: {}", e));
             }
         });
         
-        // Store the watcher handle
-        if let Ok(mut guard) = self.watcher_task.try_lock() {
-            *guard = Some(watcher_handle);
-        }
+        // Store the watcher handle (spawn a task to do it since we're not async)
+        tokio::spawn(async move {
+            *proj_for_watcher.watcher_task.lock().await = Some(watcher_handle);
+        });
 
-        // Start inactivity timer if configured
-        if self.config.reload.timeout > 0 {
-            let proj = self.clone();
+        // Start lifecycle task for Application type projects
+        if let ProjectType::Application { .. } = project.config.project_type {
+            let proj = project.clone();
             tokio::spawn(async move {
-                proj.inactivity_timer().await;
+                proj.lifecycle_task(stop_rx).await;
+            });
+        } else {
+            // For non-Application types, just listen for FileChange to deregister
+            let proj = project.clone();
+            tokio::spawn(async move {
+                proj.stop_listener(stop_rx).await;
             });
         }
 
-        // Start application process if needed
-        if let ProjectType::Application { .. } = self.config.project_type {
-            let proj = self.clone();
-            let port = self.port;
-            tokio::spawn(async move {
-                if let Err(e) = proj.clone().start_process(port).await {
-                    let _ = proj
-                        .logger
-                        .write("supervisor", &format!("Failed to start process: {}", e));
+        Ok(project)
+    }
+
+    /// Simple stop listener for non-Application projects.
+    /// Deregisters on FileChange so a new project is created with fresh config.
+    async fn stop_listener(self: Arc<Self>, mut stop_rx: mpsc::Receiver<StopReason>) {
+        while let Some(reason) = stop_rx.recv().await {
+            match reason {
+                StopReason::FileChange => {
+                    crate::server::deregister_project(&self.domain, &self);
+                    self.stop_watcher();
+                    return;
                 }
-            });
+                StopReason::Shutdown => {
+                    self.stop_watcher();
+                    return;
+                }
+                _ => {}
+            }
         }
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    /// RAII guard to track pending requests - decrements count on drop
+    fn track_request(&self) {
+        self.pending_requests.fetch_add(1, Ordering::SeqCst);
+        self.state_changed.notify_one();
+    }
+
+    fn untrack_request(&self) {
+        self.pending_requests.fetch_sub(1, Ordering::SeqCst);
+        self.state_changed.notify_one();
+    }
+
+    pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<StreamBody>> {
         *self.last_activity.lock().await = Instant::now();
 
         if self.config.log_requests {
@@ -238,7 +243,7 @@ impl Project {
             return Ok(Response::builder()
                 .status(301)
                 .header("Location", redirect)
-                .body(Full::new(Bytes::new()))?);
+                .body(BoxBody::new(Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?);
         }
 
         // Determine handler based on configuration
@@ -270,19 +275,19 @@ impl Project {
         (path.to_string(), String::new())
     }
 
-    async fn handle_redirect(&self, req: Request<Incoming>, target: &str) -> Result<Response<Full<Bytes>>> {
+    async fn handle_redirect(&self, req: Request<Incoming>, target: &str) -> Result<Response<StreamBody>> {
         Ok(Response::builder()
             .status(301)
             .header("Location", &format!("{}{}", target, req.uri().path()))
-            .body(Full::new(Bytes::new()))?)
+            .body(BoxBody::new(Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?)
     }
 
-    async fn handle_static(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    async fn handle_static(&self, req: Request<Incoming>) -> Result<Response<StreamBody>> {
         let public_dir = self.dir.join("public");
         if !public_dir.exists() {
             return Ok(Response::builder()
                 .status(404)
-                .body(Full::new(Bytes::from("Not Found")))?);
+                .body(BoxBody::new(Full::new(Bytes::from("Not Found")).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?);
         }
 
         // Simple static file serving
@@ -303,11 +308,11 @@ impl Project {
             Ok(Response::builder()
                 .status(200)
                 .header("Content-Type", mime)
-                .body(Full::new(Bytes::from(content)))?)
+                .body(BoxBody::new(Full::new(Bytes::from(content)).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?)
         } else {
             Ok(Response::builder()
                 .status(404)
-                .body(Full::new(Bytes::from("Not Found")))?)
+                .body(BoxBody::new(Full::new(Bytes::from("Not Found")).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?)
         }
     }
 
@@ -315,7 +320,7 @@ impl Project {
         self: Arc<Self>,
         req: Request<Incoming>,
         target: &str,
-    ) -> Result<Response<Full<Bytes>>> {
+    ) -> Result<Response<StreamBody>> {
 
         let (parts, body) = req.into_parts();
         let uri_str = format!("{}{}", target, parts.uri.path_and_query().unwrap());
@@ -346,19 +351,33 @@ impl Project {
     async fn forward_request(
         self: &Arc<Self>,
         req: Request<Incoming>,
-    ) -> Result<Response<Full<Bytes>>>
+    ) -> Result<Response<StreamBody>>
     {
         // Check if this is a WebSocket upgrade request
         if is_upgrade_request(&req) {
-            return self.proxy_upgrade(req).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e));
+            // Upgrade requests need special handling, convert to Full<Bytes> response
+            let resp = self.proxy_upgrade(req).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e))?;
+            let (parts, body) = resp.into_parts();
+            return Ok(Response::from_parts(parts, BoxBody::new(body.map_err(|e| anyhow::anyhow!("{}", e)))));
         }
 
-        // TODO: do we need this conversion from body to Full here?
+        // Buffer the request body (we must send the full request to upstream)
         let (parts, body) = req.into_parts();
         let body_bytes = body.collect().await?.to_bytes();
         let req = Request::from_parts(parts, Full::new(body_bytes));
 
-        let resp = match self.http_client.request(req).await {
+        // Get the http_client from the appropriate source
+        let http_client = if let Some(client) = &self.static_http_client {
+            client.clone()
+        } else {
+            let conn = self.app_connection.lock().await;
+            match conn.as_ref() {
+                Some(c) => c.http_client.clone(),
+                None => anyhow::bail!("502 application not started"),
+            }
+        };
+
+        let resp = match http_client.request(req).await {
             Ok(resp) => resp,
             Err(e) => {
                 if e.is_connect() {
@@ -371,47 +390,83 @@ impl Project {
             }
         };
 
+        // Return the upstream response body as-is for streaming.
+        // When the client disconnects, the response is dropped, which drops the body,
+        // which closes the connection to the upstream server.
         let (parts, body) = resp.into_parts();
-        let body_bytes = body.collect().await?.to_bytes();
-
-        Ok(Response::from_parts(parts, Full::new(body_bytes)))
+        Ok(Response::from_parts(parts, BoxBody::new(body.map_err(|e| anyhow::anyhow!("{}", e)))))
     }
 
-    async fn handle_application(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
+    async fn handle_application(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<StreamBody>> {
+        // Track this request so lifecycle task knows we have pending work
+        self.track_request();
+        
         // Wait for application to be ready (with timeout)
-        let mut rx = self.app_ready.clone();
-        tokio::time::timeout(Duration::from_secs(30), rx.wait_for(|&ready| ready))
-            .await
-            .map_err(|_| anyhow::anyhow!("Application startup timeout"))?
-            .map_err(|_| anyhow::anyhow!("Application startup failed"))?;
+        // Scoped to ensure watch::Ref is dropped before the forward_request await
+        let state = {
+            let mut rx = self.state_rx.clone();
+            let wait_result = tokio::time::timeout(
+                Duration::from_secs(30),
+                rx.wait_for(|&s| s == AppState::Running || s == AppState::Failed)
+            ).await;
 
-        self.forward_request(req).await
+            match wait_result {
+                Ok(Ok(s)) => *s,  // Deref and copy the state before dropping the Ref
+                Ok(Err(_)) => {
+                    self.untrack_request();
+                    anyhow::bail!("Application state channel closed");
+                }
+                Err(_) => {
+                    self.untrack_request();
+                    anyhow::bail!("Application startup timeout");
+                }
+            }
+        };
+
+        if state == AppState::Failed {
+            self.untrack_request();
+            anyhow::bail!("502 application failed to start");
+        }
+
+        let result = self.forward_request(req).await;
+        self.untrack_request();
+        result
     }
 
-    async fn start_process(self: Arc<Self>, port: u16) -> Result<()> {
-        // Wait for predecessor to stop if this is a restart
-        if let Some(rx) = self.wait_for_predecessor.lock().await.take() {
-            self.logger.write("supervisor", "Waiting for predecessor to stop");
-            let _ = rx.await; // Ignore error if sender dropped
-        }
+    /// Spawns the application process and workers. Returns handles to await for process exit.
+    /// Allocates a new port and stores connection info in app_connection.
+    /// Does NOT wait for port readiness - caller should do that.
+    async fn spawn_processes(&self) -> Result<Vec<tokio::process::Child>> {
+        // Allocate a new port for this startup cycle
+        let port = get_free_port()?;
+        let addr = format!("localhost:{}", port);
+        let connector = AnyConnector::FixedTcp(addr.clone());
+        let http_client = Client::builder(SHARED_EXECUTOR.clone()).build(connector.clone());
+        
+        // Store the new connection info
+        *self.app_connection.lock().await = Some(AppConnection {
+            port,
+            http_client,
+            connector,
+        });
 
         self.logger.write("supervisor", &format!("Starting on port {}", port));
 
-        let (command, docker, _workers) = match &self.config.project_type {
+        let (command, docker, workers) = match &self.config.project_type {
             ProjectType::Application {
                 command,
                 docker,
                 workers,
                 ..
-            } => (command, docker, workers),
-            _ => unreachable!("start_process called for non-Application project"),
+            } => (command.clone(), docker.clone(), workers.clone()),
+            _ => unreachable!("spawn_processes called for non-Application project"),
         };
 
-        let mut process = if let Some(docker_config) = docker {
-            self.build_docker_command(port, docker_config, command)
+        let mut process = if let Some(docker_config) = &docker {
+            self.build_docker_command(port, docker_config, &command)
                 .await?
         } else {
-            self.build_shell_command(command)?
+            self.build_shell_command(&command)?
         };
 
         // Set environment
@@ -430,6 +485,7 @@ impl Project {
         self.logger.write("supervisor", &format!("Starting application: {:?}", process));
 
         let mut child = process.spawn()?;
+        let mut children = Vec::new();
 
         // Stream stdout to log
         if let Some(stdout) = child.stdout.take() {
@@ -455,58 +511,18 @@ impl Project {
             });
         }
 
-        // Spawn process monitor
-        let stop_rx = self.stop_rx.clone();
-        let logger = self.logger.clone();
-        let proj = self.clone();
-        let handle = tokio::spawn(async move {
-            monitor_process(child, stop_rx, logger, "main process").await;
-            proj.stop();
-        });
-        self.process_handles.lock().await.push(handle);
+        children.push(child);
 
-        // Wait for port to be ready (abort early if stop signal received)
-        let ready = wait_for_port(port, Duration::from_secs(30), self.stop_rx.clone()).await;
-
-        if !ready {
-            self.logger
-                .write("supervisor", "Application failed to start listening on port");
-            let _ = self.app_ready_tx.send(false); // Signal startup failed
-            self.stop();
-            anyhow::bail!("Port not ready");
+        // Spawn workers
+        if !workers.is_empty() {
+            self.logger.write("supervisor", &format!("Starting {} worker(s)", workers.len()));
         }
 
-        self.logger.write("supervisor", &format!("Ready on port {}", port));
-
-        // Start workers
-        self.start_workers(port).await;
-
-        // Signal that application is ready
-        let _ = self.app_ready_tx.send(true);
-
-        Ok(())
-    }
-
-    async fn start_workers(&self, port: u16) {
-        let workers_map = match &self.config.project_type {
-            ProjectType::Application { workers, .. } => workers,
-            _ => return,
-        };
-
-        if workers_map.is_empty() {
-            return;
-        }
-
-        self.logger
-            .write("supervisor", &format!("Starting {} worker(s)", workers_map.len()));
-
-        for (name, cmd) in workers_map {
+        for (name, cmd) in &workers {
             let mut process = match self.build_shell_command(cmd) {
                 Ok(p) => p,
                 Err(e) => {
-                    let _ = self
-                        .logger
-                        .write("supervisor", &format!("Failed to build worker {}: {}", name, e));
+                    self.logger.write("supervisor", &format!("Failed to build worker {}: {}", name, e));
                     continue;
                 }
             };
@@ -516,16 +532,14 @@ impl Project {
                 process.env(key, val);
             }
             process.current_dir(&self.dir);
-
             process.stdout(std::process::Stdio::piped());
             process.stderr(std::process::Stdio::piped());
 
             match process.spawn() {
-                Ok(mut child) => {
-                    // Stream logs
+                Ok(mut worker_child) => {
                     let logger = self.logger.clone();
                     let label = format!("worker-{}", name);
-                    if let Some(stdout) = child.stdout.take() {
+                    if let Some(stdout) = worker_child.stdout.take() {
                         let logger = logger.clone();
                         let label = label.clone();
                         tokio::spawn(async move {
@@ -536,7 +550,7 @@ impl Project {
                             }
                         });
                     }
-                    if let Some(stderr) = child.stderr.take() {
+                    if let Some(stderr) = worker_child.stderr.take() {
                         let logger = logger.clone();
                         let label = label.clone();
                         tokio::spawn(async move {
@@ -547,21 +561,314 @@ impl Project {
                             }
                         });
                     }
-
-                    // Spawn process monitor for worker
-                    let stop_rx = self.stop_rx.clone();
-                    let handle = tokio::spawn(async move {
-                        monitor_process(child, stop_rx, logger, &label).await;
-                    });
-                    self.process_handles.lock().await.push(handle);
+                    children.push(worker_child);
                 }
                 Err(e) => {
-                    let _ = self
-                        .logger
-                        .write("supervisor", &format!("Failed to start worker {}: {}", name, e));
+                    self.logger.write("supervisor", &format!("Failed to start worker {}: {}", name, e));
                 }
             }
         }
+
+        Ok(children)
+    }
+
+    /// Main lifecycle state machine for Application projects.
+    /// Manages: Stopped -> Starting -> Running -> (stop trigger) -> Stopped cycle
+    /// On startup failure (twice), transitions to Failed and deregisters.
+    async fn lifecycle_task(self: Arc<Self>, mut stop_rx: mpsc::Receiver<StopReason>) {
+        let timeout_duration = if self.config.reload.timeout > 0 {
+            Some(Duration::from_secs(self.config.reload.timeout as u64))
+        } else {
+            None
+        };
+        let mut retry_count = 0;
+
+        loop {
+            let state = *self.state_rx.borrow();
+            
+            match state {
+                AppState::Stopped => {
+                    // Wait for a pending request to trigger startup
+                    loop {
+                        if self.pending_requests.load(Ordering::SeqCst) > 0 {
+                            break;
+                        }
+                        // Check for shutdown signal while waiting
+                        // Use a timeout to periodically re-check pending_requests
+                        // in case we missed a notification
+                        tokio::select! {
+                            reason = stop_rx.recv() => {
+                                if let Some(StopReason::Shutdown) = reason {
+                                    self.logger.write("supervisor", "Shutdown requested");
+                                    return;
+                                }
+                                // Other stop reasons in Stopped state - ignore
+                            }
+                            _ = self.state_changed.notified() => {
+                                // Got notification, loop back to check pending_requests
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                                // Periodic check in case notification was missed
+                            }
+                        }
+                    }
+                    
+                    let _ = self.state_tx.send(AppState::Starting);
+                }
+                
+                AppState::Starting => {
+                    self.logger.write("supervisor", "Starting application");
+                    
+                    // Spawn processes
+                    let mut children = match self.spawn_processes().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            self.logger.write("supervisor", &format!("Failed to spawn: {}", e));
+                            retry_count += 1;
+                            if retry_count >= 2 {
+                                self.logger.write("supervisor", "Startup failed twice, giving up");
+                                let _ = self.state_tx.send(AppState::Failed);
+                            } else {
+                                self.logger.write("supervisor", "Will retry once");
+                                // Brief delay before retry
+                                sleep(Duration::from_millis(500)).await;
+                            }
+                            continue;
+                        }
+                    };
+
+                    // Wait for port to be ready, but also listen for stop signals and process exit
+                    let port_ready = self.wait_for_port_ready(&mut stop_rx, &mut children).await;
+                    
+                    if !port_ready {
+                        self.kill_processes(children).await;
+                        retry_count += 1;
+                        if retry_count >= 2 {
+                            self.logger.write("supervisor", "Startup failed twice, giving up");
+                            let _ = self.state_tx.send(AppState::Failed);
+                        } else {
+                            self.logger.write("supervisor", "Will retry once");
+                            sleep(Duration::from_millis(500)).await;
+                        }
+                        continue;
+                    }
+
+                    // Get port from app_connection for logging
+                    let port = {
+                        let conn = self.app_connection.lock().await;
+                        conn.as_ref().map(|c| c.port).unwrap_or(0)
+                    };
+                    self.logger.write("supervisor", &format!("Ready on port {}", port));
+                    retry_count = 0;
+                    let _ = self.state_tx.send(AppState::Running);
+                    
+                    // Run until stop trigger or process exit
+                    let stop_reason = self.run_until_stop(children, &mut stop_rx, timeout_duration).await;
+                    
+                    match stop_reason {
+                        StopReason::Shutdown => {
+                            self.logger.write("supervisor", "Stopped app (shutdown)");
+                            return;
+                        }
+                        StopReason::FileChange => {
+                            // Config may have changed. Already deregistered in run_until_stop.
+                            self.logger.write("supervisor", "Stopped app (file change)");
+                            self.stop_watcher();
+                            return;
+                        }
+                        StopReason::Inactivity => {
+                            self.logger.write("supervisor", "Stopped app (inactivity)");
+                            // Loop continues, will restart on next request
+                        }
+                        StopReason::ProcessExit => {
+                            self.logger.write("supervisor", "Stopped app (process exit)");
+                            // Loop continues, will restart on next request
+                        }
+                    }
+                    // State is already Stopped (set by run_until_stop before killing processes)
+                }
+                
+                AppState::Running => {
+                    // Should not reach here - run_until_stop handles Running state
+                    unreachable!("lifecycle_task in Running state outside run_until_stop");
+                }
+                
+                AppState::Failed => {
+                    // Deregister from server and exit
+                    self.logger.write("supervisor", "Deregistering failed project");
+                    crate::server::deregister_project(&self.domain, &self);
+                    self.stop_watcher();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Wait for port to become ready, returns false if stop signal received, timeout, or process exits
+    async fn wait_for_port_ready(&self, stop_rx: &mut mpsc::Receiver<StopReason>, children: &mut [tokio::process::Child]) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let port = {
+            let conn = self.app_connection.lock().await;
+            match conn.as_ref() {
+                Some(c) => c.port,
+                None => return false, // No connection info = startup failed
+            }
+        };
+        let addr = format!("localhost:{}", port);
+
+        loop {
+            // Check for stop signal (non-blocking)
+            match stop_rx.try_recv() {
+                Ok(StopReason::Shutdown) => return false,
+                Ok(_) => return false, // Any stop during startup = abort
+                Err(_) => {}
+            }
+
+            // Check if main process has exited
+            if let Some(main) = children.first_mut() {
+                match main.try_wait() {
+                    Ok(Some(status)) => {
+                        self.logger.write("supervisor", &format!("Application failed to start listening on port {} (process exited: {})", port, status));
+                        return false;
+                    }
+                    Ok(None) => {} // Still running
+                    Err(e) => {
+                        self.logger.write("supervisor", &format!("Error checking process status: {}", e));
+                        return false;
+                    }
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+
+            // Try to connect
+            if let Ok(mut stream) = TcpStream::connect(&addr).await {
+                if stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").await.is_ok() {
+                    let mut buf = [0u8; 32];
+                    if let Ok(n) = stream.read(&mut buf).await {
+                        if n >= 12 && buf.starts_with(b"HTTP/1.") && buf[9] != b'5' {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Run until a stop trigger occurs. Returns the stop reason.
+    async fn run_until_stop(
+        self: &Arc<Self>,
+        mut children: Vec<tokio::process::Child>,
+        stop_rx: &mut mpsc::Receiver<StopReason>,
+        timeout_duration: Option<Duration>,
+    ) -> StopReason {
+        loop {
+            // Calculate inactivity deadline
+            let inactivity_deadline = if let Some(timeout) = timeout_duration {
+                let last = *self.last_activity.lock().await;
+                Some(tokio::time::Instant::now() + timeout.saturating_sub(last.elapsed()))
+            } else {
+                None
+            };
+
+            tokio::select! {
+                // Stop signal received
+                reason = stop_rx.recv() => {
+                    let reason = reason.unwrap_or(StopReason::Shutdown);
+                    
+                    // For FileChange, deregister immediately so new requests create fresh project
+                    if let StopReason::FileChange = reason {
+                        crate::server::deregister_project(&self.domain, &self);
+                    }
+                    
+                    // Immediately transition to Stopped so new requests wait for restart
+                    let _ = self.state_tx.send(AppState::Stopped);
+                    self.kill_processes_by_ref(&mut children).await;
+                    return reason;
+                }
+                
+                // Check for main process exit (first child is the main process)
+                result = async {
+                    if let Some(main) = children.first_mut() {
+                        main.wait().await
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    if let Ok(status) = result {
+                        self.logger.write("supervisor", &format!("Main process exited: {}", status));
+                    }
+                    // Immediately transition to Stopped so new requests wait for restart
+                    let _ = self.state_tx.send(AppState::Stopped);
+                    self.kill_processes_by_ref(&mut children).await;
+                    return StopReason::ProcessExit;
+                }
+                
+                // Inactivity timeout
+                _ = async {
+                    if let Some(deadline) = inactivity_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    // Check if actually inactive (activity might have happened)
+                    if let Some(timeout) = timeout_duration {
+                        let last = *self.last_activity.lock().await;
+                        if last.elapsed() >= timeout {
+                            self.logger.write("supervisor", "Stopping due to inactivity");
+                            // Immediately transition to Stopped so new requests wait for restart
+                            let _ = self.state_tx.send(AppState::Stopped);
+                            self.kill_processes_by_ref(&mut children).await;
+                            return StopReason::Inactivity;
+                        }
+                    }
+                    // Activity happened, loop again
+                }
+            }
+        }
+    }
+
+    /// Kill all processes gracefully (SIGTERM then SIGKILL after 5s)
+    async fn kill_processes(&self, mut children: Vec<tokio::process::Child>) {
+        self.kill_processes_by_ref(&mut children).await;
+    }
+
+    async fn kill_processes_by_ref(&self, children: &mut Vec<tokio::process::Child>) {
+        // Send SIGTERM to all
+        for child in children.iter() {
+            if let Some(pid) = child.id() {
+                #[cfg(unix)]
+                {
+                    use nix::sys::signal::{kill, Signal};
+                    use nix::unistd::Pid;
+                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                }
+            }
+        }
+
+        // Wait up to 5s for graceful exit
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        for child in children.iter_mut() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::select! {
+                _ = child.wait() => {}
+                _ = sleep(remaining) => {
+                    let _ = child.kill();
+                    let _ = child.wait().await;
+                }
+            }
+        }
+        children.clear();
+    }
+
+    /// Request stop - sends to the lifecycle task
+    pub fn request_stop(&self, reason: StopReason) {
+        let _ = self.stop_tx.try_send(reason);
     }
 
     fn build_shell_command(&self, command: &str) -> Result<Command> {
@@ -700,7 +1007,6 @@ impl Project {
     }
 
     async fn watch_files(self: Arc<Self>) -> Result<()> {
-        // Clone what we need for the callback
         let proj = self.clone();
 
         // Watch files with callback
@@ -709,79 +1015,32 @@ impl Project {
             .add_includes(&self.config.reload.include)
             .add_excludes(&self.config.reload.exclude)
             .run_debounced(100, move || {
-                proj.clone().stop();
-                proj.logger.write(
-                    "supervisor",
-                    "Stopping due to file changes",
-                );
+                proj.logger.write("supervisor", "Stopping due to file changes");
+                proj.request_stop(StopReason::FileChange);
             })
             .await?;
 
         Ok(())
     }
 
-    async fn inactivity_timer(self: &Arc<Self>) {
-        let timeout = Duration::from_secs(self.config.reload.timeout as u64);
-        let check_interval = Duration::from_secs((self.config.reload.timeout / 10).max(1) as u64);
-
-        loop {
-            sleep(check_interval).await;
-
-            let last = *self.last_activity.lock().await;
-            if last.elapsed() > timeout {
-                let _ = self.logger.write("supervisor", "Stopping due to inactivity");
-
-                self.clone().stop();
-                break;
-            }
-        }
-    }
-
-    /// Stop this project and replace with a new one (which will wait for us to stop)
-    pub fn stop(self: Arc<Self>) {
-        // Create replacement project immediately - it will wait for us before starting
-        // This ensures new requests go to the new project and wait there
-        // Returns None if we're not the current project (already replaced)
-        let Some(notify_tx) = crate::server::replace_project(&self.domain, &self) else {
-            return;
-        };
-        
-        self.logger.write("supervisor", "Stopping app");
-
+    fn stop_watcher(&self) {
         // Abort the file watcher task
         if let Ok(mut guard) = self.watcher_task.try_lock() {
             if let Some(handle) = guard.take() {
                 handle.abort();
             }
         }
+    }
 
-        // Take process handles and signal all to stop
-        let handles: Vec<_> = if let Ok(mut guard) = self.process_handles.try_lock() {
-            guard.drain(..).collect()
-        } else {
-            vec![]
-        };
-
-        // Signal all processes to stop
-        let _ = self.stop_tx.send(true);
-
-        // Spawn task to await process termination then notify successor
-        let logger = self.logger.clone();
-        tokio::spawn(async move {
-            for handle in handles {
-                let _ = handle.await;
-            }
-            logger.write("supervisor", "Stopped app");
-            
-            // Notify successor that we're done
-            let _ = notify_tx.send(());
-        });
+    /// Stop this project (for server shutdown)
+    pub fn stop(self: Arc<Self>) {
+        self.request_stop(StopReason::Shutdown);
     }
 
     async fn proxy_upgrade(
         &self,
         req: Request<Incoming>,
-    ) -> Result<Response<Full<Bytes>>> {
+    ) -> Result<Response<StreamBody>> {
         let method = req.method().clone();
         let uri = req.uri().clone();
         let headers = req.headers().clone();
@@ -790,8 +1049,18 @@ impl Project {
         // Get the upgrade future before we return a response
         let upgrade_fut = hyper::upgrade::on(req);
 
+        // Get the connector from the appropriate source
+        let mut connector = if let Some(c) = &self.static_connector {
+            c.clone()
+        } else {
+            let conn = self.app_connection.lock().await;
+            match conn.as_ref() {
+                Some(c) => c.connector.clone(),
+                None => anyhow::bail!("502 application not started"),
+            }
+        };
+
         // Connect to backend
-        let mut connector = self.connector.clone();
         let io = connector.call(uri.clone()).await.map_err(|e| anyhow::anyhow!("Connector error: {}", e))?;
         let mut backend = io.into_tokio();
 
@@ -898,7 +1167,7 @@ impl Project {
             }
         });
 
-        Ok(response_builder.body(Full::new(Bytes::new()))?)
+        Ok(response_builder.body(BoxBody::new(Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?)
     }
 }
 
@@ -935,75 +1204,6 @@ fn get_user_home(uid: u32) -> String {
         .flatten()
         .map(|u| u.dir.to_string_lossy().to_string())
         .unwrap_or_else(|| "/tmp".to_string())
-}
-
-async fn wait_for_port(port: u16, timeout: Duration, mut stop_rx: watch::Receiver<bool>) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let addr = format!("localhost:{}", port);
-
-    // One overall deadline for the whole readiness check.
-    // Individual operations (connect/write/read) are canceled by selecting on this deadline.
-    let deadline_sleep = tokio::time::sleep_until(deadline);
-    tokio::pin!(deadline_sleep);
-
-    macro_rules! await_or_abort {
-        ($fut:expr) => {{
-            tokio::select! {
-                out = $fut => Some(out),
-                _ = &mut deadline_sleep => return false,
-                changed = stop_rx.changed() => {
-                    if changed.is_ok() && *stop_rx.borrow() {
-                        return false;
-                    }
-                    None
-                }
-            }
-        }};
-    }
-
-    macro_rules! backoff_continue {
-        () => {{
-            let _ = await_or_abort!(sleep(Duration::from_millis(50)));
-            continue;
-        }};
-    }
-
-    macro_rules! await_ok_or_backoff_continue {
-        ($fut:expr) => {{
-            match await_or_abort!($fut) {
-                Some(Ok(v)) => v,
-                _ => backoff_continue!(),
-            }
-        }};
-    }
-
-    loop {
-        if *stop_rx.borrow() {
-            return false;
-        }
-
-        // Connect
-        let mut stream = await_ok_or_backoff_continue!(TcpStream::connect(&addr));
-
-        // Write probe
-        let () = await_ok_or_backoff_continue!(
-            stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
-        );
-
-        // Read probe
-        let mut buf = [0u8; 32];
-        let n = await_ok_or_backoff_continue!(stream.read(&mut buf));
-
-        // Check for "HTTP/1.x NNN" where NNN is not 5xx
-        if n >= 12 && buf.starts_with(b"HTTP/1.") {
-            // Status code starts at position 9
-            if buf[9] != b'5' {
-                return true;
-            }
-        }
-
-        let _ = await_or_abort!(sleep(Duration::from_millis(50)));
-    }
 }
 
 /// Returns the path to podman or docker, checking PATH on first call.

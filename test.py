@@ -208,6 +208,7 @@ class TestRunner:
 
             print(f"\n{YELLOW}--- {domain} ---{RESET}")
             if read_content:
+                read_content = '\n'.join(read_content.split('\n')[-4:]) # Show last 3 lines of read content
                 print(f"{DARK_GRAY}{read_content}{RESET}", end='')
             if new_content:
                 print(new_content, end='')
@@ -462,6 +463,26 @@ def test_simple_application(t):
     t.assert_http('/', check_body='App Server')
 
     # Verify the app actually started
+    t.assert_log('Ready on port', count=1)
+
+
+@test
+def test_application_starts_on_demand(t):
+    """Application should not start until first request"""
+    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('index.html', '<h1>On Demand</h1>')
+    
+    # Wait a moment to ensure webcentral has seen the files
+    time.sleep(0.5)
+    
+    # At this point, the application should NOT have started yet
+    # Check that "Ready on port" has NOT been logged (more specific than "Starting")
+    t.assert_log('Ready on port', count=0)
+    
+    # Now make a request - this should trigger startup
+    t.assert_http('/', check_body='On Demand')
+    
+    # Now the app should have started exactly once
     t.assert_log('Ready on port', count=1)
 
 
@@ -1992,6 +2013,98 @@ def test_forward_upstream_connect_error(t):
 
 
 @test
+def test_client_disconnect_closes_upstream(t):
+    """Client disconnecting should close the connection to upstream"""
+    # Create a backend that logs when connections are opened and closed,
+    # and stalls before sending response body
+    t.write_file('server.py', '''
+import socket
+import time
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class StallHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Override to use print with flush
+        print(format % args, flush=True)
+    
+    def do_GET(self):
+        print(f"Connection opened from {self.client_address}", flush=True)
+        
+        # Send headers immediately
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Content-Length', '100')
+        self.end_headers()
+        
+        # Now stall for 10 seconds before sending body
+        # If client disconnects, this should be interrupted
+        try:
+            for i in range(100):
+                time.sleep(0.1)
+                # Try to send a byte - will fail if connection closed
+                self.wfile.write(b'x')
+                self.wfile.flush()
+            print("Completed sending response", flush=True)
+        except (BrokenPipeError, ConnectionResetError) as e:
+            print(f"Connection closed by client: {type(e).__name__}", flush=True)
+        except Exception as e:
+            print(f"Connection error: {e}", flush=True)
+
+port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+server = HTTPServer(('localhost', port), StallHandler)
+print(f"Stalling server on {port}", flush=True)
+server.serve_forever()
+''')
+
+    t.write_file('webcentral.ini', 'command=python3 -u server.py $PORT')
+    
+    # Start a connection that we'll close abruptly
+    import socket
+    import threading
+    
+    conn_closed = threading.Event()
+    
+    def make_request():
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(10)
+            sock.connect(('localhost', t.port))
+            
+            # Send HTTP request
+            request = f"GET / HTTP/1.1\r\nHost: {t.current_test_domain}\r\nConnection: close\r\n\r\n"
+            sock.sendall(request.encode())
+            
+            # Read headers and a bit of the response
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+            
+            time.sleep(1)
+            
+            # Now close the connection abruptly (client disconnect)
+            print(f"{GRAY}Closing client connection{RESET}", flush=True)
+            sock.close()
+            conn_closed.set()
+        except Exception as e:
+            print(f"Request error: {e}")
+            conn_closed.set()
+    
+    thread = threading.Thread(target=make_request)
+    thread.start()
+    thread.join(timeout=5)
+    
+    # Wait a moment for the backend to detect the closed connection
+    time.sleep(0.5)
+    
+    # Check that the backend logged the connection being closed
+    t.await_log('Connection closed by client', timeout=2)
+
+
+@test
 def test_process_exit_during_startup_fast_restart(t):
     """Process that exits during startup should log failure, not restart loop"""
     # Create a script that exits immediately without opening a port
@@ -2009,10 +2122,14 @@ sys.exit(1)
     # First request triggers startup, process exits
     # With the fix, wait_for_port should detect the stop signal and return false
     # This should log "Application failed to start listening on port"
+    start_time = time.time()
     try:
-        t.assert_http('/', check_code=200, timeout=5)
+        t.assert_http('/', check_code=200, timeout=10)
     except:
-        pass  # Expected to fail since process exits
+        if time.time() - start_time > 6:
+            raise AssertionError("Terminating process should be detecting immediately")
+    else:
+        raise AssertionError("Expected HTTP request to fail")
     
     # Verify the process exited and was detected
     t.await_log('Starting but will exit immediately', timeout=2)

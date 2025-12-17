@@ -17,8 +17,6 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 `src/project_config.rs` - Parses `webcentral.ini`, `Procfile`, and `package.json`
 
-`src/file_watcher.rs` - File system watching with include/exclude patterns
-
 `src/streams.rs` - Stream abstraction (AnyConnector/AnyStream) for HTTP/TCP/Unix socket connections
 
 `src/acme.rs` - ACME/Let's Encrypt certificate acquisition using HTTP-01 challenges
@@ -27,13 +25,14 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 ### State Machine
 
-Each Project uses `Arc<Mutex<ProjectState>>` for lifecycle management. Three states:
+Application projects use `AppState` enum with explicit state machine in `lifecycle_task`:
 
-- **Stopped** → `Starting` (applications) or remains `Stopped` (static/proxy/forward don't need startup)
-- **Starting** → `Running` (port ready) or `Stopped` (failure), requests wait for startup
-- **Running** → `Stopped` (file change/timeout)
+- **Stopped** - Waiting for request (triggers startup via `pending_requests` counter)
+- **Starting** - Spawning processes, waiting for port ready, detecting process exit
+- **Running** - Processing requests, monitoring for stop triggers (file change, inactivity, process exit, shutdown)
+- **Failed** - After 2 startup failures, deregisters from server
 
-No explicit stopping state—process termination handled asynchronously in background.
+Non-Application types (Static, Proxy, Forward, Redirect) don't have a lifecycle_task but listen for FileChange via `stop_listener`.
 
 ### Concurrency Model
 
@@ -41,11 +40,9 @@ No explicit stopping state—process termination handled asynchronously in backg
 
 **Per-project tasks:**
 1. **File watcher** - Spawned once, aborted on reload, handle stored in `watcher_task` mutex
-2. **Inactivity timer** - Periodic checks, stops project on timeout
-3. **Process monitor** - Polls process status, transitions to `Stopped` when process exits
+2. **Lifecycle task** (Application) - State machine managing Stopped→Starting→Running→Stopped transitions
+3. **Stop listener** (non-Application) - Simple listener for FileChange to trigger deregistration
 4. **Log streamers** - 2 per process (stdout/stderr), plus 2 per worker
-5. **Stop handler** - Background task for graceful shutdown (5s grace period)
-6. **Request handlers** - Hyper-managed tasks, wait for `ensure_started()` completion
 
 **Server-level tasks:**
 - HTTP listener - Spawns connection handler per TCP connection
@@ -56,22 +53,28 @@ No explicit stopping state—process termination handled asynchronously in backg
 ### Synchronization
 
 **Project-level:**
-- `Arc<Mutex<ProjectState>>` - Serializes state transitions (Stopped/Starting/Running)
-- `Arc<Mutex<Instant>>` - Tracks last activity for timeout
-- `Mutex<Option<JoinHandle>>` - File watcher task handle for aborting on reload
-- State read during request handling, written during lifecycle transitions
+- `watch::channel<AppState>` - State broadcasting, requests wait via `wait_for()`
+- `mpsc::channel<StopReason>` - Stop signals (FileChange, Inactivity, ProcessExit, Shutdown)
+- `AtomicUsize` pending_requests - Tracks in-flight requests, triggers startup
+- `Notify` state_changed - Wakes lifecycle_task when pending_requests changes
+- `Mutex<Option<AppConnection>>` - Dynamic port/client per restart cycle
+- `Mutex<Instant>` last_activity - Tracks for inactivity timeout
+- `Mutex<Option<JoinHandle>>` watcher_task - For aborting file watcher
 
 **Server-level:**
 - `DashMap<String, DomainInfo>` - Concurrent domain → project mapping (lock-free reads)
-- `DomainInfo::project: RwLock<Option<Arc<Project>>>` - Per-domain project instance
-- `DomainInfo::cert_acquiring: AtomicBool` - Deduplicates certificate requests
-- `DomainInfo::cert_ready: Notify` - Wakes waiters when certificate ready
-- `CertManager::account: RwLock<Option<Account>>` - Shared ACME account
-- `CertManager::challenges: RwLock<HashMap>` - HTTP-01 challenge storage
+- `DomainInfo::project: Option<Arc<Project>>` - Per-domain project instance (None after deregister)
+- `deregister_project()` - Called on FileChange/Failed, sets project to None, next request creates new
 
 **Logger:** Internal mutex for concurrent writes, automatic log rotation on date change
 
 ### Process Management
+
+**Graceful shutdown:** On stop signal, SIGTERM with 5s grace period then SIGKILL. Processes killed via reference to avoid racing with restart.
+
+**Dynamic port allocation:** New port allocated on each startup cycle to avoid TIME_WAIT conflicts.
+
+**Process exit detection:** `wait_for_port_ready` polls `try_wait()` to detect early process exit during startup.
 
 **Firejail sandboxing** (when enabled, non-Docker):
 - Private /tmp and /dev
@@ -95,7 +98,7 @@ No explicit stopping state—process termination handled asynchronously in backg
 
 **Reload triggers:** Configurable includes/excludes, defaults to all files for applications, only config files for static/proxy
 
-**On change:** Project calls `stop()` which uses `remove_project_if_current()` with Arc ptr equality to remove from DOMAINS only if still active, then aborts watcher task and kills processes. New instance created on next request.
+**On change:** File watcher sends `StopReason::FileChange` to lifecycle_task/stop_listener. For Applications, deregisters immediately in `run_until_stop` before killing processes so new requests get new project. For non-Applications, `stop_listener` deregisters and exits. New project instance created on next request.
 
 **Server-level:** Non-recursive watch on project parent directories for domain additions/removals
 
@@ -118,9 +121,6 @@ No explicit stopping state—process termination handled asynchronously in backg
 - Wait for log: `t.await_log('text', timeout=2)` (defaults to test domain)
 - Assert HTTP: `t.assert_http('/path', check_body='text')` (defaults to test domain)
 - Count logs: `t.assert_log('text', count=1)` (defaults to test domain)
-
-**file_watcher.rs** - Module with its own unit tests
-- Use: `cargo build && cargo test --lib file_watcher`
 
 ## Developers notes
 
