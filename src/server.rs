@@ -1,9 +1,7 @@
 use crate::acme::CertManager;
-use crate::project::{self, Project};
+use crate::project::{self, Project, StreamBody, empty_body, body_from};
 use anyhow::Result;
-use bytes::Bytes;
 use dashmap::DashMap;
-use http_body_util::{Full, BodyExt};
 
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -326,7 +324,7 @@ impl Server {
     async fn handle_http(
         &self,
         req: Request<hyper::body::Incoming>,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    ) -> Result<Response<StreamBody>, hyper::Error> {
         // Handle ACME HTTP-01 challenges
         let path = req.uri().path();
         if path.starts_with("/.well-known/acme-challenge/") {
@@ -336,7 +334,7 @@ impl Server {
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "text/plain")
-                        .body(Full::new(Bytes::from(key_auth)))
+                        .body(body_from(key_auth))
                         .unwrap());
                 }
             }
@@ -352,11 +350,11 @@ impl Server {
     async fn handle_https(
         &self,
         req: Request<hyper::body::Incoming>,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    ) -> Result<Response<StreamBody>, hyper::Error> {
         self.route_request(req, true).await
     }
 
-    fn make_redirect(&self, scheme: &str, project: &Project, req: &Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
+    fn make_redirect(&self, scheme: &str, project: &Project, req: &Request<hyper::body::Incoming>) -> Response<StreamBody> {
         let port_suffix = match scheme {
             "http" if self.config.http != 80 => format!(":{}", self.config.http),
             "https" if self.config.https != 443 => format!(":{}", self.config.https),
@@ -367,14 +365,14 @@ impl Server {
         Response::builder()
             .status(StatusCode::MOVED_PERMANENTLY)
             .header("Location", url)
-            .body(Full::new(Bytes::new()))
+            .body(empty_body())
             .unwrap()
     }
 
-    fn make_error(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
+    fn make_error(status: StatusCode, message: &str) -> Response<StreamBody> {
         Response::builder()
             .status(status)
-            .body(Full::new(Bytes::from(message.to_string())))
+            .body(body_from(message.to_owned()))
             .unwrap()
     }
 
@@ -382,7 +380,7 @@ impl Server {
         &self,
         mut req: Request<hyper::body::Incoming>,
         from_https: bool,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    ) -> Result<Response<StreamBody>, hyper::Error> {
         if let Some(host) = req.headers().get("host").and_then(|h| h.to_str().ok()) {
             let scheme = if from_https { "https" } else { "http" };
             let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
@@ -406,11 +404,9 @@ impl Server {
             Err(_) => {
                 // Check for www redirect
                 if self.config.redirect_www {
-                    let alt_domain = if let Some(stripped) = domain.strip_prefix("www.") {
-                        stripped.to_string()
-                    } else {
-                        format!("www.{}", domain)
-                    };
+                    let alt_domain = domain.strip_prefix("www.")
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("www.{}", domain));
 
                     if let Ok(project) = self.get_project_for_domain(&alt_domain).await {
                         let scheme = if from_https { "https" } else { "http" };
@@ -442,23 +438,10 @@ impl Server {
             }
         }
 
-        // Handle request with project
+        // Handle request with project - response body is streamed directly to client
         let logger = project.logger.clone();
         match project.handle(req).await {
-            Ok(resp) => {
-                // Convert StreamBody to Full<Bytes> for Hyper compatibility
-                // When client disconnects, this collect() is cancelled, which drops
-                // the upstream body and closes the connection.
-                let (parts, body) = resp.into_parts();
-                let bytes = match body.collect().await {
-                    Ok(collected) => collected.to_bytes(),
-                    Err(e) => {
-                        logger.write("error", &format!("Body collection error: {}", e));
-                        return Ok(Self::make_error(StatusCode::BAD_GATEWAY, "Bad Gateway"));
-                    }
-                };
-                Ok(Response::from_parts(parts, Full::new(bytes)))
-            }
+            Ok(resp) => Ok(resp),
             Err(e) => {
                 let msg = e.to_string();
                 logger.write("error", &msg);

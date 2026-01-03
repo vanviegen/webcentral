@@ -2140,6 +2140,100 @@ sys.exit(1)
     t.await_log('Application failed to start listening on port', timeout=3)
 
 
+@test
+def test_streaming_response(t):
+    """Response body should be streamed incrementally, not buffered entirely"""
+    # Create a backend that sends data with delays but uses Content-Length
+    t.write_file('server.py', r'''
+import sys
+import time
+import socket
+
+port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server_socket.bind(('localhost', port))
+server_socket.listen(1)
+print(f"Streaming server on {port}", flush=True)
+
+while True:
+    try:
+        client, addr = server_socket.accept()
+        print(f"Connection from {addr}", flush=True)
+        
+        # Read request (simple, just drain it)
+        data = b""
+        while b"\r\n\r\n" not in data:
+            data += client.recv(1024)
+        
+        # Send response with 5 chunks, each 6 bytes, total 30 bytes
+        response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 30\r\n\r\n"
+        client.send(response)
+        
+        # Send chunks with 200ms delay between them
+        for i in range(5):
+            chunk = f"CHUNK{i}".encode()
+            client.send(chunk)
+            print(f"Sent chunk {i}", flush=True)
+            time.sleep(0.2)
+        
+        print("Sent all chunks", flush=True)
+        client.close()
+    except Exception as e:
+        print(f"Request error: {e}", flush=True)
+''')
+
+    t.write_file('webcentral.ini', 'command=python3 -u server.py $PORT')
+    
+    # Make request and measure time to receive each chunk
+    import socket
+    
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(10)
+    sock.connect(('localhost', t.port))
+    
+    request = f"GET / HTTP/1.1\r\nHost: {t.current_test_domain}\r\nConnection: close\r\n\r\n"
+    sock.sendall(request.encode())
+    
+    # Read response incrementally and track when chunks arrive
+    received_data = b""
+    chunk_times = []
+    start_time = time.time()
+    
+    while True:
+        try:
+            sock.settimeout(2)  # Short timeout to detect stalls
+            chunk = sock.recv(1024)
+            if not chunk:
+                break
+            received_data += chunk
+            
+            # Track time when each CHUNK marker is received
+            for i in range(5):
+                marker = f"CHUNK{i}".encode()
+                if marker in received_data and len(chunk_times) <= i:
+                    chunk_times.append(time.time() - start_time)
+        except socket.timeout:
+            break
+    
+    sock.close()
+    
+    # Verify all chunks were received
+    for i in range(5):
+        assert f"CHUNK{i}".encode() in received_data, f"Missing CHUNK{i}"
+    
+    # Verify streaming: if properly streamed, chunks should arrive with delays
+    # If buffered entirely, all chunks would arrive at once at the end
+    # The total time should be at least 0.6s (5 chunks * 0.2s delay, minus some for first chunk)
+    # but the individual chunk times should show incrementing values
+    if len(chunk_times) >= 3:
+        # At least some chunks should have different arrival times
+        time_spread = chunk_times[-1] - chunk_times[0]
+        assert time_spread >= 0.3, f"Expected streaming delay of at least 0.3s, got {time_spread:.2f}s - response may be buffered"
+    
+    print(f"{GRAY}Chunk arrival times: {[f'{ct:.2f}s' for ct in chunk_times]}{RESET}", flush=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run webcentral tests')
     parser.add_argument('--firejail', type=str, choices=['true', 'false'], default='true',

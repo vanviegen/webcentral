@@ -386,6 +386,12 @@ Make sure no other services are using ports 80 or 443.
 
 ## Changelog
 
+2026-01-03 (2.1.6):
+ - Stream response bodies to clients (lower latency and memory usage)
+
+2025-12-28 (2.1.5):
+ - Fix potential app reload hang
+
 2025-12-10 (2.1.4):
  - Static file server now sends MIME types based on file extensions
 

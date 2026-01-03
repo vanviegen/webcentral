@@ -12,7 +12,19 @@ use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use std::error::Error as StdError;
 use hyper::{body::Incoming, Request, Response};
 
-type StreamBody = BoxBody<Bytes, anyhow::Error>;
+/// Streaming response body type used throughout the proxy.
+/// Wraps BoxBody to allow streaming responses from upstream to clients.
+pub type StreamBody = BoxBody<Bytes, anyhow::Error>;
+
+/// Create an empty StreamBody (for redirects, upgrade responses, etc.)
+pub fn empty_body() -> StreamBody {
+    BoxBody::new(Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e)))
+}
+
+/// Create a StreamBody from any data that can be converted to Bytes
+pub fn body_from<T: Into<Bytes>>(data: T) -> StreamBody {
+    BoxBody::new(Full::new(data.into()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e)))
+}
 use hyper_util::client::legacy::connect::{HttpConnector};
 use hyper_util::{
     client::legacy::Client,
@@ -243,7 +255,7 @@ impl Project {
             return Ok(Response::builder()
                 .status(301)
                 .header("Location", redirect)
-                .body(BoxBody::new(Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?);
+                .body(empty_body())?);
         }
 
         // Determine handler based on configuration
@@ -279,7 +291,7 @@ impl Project {
         Ok(Response::builder()
             .status(301)
             .header("Location", &format!("{}{}", target, req.uri().path()))
-            .body(BoxBody::new(Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?)
+            .body(empty_body())?)
     }
 
     async fn handle_static(&self, req: Request<Incoming>) -> Result<Response<StreamBody>> {
@@ -287,7 +299,7 @@ impl Project {
         if !public_dir.exists() {
             return Ok(Response::builder()
                 .status(404)
-                .body(BoxBody::new(Full::new(Bytes::from("Not Found")).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?);
+                .body(body_from("Not Found"))?);
         }
 
         // Simple static file serving
@@ -308,11 +320,11 @@ impl Project {
             Ok(Response::builder()
                 .status(200)
                 .header("Content-Type", mime)
-                .body(BoxBody::new(Full::new(Bytes::from(content)).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?)
+                .body(body_from(content))?)
         } else {
             Ok(Response::builder()
                 .status(404)
-                .body(BoxBody::new(Full::new(Bytes::from("Not Found")).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?)
+                .body(body_from("Not Found"))?)
         }
     }
 
@@ -1167,7 +1179,7 @@ impl Project {
             }
         });
 
-        Ok(response_builder.body(BoxBody::new(Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e))))?)
+        Ok(response_builder.body(empty_body())?)
     }
 }
 
