@@ -912,9 +912,9 @@ dependencies = [
 
 [[package]]
 name = "include-exclude-watcher"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93600477b836eedb33f8b6d1d2aa5cd579020a52f0b7d59d7fe622dd0df3e523"
+checksum = "44c7bb00fa5f00020bc640a88f51abd4d4434edc9503a3e3c589603f2b21a8e7"
 dependencies = [
  "libc",
  "tokio",
@@ -1946,9 +1946,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-stream"
-version = "0.1.17"
+version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eca58d7bba4a75707817a2c44174253f9236b2d5fbd055602e9d5c07c139a047"
+checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
 dependencies = [
  "futures-core",
  "pin-project-lite",
@@ -1957,9 +1957,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.17"
+version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2efa149fe76073d6e8fd97ef4f4eca7b67f599660115591483572e406e165594"
+checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
 dependencies = [
  "bytes",
  "futures-core",
@@ -2231,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "webcentral"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "anyhow",
  "bytes",

@@ -1,6 +1,6 @@
 [package]
 name = "webcentral"
-version = "2.2.2"
+version = "2.2.3"
 edition = "2021"
 authors = ["Frank van Viegen <oss@vanviegen.net>"]
 description = "A reverse proxy that runs multiple web applications on a single server with on-demand startup, sandboxing, auto-reload, and Let's Encrypt certificates"
@@ -43,7 +43,7 @@ nix = { version = "0.30", features = ["user", "process", "signal"] }
 lazy_static = "1.5"
 x509-parser = "0.18.0"
 rand = "0.9.2"
-include-exclude-watcher = "0.1.2"
+include-exclude-watcher = "0.2.0"
 mime_guess = "2.0.5"
 console-subscriber = { version = "0.5", optional = true }
 

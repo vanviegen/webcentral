@@ -391,6 +391,9 @@ Make sure no other services are using ports 80 or 443.
 
 ## Changelog
 
+2026-01-04 (2.2.3):
+ - Log which file triggered reload on file change
+
 2026-01-04 (2.2.2):
  - Enable TLS 1.3 0-RTT session resumption for HTTPS and HTTP/3
 

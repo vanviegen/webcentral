@@ -501,7 +501,7 @@ def test_application_file_change_reload(t):
 
     # Modify file and wait for stop
     t.write_file('index.html', '<h1>Version 2</h1>')
-    t.await_log('Stopping due to file changes')
+    t.await_log('Stopping due to file changes: index.html')
 
     # Make HTTP request to trigger restart and serve new content
     t.assert_http('/', check_body='Version 2')

@@ -1084,8 +1084,8 @@ impl Project {
             .set_base_dir(&self.dir)
             .add_includes(&self.config.reload.include)
             .add_excludes(&self.config.reload.exclude)
-            .run_debounced(100, move || {
-                proj.logger.write("supervisor", "Stopping due to file changes");
+            .run_debounced(100, move |path| {
+                proj.logger.write("supervisor", &format!("Stopping due to file changes: {}", path.display()));
                 proj.request_stop(StopReason::FileChange);
             })
             .await?;
