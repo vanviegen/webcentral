@@ -3,7 +3,7 @@
 A reverse proxy that runs multiple web applications for multiple users on a single server. Just put your app in a directory named like the target domain (eg `myapp.example.com/`), point DNS at the server, and you're done! The app will start (and shutdown) on-demand, and reload when its files change.
 
 
-## w
+## Features
 
 ### Per domain request handling
 - Run an executable (that should start serving on $PORT) either from a Docker image or in a Firejail sandbox
@@ -18,8 +18,8 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 ### HTTPS & routing
 - Let's Encrypt certificates acquired and renewed automatically
-- HTTP/3 (QUIC), HTTP/2, and HTTP/1.1 support with automatic protocol negotiation
-- Configurable HTTP ↔ HTTPS and www redirects
+- HTTP/3 (QUIC), HTTP/2, and HTTP/1.1 support with automatic protocol negotiation and 0-RTT resumption
+- Enabled-by-default HTTP ↔ HTTPS and www redirects
 - Transparent WebSocket proxying
 
 ### Multi-user & isolation
@@ -74,6 +74,7 @@ Point DNS for `someapp.yourdomain.com` at your server. Up and running!
 | Built-in sandboxing | Docker or Firejail | ✗ | Docker | ✗ | Docker | Docker |
 | Config complexity | Minimal | Low | Medium | High | Medium | Medium |
 | Container orchestration | ✗ | ✗ | ✓ | ✗ | ✓ | ✓ |
+| HTTP/3 (QUIC) | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
 
 **Caddy/Nginx/Traefik** are pure reverse proxies—they route traffic but don't manage application lifecycles. You need separate tools (systemd, Docker Compose, Kubernetes) to run your apps.
 
@@ -389,6 +390,9 @@ Make sure no other services are using ports 80 or 443.
 ---
 
 ## Changelog
+
+2026-01-04 (2.2.2):
+ - Enable TLS 1.3 0-RTT session resumption for HTTPS and HTTP/3
 
 2026-01-04 (2.2.1):
  - Add HSTS header to all HTTPS responses
