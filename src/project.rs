@@ -242,6 +242,41 @@ impl Project {
     }
 
     pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<StreamBody>> {
+        // Check for WebSocket upgrade before generic handling (requires Incoming body)
+        if is_upgrade_request(&req) {
+            // Log upgrade requests (handle_inner does logging for non-upgrades)
+            *self.last_activity.lock().await = Instant::now();
+            if self.config.log_requests {
+                let _ = self.logger.write("request", &format!("{} {}", req.method(), req.uri().path()));
+            }
+
+            // Upgrades only work for forward/proxy/application types
+            match &self.config.project_type {
+                ProjectType::Application { .. } => {
+                    self.wait_for_app_ready().await?;
+                    let result = self.proxy_upgrade(req).await;
+                    self.untrack_request();
+                    return result;
+                }
+                ProjectType::Proxy { .. } | ProjectType::TcpForward { .. } | 
+                ProjectType::UnixForward { .. } => {
+                    return self.proxy_upgrade(req).await;
+                }
+                _ => {} // Fall through to normal handling
+            }
+        }
+
+        self.handle_inner(req).await
+    }
+
+    /// Internal handler that works with any body type (no upgrade support).
+    /// Used by HTTP/3 which doesn't support WebSocket upgrades.
+    pub async fn handle_inner<B>(self: Arc<Self>, req: Request<B>) -> Result<Response<StreamBody>>
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        // Update activity timestamp
         *self.last_activity.lock().await = Instant::now();
 
         if self.config.log_requests {
@@ -260,12 +295,12 @@ impl Project {
 
         // Determine handler based on configuration
         match &self.config.project_type {
-            ProjectType::Redirect { target } => self.handle_redirect(req, target).await,
+            ProjectType::Redirect { target } => self.handle_redirect(&req, target).await,
             ProjectType::Proxy { target } => self.clone().proxy_request(req, target).await,
             ProjectType::TcpForward { .. } => self.forward_request(req).await,
             ProjectType::UnixForward { .. } => self.forward_request(req).await,
             ProjectType::Application { .. } => self.handle_application(req).await,
-            ProjectType::Static => self.handle_static(req).await,
+            ProjectType::Static => self.handle_static(&req).await,
         }
     }
 
@@ -287,14 +322,14 @@ impl Project {
         (path.to_string(), String::new())
     }
 
-    async fn handle_redirect(&self, req: Request<Incoming>, target: &str) -> Result<Response<StreamBody>> {
+    async fn handle_redirect<B>(&self, req: &Request<B>, target: &str) -> Result<Response<StreamBody>> {
         Ok(Response::builder()
             .status(301)
             .header("Location", &format!("{}{}", target, req.uri().path()))
             .body(empty_body())?)
     }
 
-    async fn handle_static(&self, req: Request<Incoming>) -> Result<Response<StreamBody>> {
+    async fn handle_static<B>(&self, req: &Request<B>) -> Result<Response<StreamBody>> {
         let public_dir = self.dir.join("public");
         if !public_dir.exists() {
             return Ok(Response::builder()
@@ -328,14 +363,17 @@ impl Project {
         }
     }
 
-    async fn proxy_request(
+    async fn proxy_request<B>(
         self: Arc<Self>,
-        req: Request<Incoming>,
+        req: Request<B>,
         target: &str,
-    ) -> Result<Response<StreamBody>> {
-
+    ) -> Result<Response<StreamBody>>
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let (parts, body) = req.into_parts();
-        let uri_str = format!("{}{}", target, parts.uri.path_and_query().unwrap());
+        let uri_str = format!("{}{}", target, parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
 
         let mut new_parts = parts.clone();
         let new_uri: http::Uri = uri_str.parse()?;
@@ -344,12 +382,13 @@ impl Project {
         let original_host = parts
             .headers
             .get("host")
+            .or_else(|| parts.headers.get(":authority"))
             .and_then(|h| h.to_str().ok())
             .unwrap_or("");
 
         // Set X-Forwarded headers to preserve original request info
         new_parts.headers.insert("X-Forwarded-Host", HeaderValue::from_str(original_host)?);
-        new_parts.headers.insert("X-Forwarded-Proto", HeaderValue::from_str(parts.uri.scheme_str().unwrap_or("?"))?);
+        new_parts.headers.insert("X-Forwarded-Proto", HeaderValue::from_str(parts.uri.scheme_str().unwrap_or("https"))?);
 
         // Rewrite Host header to match the backend (extracted from target URI)
         if let Some(authority) = new_uri.authority() {
@@ -360,22 +399,33 @@ impl Project {
         self.forward_request(proxy_req).await
     }
 
-    async fn forward_request(
+    async fn forward_request<B>(
         self: &Arc<Self>,
-        req: Request<Incoming>,
+        req: Request<B>,
     ) -> Result<Response<StreamBody>>
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        // Check if this is a WebSocket upgrade request
-        if is_upgrade_request(&req) {
-            // Upgrade requests need special handling, convert to Full<Bytes> response
-            let resp = self.proxy_upgrade(req).await.map_err(|e| anyhow::anyhow!("Error during HTTP upgrade: {}", e))?;
-            let (parts, body) = resp.into_parts();
-            return Ok(Response::from_parts(parts, BoxBody::new(body.map_err(|e| anyhow::anyhow!("{}", e)))));
-        }
+        // Note: WebSocket upgrades are handled separately in handle_upgrade
+        // because they require the hyper::body::Incoming type specifically.
 
         // Buffer the request body (we must send the full request to upstream)
-        let (parts, body) = req.into_parts();
-        let body_bytes = body.collect().await?.to_bytes();
+        let (mut parts, body) = req.into_parts();
+        
+        // Upstream connections are always HTTP/1.1
+        parts.version = http::Version::HTTP_11;
+        
+        // Remove HTTP/2 and HTTP/3 pseudo-headers (they start with ':')
+        // These are not valid in HTTP/1.1 and will cause upstream errors
+        parts.headers.remove(":authority");
+        parts.headers.remove(":method");
+        parts.headers.remove(":path");
+        parts.headers.remove(":scheme");
+        parts.headers.remove(":status");
+        parts.headers.remove(":protocol");
+        
+        let body_bytes = BodyExt::collect(body).await.map_err(|e| anyhow::anyhow!("{}", e.into()))?.to_bytes();
         let req = Request::from_parts(parts, Full::new(body_bytes));
 
         // Get the http_client from the appropriate source
@@ -409,12 +459,22 @@ impl Project {
         Ok(Response::from_parts(parts, BoxBody::new(body.map_err(|e| anyhow::anyhow!("{}", e)))))
     }
 
-    async fn handle_application(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<StreamBody>> {
-        // Track this request so lifecycle task knows we have pending work
+    async fn handle_application<B>(self: Arc<Self>, req: Request<B>) -> Result<Response<StreamBody>>
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.wait_for_app_ready().await?;
+        let result = self.forward_request(req).await;
+        self.untrack_request();
+        result
+    }
+
+    /// Wait for application to be ready, tracking the request.
+    /// On success, caller MUST call untrack_request() when done.
+    async fn wait_for_app_ready(&self) -> Result<()> {
         self.track_request();
         
-        // Wait for application to be ready (with timeout)
-        // Scoped to ensure watch::Ref is dropped before the forward_request await
         let state = {
             let mut rx = self.state_rx.clone();
             let wait_result = tokio::time::timeout(
@@ -423,7 +483,7 @@ impl Project {
             ).await;
 
             match wait_result {
-                Ok(Ok(s)) => *s,  // Deref and copy the state before dropping the Ref
+                Ok(Ok(s)) => *s,
                 Ok(Err(_)) => {
                     self.untrack_request();
                     anyhow::bail!("Application state channel closed");
@@ -440,9 +500,7 @@ impl Project {
             anyhow::bail!("502 application failed to start");
         }
 
-        let result = self.forward_request(req).await;
-        self.untrack_request();
-        result
+        Ok(())
     }
 
     /// Spawns the application process and workers. Returns handles to await for process exit.
@@ -1184,7 +1242,7 @@ impl Project {
 }
 
 // Helper function to detect WebSocket upgrade requests
-fn is_upgrade_request(req: &Request<Incoming>) -> bool {
+fn is_upgrade_request<B>(req: &Request<B>) -> bool {
     req.headers()
         .get(hyper::header::CONNECTION)
         .and_then(|v| v.to_str().ok())

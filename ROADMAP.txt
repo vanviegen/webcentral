@@ -1,7 +1,5 @@
-- When a Project shuts down or after 15 minutes of running, output some stats (at least request count, but other easy-to-gather stats would be nice as well) to its log file
-- Add a way to set a list of basic auth usernames+passwords for a project in webcentral.ini, and have webcentral enforce that for all requests to that project - the passwords should be stored using argon2
+- Add a way to set a list of basic auth usernames+passwords (optionally stored using some password hash) for a project in webcentral.ini, and have webcentral enforce that for all requests to that project - the passwords should be stored using argon2
 - Make the URL to check if the service is running configurable in webcentral.ini
 - Do a periodic check on the check URL after the project has started, forcing a shutdown if it's no longer responding
-- Implement HTTP/3 server using https://github.com/quinn-rs/quinn
 
 For each of the above: update README.md (and add to its Changelog section) if needed.

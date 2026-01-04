@@ -9,7 +9,7 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 `src/main.rs` - Entry point, command-line args, starts server, handles shutdown
 
-`src/server.rs` - HTTP/HTTPS listeners, ACME certificate management, domain routing, www/HTTPS redirects, directory watching
+`src/server.rs` - HTTP/HTTPS/HTTP3 listeners, ACME certificate management, domain routing, www/HTTPS redirects, directory watching
 
 `src/project.rs` - Per-domain lifecycle manager supporting: applications (Firejail/Docker), static files, redirects, proxies, forwards. Handles file watching, auto-reload, inactivity timeouts, URL rewrites
 

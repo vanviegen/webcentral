@@ -1,8 +1,12 @@
 use crate::acme::CertManager;
 use crate::project::{self, Project, StreamBody, empty_body, body_from};
 use anyhow::Result;
+use bytes::Bytes;
 use dashmap::DashMap;
 
+#[cfg(feature = "http3")]
+use h3_quinn::quinn::crypto::rustls::QuicServerConfig;
+use http_body_util::BodyExt;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -13,6 +17,8 @@ use rustls::ServerConfig;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, Write};
+#[cfg(feature = "http3")]
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -51,6 +57,40 @@ impl Drop for DomainInfo {
 lazy_static::lazy_static! {
     static ref DOMAINS: DashMap<String, DomainInfo> = DashMap::new();
     static ref VALID_DOMAIN: Regex = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$").unwrap();
+}
+
+/// Streaming body adapter for HTTP/3 - wraps h3 RecvStream as an http_body::Body.
+#[cfg(feature = "http3")]
+struct H3RecvBody<S: h3::quic::RecvStream> {
+    stream: h3::server::RequestStream<S, Bytes>,
+}
+
+#[cfg(feature = "http3")]
+impl<S: h3::quic::RecvStream> http_body::Body for H3RecvBody<S> {
+    type Data = Bytes;
+    type Error = anyhow::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use bytes::Buf;
+        use std::future::Future;
+        
+        let fut = self.stream.recv_data();
+        tokio::pin!(fut);
+        
+        match fut.poll(cx) {
+            std::task::Poll::Ready(Ok(Some(mut buf))) => {
+                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(buf.copy_to_bytes(buf.remaining())))))
+            }
+            std::task::Poll::Ready(Ok(None)) => std::task::Poll::Ready(None),
+            std::task::Poll::Ready(Err(e)) => {
+                std::task::Poll::Ready(Some(Err(anyhow::anyhow!("H3 recv error: {}", e))))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
 }
 
 /// Deregister a project (only if it's still the current one for the domain).
@@ -241,6 +281,17 @@ impl Server {
                     eprintln!("HTTPS server error: {}", e);
                 }
             });
+
+            // Start HTTP/3 server (QUIC) on same port - UDP vs TCP
+            #[cfg(feature = "http3")]
+            if self.config.http3 {
+                let server = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = server.run_http3_server().await {
+                        eprintln!("HTTP/3 server error: {}", e);
+                    }
+                });
+            }
         }
 
         Ok(())
@@ -277,11 +328,14 @@ impl Server {
             .expect("Certificate manager required for HTTPS");
         let cert_manager_clone = cert_manager.clone();
 
-        let tls_config = ServerConfig::builder()
+        let mut tls_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(CertResolver {
                 cert_manager: cert_manager_clone,
             }));
+        
+        // ALPN protocols for HTTP/2 and HTTP/1.1 negotiation
+        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
@@ -319,6 +373,189 @@ impl Server {
                 }
             });
         }
+    }
+
+    #[cfg(feature = "http3")]
+    async fn run_http3_server(self: Arc<Self>) -> Result<()> {
+        let cert_manager = self
+            .cert_manager
+            .as_ref()
+            .expect("Certificate manager required for HTTP/3");
+
+        // Build TLS config for QUIC - same as HTTPS but with h3 ALPN
+        let mut tls_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(CertResolver {
+                cert_manager: cert_manager.clone(),
+            }));
+        tls_config.alpn_protocols = vec![b"h3".to_vec()];
+        tls_config.max_early_data_size = u32::MAX;
+
+        let quic_config = QuicServerConfig::try_from(tls_config)
+            .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
+
+        let server_config = h3_quinn::quinn::ServerConfig::with_crypto(Arc::new(quic_config));
+        let addr: SocketAddr = format!("0.0.0.0:{}", self.config.https).parse()?;
+
+        let endpoint = h3_quinn::quinn::Endpoint::server(server_config, addr)
+            .map_err(|e| anyhow::anyhow!("Failed to create QUIC endpoint: {}", e))?;
+
+        println!("HTTP/3 server listening on port {} (UDP)", self.config.https);
+
+        while let Some(incoming) = endpoint.accept().await {
+            let server = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = server.handle_http3_connection(incoming).await {
+                    let err_str = e.to_string();
+                    // Don't log "no certificate" errors (unconfigured domain) or idle timeouts
+                    if !err_str.contains("no server certificate") && !err_str.contains("Timeout") {
+                        eprintln!("HTTP/3 connection error: {}", e);
+                    }
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "http3")]
+    async fn handle_http3_connection(
+        self: Arc<Self>,
+        incoming: h3_quinn::quinn::Incoming,
+    ) -> Result<()> {
+        let conn = incoming.await?;
+        let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn)).await?;
+
+        loop {
+            match h3_conn.accept().await {
+                Ok(Some(resolver)) => {
+                    let server = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = server.handle_http3_request(resolver).await {
+                            eprintln!("HTTP/3 request error: {}", e);
+                        }
+                    });
+                }
+                Ok(None) => break, // Connection closed gracefully
+                Err(e) => {
+                    return Err(anyhow::anyhow!("HTTP/3 accept error: {}", e));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "http3")]
+    async fn handle_http3_request<C>(
+        &self,
+        resolver: h3::server::RequestResolver<C, Bytes>,
+    ) -> Result<()>
+    where
+        C: h3::quic::Connection<Bytes>,
+        C::BidiStream: h3::quic::BidiStream<Bytes>,
+        <C::BidiStream as h3::quic::BidiStream<Bytes>>::RecvStream: Send + 'static,
+    {
+        let (req, stream) = resolver.resolve_request().await?;
+
+        // Split stream into send/recv halves for concurrent request/response streaming
+        let (mut send_stream, recv_stream) = stream.split();
+
+        // Extract domain from headers before consuming request
+        let (parts, _) = req.into_parts();
+        let domain = match self.extract_domain_from_parts(&parts) {
+            Some(d) => d,
+            None => {
+                let resp = http::Response::builder().status(StatusCode::BAD_REQUEST).body(()).unwrap();
+                send_stream.send_response(resp).await?;
+                send_stream.send_data(Bytes::from("Bad Request")).await?;
+                return Ok(send_stream.finish().await?);
+            }
+        };
+
+        // Get project
+        let project = match self.get_project_for_domain(&domain).await {
+            Ok(p) => p,
+            Err(_) => {
+                let resp = http::Response::builder().status(StatusCode::NOT_FOUND).body(()).unwrap();
+                send_stream.send_response(resp).await?;
+                send_stream.send_data(Bytes::from("Not Found")).await?;
+                return Ok(send_stream.finish().await?);
+            }
+        };
+
+        // Wrap recv stream as streaming body
+        let body = H3RecvBody { stream: recv_stream };
+        let req = Request::from_parts(parts, body);
+
+        // Handle request with streaming body - HTTP/3 doesn't support upgrades
+        let logger = project.logger.clone();
+        let domain = project.domain.clone();
+        let response = project.handle_inner(req).await;
+
+        match response {
+            Ok(resp) => {
+                // Send response headers
+                let (resp_parts, mut body) = resp.into_parts();
+                let mut builder = http::Response::builder().status(resp_parts.status);
+                for (name, value) in resp_parts.headers.iter() {
+                    // Skip connection-specific headers forbidden in HTTP/3
+                    let name_lower = name.as_str().to_lowercase();
+                    if name_lower == "transfer-encoding" 
+                        || name_lower == "connection"
+                        || name_lower == "keep-alive"
+                        || name_lower == "upgrade"
+                        || name_lower == "proxy-connection"
+                    {
+                        continue;
+                    }
+                    builder = builder.header(name, value);
+                }
+                send_stream.send_response(builder.body(()).unwrap()).await?;
+                
+                // Stream response body
+                while let Some(chunk) = body.frame().await {
+                    match chunk {
+                        Ok(frame) => {
+                            if let Some(data) = frame.data_ref() {
+                                send_stream.send_data(data.clone()).await?;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("HTTP/3 body stream error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                eprintln!("HTTP/3 request error for {}: {}", domain, msg);
+                logger.write("error", &msg);
+                let status = if msg.starts_with("502 ") {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                let resp = http::Response::builder().status(status).body(()).unwrap();
+                send_stream.send_response(resp).await?;
+                send_stream.send_data(Bytes::from(status.canonical_reason().unwrap_or("Error"))).await?;
+            }
+        }
+
+        Ok(send_stream.finish().await?)
+    }
+
+    #[cfg(feature = "http3")]
+    fn extract_domain_from_parts(&self, parts: &http::request::Parts) -> Option<String> {
+        // h3 puts :authority in the URI, fall back to headers
+        let host = parts.uri.host()
+            .map(|h| h.to_string())
+            .or_else(|| parts.headers.get("host").and_then(|h| h.to_str().ok()).map(|s| s.to_string()))
+            .or_else(|| parts.headers.get(":authority").and_then(|h| h.to_str().ok()).map(|s| s.to_string()))?;
+        let host = host.split(':').next().unwrap_or(&host).to_lowercase();
+        if !VALID_DOMAIN.is_match(&host) { return None; }
+        Some(host)
     }
 
     async fn handle_http(
@@ -440,7 +677,7 @@ impl Server {
 
         // Handle request with project - response body is streamed directly to client
         let logger = project.logger.clone();
-        match project.handle(req).await {
+        let result = match project.handle(req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 let msg = e.to_string();
@@ -451,7 +688,18 @@ impl Server {
                     Ok(Self::make_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"))
                 }
             }
+        };
+
+        // Add Alt-Svc header for HTTPS responses to advertise HTTP/3
+        if from_https && self.config.http3 {
+            if let Ok(mut resp) = result {
+                let alt_svc = format!("h3=\":{}\"; ma=86400", self.config.https);
+                resp.headers_mut().insert("Alt-Svc", alt_svc.parse().unwrap());
+                return Ok(resp);
+            }
         }
+
+        result
     }
 
     fn extract_domain(&self, req: &Request<hyper::body::Incoming>) -> Option<String> {

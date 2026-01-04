@@ -3,7 +3,7 @@
 A reverse proxy that runs multiple web applications for multiple users on a single server. Just put your app in a directory named like the target domain (eg `myapp.example.com/`), point DNS at the server, and you're done! The app will start (and shutdown) on-demand, and reload when its files change.
 
 
-## Features
+## w
 
 ### Per domain request handling
 - Run an executable (that should start serving on $PORT) either from a Docker image or in a Firejail sandbox
@@ -18,6 +18,7 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 ### HTTPS & routing
 - Let's Encrypt certificates acquired and renewed automatically
+- HTTP/3 (QUIC), HTTP/2, and HTTP/1.1 support with automatic protocol negotiation
 - Configurable HTTP ↔ HTTPS and www redirects
 - Transparent WebSocket proxying
 
@@ -36,10 +37,13 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 # Install dependencies
 sudo apt install git firejail docker.io rustc
 
-# Build
+# Build (includes HTTP/3 support by default)
 git clone https://github.com/vanviegen/webcentral.git
 cd webcentral
 cargo build --release
+
+# Build without HTTP/3 (smaller binary, fewer dependencies)
+cargo build --release --no-default-features
 
 # Run
 sudo ./target/release/webcentral --email you@example.com
@@ -385,6 +389,10 @@ Make sure no other services are using ports 80 or 443.
 ---
 
 ## Changelog
+
+2026-01-04 (2.2.0):
+ - HTTP/3 (QUIC) support - automatically enabled when HTTPS is active
+ - HTTP/2 support via ALPN negotiation
 
 2026-01-03 (2.1.6):
  - Stream response bodies to clients (lower latency and memory usage)

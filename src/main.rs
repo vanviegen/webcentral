@@ -26,6 +26,9 @@ pub struct GlobalConfig {
     #[arg(long, default_value = "443", help = "HTTPS port (0 to disable)")]
     pub https: u16,
 
+    #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value = "true", default_missing_value = "true", help = "Enable HTTP/3 (QUIC) on HTTPS port")]
+    pub http3: bool,
+
     #[arg(long, default_value = "80", help = "HTTP port (0 to disable)")]
     pub http: u16,
 
@@ -87,6 +90,11 @@ impl GlobalConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install rustls crypto provider (needed when multiple providers available, e.g. with HTTP/3)
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     #[cfg(feature = "console")]
     console_subscriber::init();
 
