@@ -390,6 +390,9 @@ Make sure no other services are using ports 80 or 443.
 
 ## Changelog
 
+2026-01-04 (2.2.1):
+ - Add HSTS header to all HTTPS responses
+
 2026-01-04 (2.2.0):
  - HTTP/3 (QUIC) support - automatically enabled when HTTPS is active
  - HTTP/2 support via ALPN negotiation

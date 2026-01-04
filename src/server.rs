@@ -511,6 +511,8 @@ impl Server {
                     }
                     builder = builder.header(name, value);
                 }
+                // HTTP/3 is always over TLS, so add HSTS
+                builder = builder.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
                 send_stream.send_response(builder.body(()).unwrap()).await?;
                 
                 // Stream response body
@@ -537,7 +539,11 @@ impl Server {
                 } else {
                     StatusCode::INTERNAL_SERVER_ERROR
                 };
-                let resp = http::Response::builder().status(status).body(()).unwrap();
+                // HTTP/3 is always over TLS, so add HSTS
+                let resp = http::Response::builder()
+                    .status(status)
+                    .header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+                    .body(()).unwrap();
                 send_stream.send_response(resp).await?;
                 send_stream.send_data(Bytes::from(status.canonical_reason().unwrap_or("Error"))).await?;
             }
@@ -690,11 +696,14 @@ impl Server {
             }
         };
 
-        // Add Alt-Svc header for HTTPS responses to advertise HTTP/3
-        if from_https && self.config.http3 {
+        // Add HSTS and Alt-Svc headers for HTTPS responses
+        if from_https {
             if let Ok(mut resp) = result {
-                let alt_svc = format!("h3=\":{}\"; ma=86400", self.config.https);
-                resp.headers_mut().insert("Alt-Svc", alt_svc.parse().unwrap());
+                resp.headers_mut().insert("Strict-Transport-Security", "max-age=31536000; includeSubDomains".parse().unwrap());
+                if self.config.http3 {
+                    let alt_svc = format!("h3=\":{}\"; ma=86400", self.config.https);
+                    resp.headers_mut().insert("Alt-Svc", alt_svc.parse().unwrap());
+                }
                 return Ok(resp);
             }
         }
