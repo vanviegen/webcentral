@@ -1,4 +1,4 @@
-- Add a way to set a list of basic auth usernames+passwords (optionally stored using some password hash) for a project in webcentral.ini, and have webcentral enforce that for all requests to that project - the passwords should be stored using argon2
+- Add a way to set a list of basic auth usernames+passwords (optionally stored using some password hash) for a project in webcentral.ini, and have webcentral enforce that for all requests to that project - the passwords should be stored using argon2. For this in an optional [auth] section of the ini file. If none are given, no security is enforced.
 - Make the URL to check if the service is running configurable in webcentral.ini
 - Do a periodic check on the check URL after the project has started, forcing a shutdown if it's no longer responding
 

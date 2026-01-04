@@ -622,6 +622,26 @@ def test_redirect_configuration(t):
 
 
 @test
+def test_dashboard_type(t):
+    """Test dashboard type shows project status"""
+    # Create a dashboard project
+    t.write_file('webcentral.ini', 'type=dashboard')
+    
+    # Create an app project to show in the dashboard
+    t.write_file('webcentral.ini', 'command=sleep 999', domain='app.test')
+    t.await_log('stdout', 'Domain app.test added')
+    
+    # Access dashboard - check structure
+    t.assert_http('/', check_body='<title>Webcentral Dashboard</title>')
+    t.assert_http('/', check_body='<th>Domain</th>')
+    t.assert_http('/', check_body='<th>TLS</th>')
+    t.assert_http('/', check_body='<th>Requests</th>')
+    t.assert_http('/', check_body='<th>Idle</th>')
+    t.assert_http('/', check_body='Uptime')
+    t.assert_http('/', check_body='app.test')
+
+
+@test
 def test_multiple_projects_isolation(t):
     """Multiple projects run independently"""
     # This test needs multiple domains

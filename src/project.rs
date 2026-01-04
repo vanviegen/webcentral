@@ -98,6 +98,7 @@ pub struct Project {
     state_rx: watch::Receiver<AppState>,
     stop_tx: mpsc::Sender<StopReason>,  // Send to request stop
     pending_requests: AtomicU64,        // Requests currently being handled
+    total_requests: AtomicU64,          // Total requests served
     last_activity: Mutex<Instant>,
     watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     state_changed: Notify,              // Notified when pending_requests changes
@@ -141,6 +142,9 @@ impl Project {
                 ProjectType::Static => {
                     (None, "Static file server".to_string())
                 }
+                ProjectType::Dashboard => {
+                    (None, "Dashboard".to_string())
+                }
                 ProjectType::Application { .. } => unreachable!(),
             };
             logger.write("supervisor", &descr);
@@ -175,6 +179,7 @@ impl Project {
             state_rx,
             stop_tx,
             pending_requests: 0.into(),
+            total_requests: 0.into(),
             last_activity: Mutex::new(Instant::now()),
             watcher_task: Mutex::new(None),
             state_changed: Notify::new(),
@@ -233,6 +238,7 @@ impl Project {
     /// RAII guard to track pending requests - decrements count on drop
     fn track_request(&self) {
         self.pending_requests.fetch_add(1, Ordering::SeqCst);
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.state_changed.notify_one();
     }
 
@@ -301,6 +307,7 @@ impl Project {
             ProjectType::UnixForward { .. } => self.forward_request(req).await,
             ProjectType::Application { .. } => self.handle_application(req).await,
             ProjectType::Static => self.handle_static(&req).await,
+            ProjectType::Dashboard => self.handle_dashboard(&req).await,
         }
     }
 
@@ -361,6 +368,100 @@ impl Project {
                 .status(404)
                 .body(body_from("Not Found"))?)
         }
+    }
+
+    async fn handle_dashboard<B>(&self, _req: &Request<B>) -> Result<Response<StreamBody>> {
+        let domains = crate::server::get_domain_status();
+        let server_info = crate::server::get_server_info();
+        
+        // Format uptime nicely
+        let uptime_secs = server_info.uptime_seconds;
+        let uptime_str = if uptime_secs < 60 {
+            format!("{}s", uptime_secs)
+        } else if uptime_secs < 3600 {
+            format!("{}m {}s", uptime_secs / 60, uptime_secs % 60)
+        } else if uptime_secs < 86400 {
+            format!("{}h {}m", uptime_secs / 3600, (uptime_secs % 3600) / 60)
+        } else {
+            format!("{}d {}h", uptime_secs / 86400, (uptime_secs % 86400) / 3600)
+        };
+        
+        let mut html = format!(r#"<!DOCTYPE html>
+<html>
+<head>
+<title>Webcentral Dashboard</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 2em; background: #f5f5f5; }}
+h1 {{ color: #333; }}
+h2 {{ color: #555; margin-top: 2em; }}
+table {{ border-collapse: collapse; width: 100%; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 1em; }}
+th, td {{ border: 1px solid #ddd; padding: 0.75em 1em; text-align: left; }}
+th {{ background: #f8f8f8; }}
+tr:hover {{ background: #f5f5f5; }}
+.status-running {{ color: #2a2; }}
+.status-stopped {{ color: #888; }}
+.status-starting {{ color: #f90; }}
+.status-failed {{ color: #c22; }}
+.status-active {{ color: #2a2; }}
+.cert-valid {{ color: #2a2; }}
+.cert-error {{ color: #c22; }}
+.cert-acquiring {{ color: #f90; }}
+.server-info {{ display: flex; gap: 2em; margin-bottom: 2em; flex-wrap: wrap; }}
+.info-card {{ background: white; padding: 1em 1.5em; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+.info-card h3 {{ margin: 0 0 0.5em 0; color: #666; font-size: 0.9em; }}
+.info-card .value {{ font-size: 1.5em; color: #333; }}
+.num {{ text-align: right; }}
+.dir {{ font-size: 0.85em; color: #666; max-width: 300px; overflow: hidden; text-overflow: ellipsis; }}
+</style>
+</head>
+<body>
+<h1>Webcentral Dashboard</h1>
+
+<div class="server-info">
+<div class="info-card"><h3>Uptime</h3><div class="value">{}</div></div>
+<div class="info-card"><h3>Domains</h3><div class="value">{}</div></div>
+</div>
+
+<h2>Projects</h2>
+<table>
+<tr><th>Domain</th><th>Type</th><th>Status</th><th>TLS</th><th>Requests</th><th>Pending</th><th>Idle</th><th>Directory</th></tr>
+"#, uptime_str, server_info.domain_count);
+
+        for d in domains {
+            let status_class = match d.status.as_str() {
+                "Running" => "status-running",
+                "Stopped" => "status-stopped",
+                "Starting" => "status-starting",
+                "Failed" => "status-failed",
+                "Active" => "status-active",
+                _ => "",
+            };
+            let idle_str = d.idle_seconds.map(|s| {
+                if s < 60 { format!("{}s", s) }
+                else if s < 3600 { format!("{}m", s / 60) }
+                else { format!("{}h", s / 3600) }
+            }).unwrap_or_else(|| "-".to_string());
+            
+            let (cert_class, cert_str) = match d.cert_status.as_deref() {
+                Some(s) if s.starts_with("Valid") => ("cert-valid", s),
+                Some(s) if s.starts_with("Error") => ("cert-error", s),
+                Some(s) if s == "Expired" => ("cert-error", s),
+                Some(s) => ("cert-acquiring", s),
+                None => ("", "-"),
+            };
+            
+            html.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td class=\"{}\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"dir\" title=\"{}\">{}</td></tr>\n",
+                d.domain, d.project_type, status_class, d.status, cert_class, cert_str, d.total_requests, d.pending_requests, idle_str, d.directory, d.directory
+            ));
+        }
+
+        html.push_str("</table>\n</body>\n</html>");
+
+        Ok(Response::builder()
+            .status(200)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(body_from(html))?)
     }
 
     async fn proxy_request<B>(
@@ -1105,6 +1206,50 @@ impl Project {
     /// Stop this project (for server shutdown)
     pub fn stop(self: Arc<Self>) {
         self.request_stop(StopReason::Shutdown);
+    }
+
+    /// Get the project type name for dashboard display
+    pub fn get_type_name(&self) -> String {
+        match &self.config.project_type {
+            ProjectType::Application { docker: Some(_), .. } => "Docker",
+            ProjectType::Application { .. } => "Application",
+            ProjectType::Static => "Static",
+            ProjectType::Redirect { .. } => "Redirect",
+            ProjectType::Proxy { .. } => "Proxy",
+            ProjectType::TcpForward { .. } => "TCP Forward",
+            ProjectType::UnixForward { .. } => "Unix Forward",
+            ProjectType::Dashboard => "Dashboard",
+        }.to_string()
+    }
+
+    /// Get the current status for dashboard display
+    pub fn get_status(&self) -> String {
+        match &self.config.project_type {
+            ProjectType::Application { .. } => {
+                match *self.state_rx.borrow() {
+                    AppState::Stopped => "Stopped",
+                    AppState::Starting => "Starting",
+                    AppState::Running => "Running",
+                    AppState::Failed => "Failed",
+                }.to_string()
+            }
+            _ => "Active".to_string()
+        }
+    }
+
+    /// Get pending request count
+    pub fn get_pending_requests(&self) -> u64 {
+        self.pending_requests.load(Ordering::Relaxed)
+    }
+
+    /// Get total request count
+    pub fn get_total_requests(&self) -> u64 {
+        self.total_requests.load(Ordering::Relaxed)
+    }
+
+    /// Get seconds since last activity (returns None if lock unavailable)
+    pub fn get_idle_seconds(&self) -> Option<u64> {
+        self.last_activity.try_lock().ok().map(|guard| guard.elapsed().as_secs())
     }
 
     async fn proxy_upgrade(

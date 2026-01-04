@@ -57,6 +57,8 @@ impl Drop for DomainInfo {
 lazy_static::lazy_static! {
     static ref DOMAINS: DashMap<String, DomainInfo> = DashMap::new();
     static ref VALID_DOMAIN: Regex = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$").unwrap();
+    static ref SERVER_START_TIME: std::time::Instant = std::time::Instant::now();
+    static ref CERT_STATUS: DashMap<String, String> = DashMap::new();
 }
 
 /// Streaming body adapter for HTTP/3 - wraps h3 RecvStream as an http_body::Body.
@@ -111,6 +113,66 @@ pub fn stop_all_projects() {
         if let Some(project) = entry.project.clone() {
             project.stop();
         }
+    }
+}
+
+/// Get status info for all domains (for dashboard display)
+pub fn get_domain_status() -> Vec<DomainStatus> {
+    let mut result: Vec<DomainStatus> = DOMAINS.iter().map(|entry| {
+        let domain = entry.key().clone();
+        let directory = entry.directory.clone();
+        let cert_status = CERT_STATUS.get(&domain).map(|s| s.clone());
+        if let Some(project) = &entry.project {
+            DomainStatus {
+                domain,
+                directory,
+                project_type: project.get_type_name(),
+                status: project.get_status(),
+                pending_requests: project.get_pending_requests(),
+                total_requests: project.get_total_requests(),
+                idle_seconds: project.get_idle_seconds(),
+                cert_status,
+            }
+        } else {
+            DomainStatus {
+                domain,
+                directory,
+                project_type: "Unknown".to_string(),
+                status: "Not loaded".to_string(),
+                pending_requests: 0,
+                total_requests: 0,
+                idle_seconds: None,
+                cert_status,
+            }
+        }
+    }).collect();
+    result.sort_by(|a, b| a.domain.cmp(&b.domain));
+    result
+}
+
+/// Status info for a single domain
+pub struct DomainStatus {
+    pub domain: String,
+    pub directory: String,
+    pub project_type: String,
+    pub status: String,
+    pub pending_requests: u64,
+    pub total_requests: u64,
+    pub idle_seconds: Option<u64>,
+    pub cert_status: Option<String>,
+}
+
+/// Server-wide status info
+pub struct ServerInfo {
+    pub uptime_seconds: u64,
+    pub domain_count: usize,
+}
+
+/// Get basic server-wide info (thread-safe, no config needed)
+pub fn get_server_info() -> ServerInfo {
+    ServerInfo {
+        uptime_seconds: SERVER_START_TIME.elapsed().as_secs(),
+        domain_count: DOMAINS.len(),
     }
 }
 
@@ -846,10 +908,14 @@ impl Server {
                     if let Ok(duration_until_expiry) = expiration.duration_since(now) {
                         // Renew if expires in < 8 days
                         if duration_until_expiry < std::time::Duration::from_secs(8 * 24 * 60 * 60) {
+                            let days = duration_until_expiry.as_secs() / 86400;
+                            CERT_STATUS.insert(domain.clone(), format!("Renewing ({}d left)", days));
                             println!("Certificate for {} expires in {:?}, renewing...", domain, duration_until_expiry);
                             // Acquire!
                         } else {
                             // Valid certificate, sleep until renewal time (expiration - 7 days)
+                            let days = duration_until_expiry.as_secs() / 86400;
+                            CERT_STATUS.insert(domain.clone(), format!("Valid ({}d)", days));
                             let sleep_time = duration_until_expiry - to_jittered_duration(7 * 24 * 60 * 60);
                             println!("Certificate for {} is valid. Sleeping for {}s", domain, sleep_time.as_secs());
                             tokio::time::sleep(sleep_time).await;
@@ -857,18 +923,22 @@ impl Server {
                         }
                     } else {
                         // Already expired - acquire!
+                        CERT_STATUS.insert(domain.clone(), "Expired".to_string());
                         println!("Certificate for {} has expired", domain);
                     }
                 }
                 Err(_) => {
                     // No certificate or invalid - acquire!
+                    CERT_STATUS.insert(domain.clone(), "Acquiring".to_string());
                 }
             };
 
             let mut backoff_time = 15 * 60; // 15 minutes
             loop {
+                CERT_STATUS.insert(domain.clone(), "Acquiring".to_string());
                 match cert_manager.acquire_certificate(&domain).await {
                     Ok(_) => {
+                        CERT_STATUS.insert(domain.clone(), "Valid".to_string());
                         println!("Successfully acquired certificate for {}", domain);
                         break; // Go back to outer loop to check expiration and sleep
                     }
@@ -878,7 +948,7 @@ impl Server {
                         if backoff_time < 12*60*60 { // 15m, 1h, 4h, 16h
                             backoff_time *= 4;
                         }
-                        
+                        CERT_STATUS.insert(domain.clone(), format!("Error (retry {}m)", sleep_time.as_secs() / 60));
                         eprintln!("Failed to acquire certificate for {}: {} (retrying in {}s)", domain, e, sleep_time.as_secs());
                         tokio::time::sleep(sleep_time).await;
                     }

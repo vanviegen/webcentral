@@ -163,8 +163,10 @@ impl IniMap {
 // Build ProjectConfig directly from IniMap
 fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
     // Determine project type by checking for type-specific keys
-    // Priority: redirect > proxy > forward (socket/port) > application > static
-    let project_type = if let Some(target) = ini_map.fetch("redirect") {
+    // Priority: type=dashboard > redirect > proxy > forward (socket/port) > application > static
+    let project_type = if ini_map.fetch("type").as_deref() == Some("dashboard") {
+        ProjectType::Dashboard
+    } else if let Some(target) = ini_map.fetch("redirect") {
         ProjectType::Redirect { target: target.trim_end_matches('/').to_string() }
     } else if let Some(target) = ini_map.fetch("proxy") {
         ProjectType::Proxy { target }
@@ -309,6 +311,8 @@ pub enum ProjectType {
     // Forward to local port or unix socket
     UnixForward { socket_path: String },
     TcpForward { address: String },
+    // Dashboard showing server status
+    Dashboard,
 }
 
 #[derive(Debug, Clone)]

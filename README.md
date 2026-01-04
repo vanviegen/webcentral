@@ -391,6 +391,9 @@ Make sure no other services are using ports 80 or 443.
 
 ## Changelog
 
+2026-01-04 (2.3.0):
+ - Add dashboard project type (`type=dashboard`) showing server status, domain list, request counts, TLS certificate status, and uptime
+
 2026-01-04 (2.2.3):
  - Log which file triggered reload on file change
 
