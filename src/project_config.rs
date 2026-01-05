@@ -224,6 +224,9 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
     let mut exclude = ini_map.fetch_array("reload.exclude");
     exclude.extend(DEFAULT_EXCLUDES.iter().map(|s| s.to_string()));
 
+    // Parse [auth] section - users are specified as auth.<username> = <password_hash>
+    let auth = ini_map.fetch_prefix("auth");
+
     // Read common configuration
     let mut config = ProjectConfig {
         dir,
@@ -238,6 +241,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
             exclude,
         },
         rewrites: ini_map.fetch_prefix("rewrite"),
+        auth,
         config_errors: ini_map.errors.clone(),
     };
 
@@ -326,6 +330,8 @@ pub struct ProjectConfig {
     pub environment: HashMap<String, String>,
     pub reload: ReloadConfig,
     pub rewrites: HashMap<String, String>,
+    /// Map of username to password hash (argon2) for basic auth
+    pub auth: HashMap<String, String>,
     pub config_errors: Vec<String>,
 }
 
@@ -370,6 +376,7 @@ impl Default for ReloadConfig {
         }
     }
 }
+
 
 impl ProjectConfig {
     pub fn load(dir: &Path) -> Result<Self> {

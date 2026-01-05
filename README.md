@@ -332,6 +332,21 @@ Enable per-project request logging:
 log_requests = true
 ```
 
+### Basic Authentication
+
+Protect your application with basic username/password authentication:
+
+```ini
+[auth]
+alice = $argon2id$v=19$m=19456,t=2,p=1$...
+bob = $argon2id$v=19$m=19456,t=2,p=1$...
+```
+
+- Passwords are stored as secure argon2id hashes (never plain text)
+- Use `webcentral hash mypassword` to generate hashes
+- Sessions support browser restart using HTTP-only cookie
+- Visit `/webcentral/logout` to log out
+
 ---
 
 ## Command-Line Options
@@ -390,6 +405,13 @@ Make sure no other services are using ports 80 or 443.
 ---
 
 ## Changelog
+
+2026-01-05 (2.4.0):
+ - Add basic authentication with argon2 password hashing (`[auth]` section)
+ - Persistent sessions via HTTP-only subdomain-scoped cookies
+ - Logout endpoint at `/webcentral/logout`
+ - `webcentral hash <password>` subcommand to generate password hashes
+ - Disable 0-RTT resumption as it caused issues in some cases
 
 2026-01-04 (2.3.0):
  - Add dashboard project type (`type=dashboard`) showing server status, domain list, request counts, TLS certificate status, and uptime

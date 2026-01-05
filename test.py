@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import base64
 import glob
 import http.client
 import os
@@ -284,20 +285,26 @@ class TestRunner:
             f"Timeout waiting for '{text}' in {project} logs after {timeout}s."
         )
 
-    def assert_http(self, path, check_body=None, check_code=200, check_header=None, method='GET', data=None, timeout=5, host=None):
+    def assert_http(self, path, check_body=None, check_code=200, check_header=None, method='GET', data=None, timeout=5, host=None, headers=None, return_headers=False):
         """Make HTTP request and assert response. Host defaults to current test domain.
-        check_header: tuple of (header_name, expected_value) to verify a response header."""
+        check_header: tuple of (header_name, expected_value) to verify a response header.
+        headers: dict of additional headers to send with the request.
+        return_headers: if True, returns (body, headers_dict) instead of just body."""
         if host is None:
             host = self.current_test_domain
         print(f"{CLEAR_LINE}{GRAY}→ HTTP {method} {host}{path}{RESET}", end='', flush=True)
 
         conn = http.client.HTTPConnection('localhost', self.port, timeout=timeout)
-        headers = {'Host': host}
+        req_headers = {'Host': host}
+        if headers:
+            req_headers.update(headers)
 
         try:
-            conn.request(method, path, body=data, headers=headers)
+            conn.request(method, path, body=data, headers=req_headers)
             response = conn.getresponse()
             body = response.read().decode('utf-8')
+            # Use case-insensitive dict for headers
+            response_headers = {k.lower(): v for k, v in response.getheaders()}
 
             if check_code is not None and response.status != check_code:
                 raise AssertionError(
@@ -318,6 +325,8 @@ class TestRunner:
                         f"Expected header '{header_name}' to be '{expected_value}', got '{actual_value}'"
                     )
 
+            if return_headers:
+                return body, response_headers
             return body
         finally:
             print(CLEAR_LINE, end='', flush=True)
@@ -2252,6 +2261,77 @@ while True:
         assert time_spread >= 0.3, f"Expected streaming delay of at least 0.3s, got {time_spread:.2f}s - response may be buffered"
     
     print(f"{GRAY}Chunk arrival times: {[f'{ct:.2f}s' for ct in chunk_times]}{RESET}", flush=True)
+
+
+# ============================================================================
+# BASIC AUTH TESTS
+# ============================================================================
+
+def make_basic_auth_header(username, password):
+    """Create a Basic auth header value from username and password."""
+    credentials = f"{username}:{password}"
+    encoded = base64.b64encode(credentials.encode()).decode()
+    return f"Basic {encoded}"
+
+# Generate argon2 hash for 'testpass' using: ./target/debug/webcentral hash testpass
+TEST_PASSWORD_HASH = '$argon2id$v=19$m=19456,t=2,p=1$GuPKg0qepf5z8eL5pfrFYA$yb3Mr85cF0DxK4euCpnSKvKjKXOMpJcLIcMujnxqFj4'
+
+@test
+def test_basic_auth(t):
+    """Basic auth: no config passes through, with config requires credentials"""
+    # Without auth config, requests pass through
+    t.write_file('public/index.html', '<h1>Page</h1>')
+    t.assert_http('/', check_body='Page')
+    
+    # Add auth config
+    t.write_file('webcentral.ini', f'[auth]\ntestuser = {TEST_PASSWORD_HASH}')
+    t.await_log('file change')
+    
+    # Without credentials: 401 with WWW-Authenticate header
+    t.assert_http('/', check_code=401, check_header=('WWW-Authenticate', 'Basic realm="Authentication Required"'))
+    
+    # Wrong password/username: 401
+    t.assert_http('/', check_code=401, headers={'Authorization': make_basic_auth_header('testuser', 'wrong')})
+    t.assert_http('/', check_code=401, headers={'Authorization': make_basic_auth_header('wrong', 'testpass')})
+    
+    # Correct credentials: 200 with Set-Cookie
+    body, headers = t.assert_http('/', check_body='Page', headers={'Authorization': make_basic_auth_header('testuser', 'testpass')}, return_headers=True)
+    set_cookie = headers.get('set-cookie', '')
+    assert 'webcentral_auth=' in set_cookie and 'HttpOnly' in set_cookie, f"Bad Set-Cookie: {set_cookie}"
+    cookie = set_cookie.split(';')[0]
+    
+    # Cookie auth works without basic auth header, and doesn't re-set cookie
+    body, headers = t.assert_http('/', check_body='Page', headers={'Cookie': cookie}, return_headers=True)
+    assert 'set-cookie' not in headers, "Unexpected set-cookie on cookie auth"
+    
+    # Invalid cookie: 401
+    t.assert_http('/', check_code=401, headers={'Cookie': 'webcentral_auth=testuser:invalid'})
+    
+    # Logout: clears cookie and redirects
+    body, headers = t.assert_http('/webcentral/logout', check_code=302, headers={'Cookie': cookie}, return_headers=True)
+    assert headers.get('location') == '/' and 'Max-Age=0' in headers.get('set-cookie', ''), "Bad logout response"
+
+
+@test
+def test_basic_auth_multiple_users(t):
+    """Multiple users can be configured with different passwords"""
+    ANOTHER_HASH = '$argon2id$v=19$m=19456,t=2,p=1$n0qMIBo4Xc3+R5OWcz1u9A$QdmJraypHLGF/TavDRGscYI11gfHhFGgettpS2SU0rk'
+    t.write_file('public/index.html', '<h1>Page</h1>')
+    t.write_file('webcentral.ini', f'[auth]\nalice = {TEST_PASSWORD_HASH}\nbob = {ANOTHER_HASH}')
+    
+    t.assert_http('/', check_body='Page', headers={'Authorization': make_basic_auth_header('alice', 'testpass')})
+    t.assert_http('/', check_body='Page', headers={'Authorization': make_basic_auth_header('bob', 'anotherpass')})
+    t.assert_http('/', check_code=401, headers={'Authorization': make_basic_auth_header('alice', 'anotherpass')})
+
+
+@test
+def test_basic_auth_with_application(t):
+    """Basic auth works with application projects"""
+    t.write_file('webcentral.ini', f'command = python3 -u -m http.server $PORT\n[auth]\nuser = {TEST_PASSWORD_HASH}')
+    t.write_file('index.html', '<h1>App</h1>')
+    
+    t.assert_http('/', check_code=401)
+    t.assert_http('/', check_body='App', headers={'Authorization': make_basic_auth_header('user', 'testpass')})
 
 
 if __name__ == '__main__':

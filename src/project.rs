@@ -4,6 +4,8 @@ use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
 use crate::server::SHARED_EXECUTOR;
 use crate::streams::AnyConnector;
 use tower::Service;
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use base64::Engine;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -60,6 +62,13 @@ pub enum StopReason {
     Inactivity,
     ProcessExit,
     Shutdown,  // Server shutdown
+}
+
+/// Result of authentication check
+enum AuthResult {
+    Passed,                     // Auth passed (via cookie)
+    PassedSetCookie(String),    // Auth passed via basic auth, set cookie for username
+    Failed(Response<StreamBody>), // Auth failed, return this response
 }
 
 lazy_static::lazy_static! {
@@ -256,6 +265,14 @@ impl Project {
                 let _ = self.logger.write("request", &format!("{} {}", req.method(), req.uri().path()));
             }
 
+            // Check auth if configured (no cookie setting for upgrades)
+            if !self.config.auth.is_empty() {
+                match self.check_auth(&req) {
+                    AuthResult::Failed(response) => return Ok(response),
+                    _ => {} // Passed or PassedSetCookie - both mean auth ok
+                }
+            }
+
             // Upgrades only work for forward/proxy/application types
             match &self.config.project_type {
                 ProjectType::Application { .. } => {
@@ -289,6 +306,27 @@ impl Project {
             let _ = self.logger.write("request", &format!("{} {}", req.method(), req.uri().path()));
         }
 
+        // Track if we need to set auth cookie on successful response
+        let mut set_auth_cookie: Option<String> = None;
+
+        // Check auth if configured
+        if !self.config.auth.is_empty() {
+            // Handle /webcentral/logout - clear cookie and redirect to /
+            if req.uri().path() == "/webcentral/logout" {
+                return Ok(Response::builder()
+                    .status(302)
+                    .header("Location", "/")
+                    .header("Set-Cookie", "webcentral_auth=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+                    .body(empty_body())?);
+            }
+
+            match self.check_auth(&req) {
+                AuthResult::Failed(response) => return Ok(response),
+                AuthResult::PassedSetCookie(username) => set_auth_cookie = Some(username),
+                AuthResult::Passed => {}
+            }
+        }
+
         // Apply URL rewrites
         let (_path, redirect) = self.apply_rewrites(req.uri().path());
 
@@ -300,15 +338,29 @@ impl Project {
         }
 
         // Determine handler based on configuration
-        match &self.config.project_type {
+        // Clone self upfront since some handlers take ownership
+        let self_clone = self.clone();
+        let mut response = match &self.config.project_type {
             ProjectType::Redirect { target } => self.handle_redirect(&req, target).await,
-            ProjectType::Proxy { target } => self.clone().proxy_request(req, target).await,
+            ProjectType::Proxy { target } => self_clone.proxy_request(req, target).await,
             ProjectType::TcpForward { .. } => self.forward_request(req).await,
             ProjectType::UnixForward { .. } => self.forward_request(req).await,
-            ProjectType::Application { .. } => self.handle_application(req).await,
+            ProjectType::Application { .. } => self_clone.handle_application(req).await,
             ProjectType::Static => self.handle_static(&req).await,
             ProjectType::Dashboard => self.handle_dashboard(&req).await,
+        }?;
+
+        // Add auth cookie if authentication just succeeded via basic auth
+        if let Some(username) = set_auth_cookie {
+            let password_hash = self.config.auth.get(&username).unwrap();
+            let cookie = format!("webcentral_auth={}:{}; Path=/; HttpOnly; SameSite=Strict; Max-Age=315360000", username, password_hash);
+            response.headers_mut().insert(
+                http::header::SET_COOKIE,
+                HeaderValue::from_str(&cookie).unwrap()
+            );
         }
+
+        Ok(response)
     }
 
     fn apply_rewrites(&self, path: &str) -> (String, String) {
@@ -327,6 +379,78 @@ impl Project {
             }
         }
         (path.to_string(), String::new())
+    }
+
+    /// Check authentication. Returns Some(response) if auth failed/logout, None if auth passed.
+    /// When basic auth succeeds, the returned None indicates the handler should set an auth cookie.
+    fn check_auth<B>(&self, req: &Request<B>) -> AuthResult {
+        // Check for valid auth cookie first
+        if let Some(cookie_header) = req.headers().get(http::header::COOKIE) {
+            if let Ok(cookies) = cookie_header.to_str() {
+                for cookie in cookies.split(';') {
+                    let cookie = cookie.trim();
+                    if let Some(value) = cookie.strip_prefix("webcentral_auth=") {
+                        // Cookie format: username:password_hash
+                        if let Some((username, cookie_hash)) = value.split_once(':') {
+                            if let Some(password_hash) = self.config.auth.get(username) {
+                                if cookie_hash == password_hash {
+                                    return AuthResult::Passed;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // No valid cookie, check for basic auth header
+        let Some(auth_header) = req.headers().get(http::header::AUTHORIZATION) else {
+            return AuthResult::Failed(self.auth_required_response());
+        };
+        let Some(auth_str) = auth_header.to_str().ok() else {
+            return AuthResult::Failed(self.auth_required_response());
+        };
+        
+        if !auth_str.starts_with("Basic ") {
+            return AuthResult::Failed(self.auth_required_response());
+        }
+        
+        let encoded = &auth_str[6..];
+        let Some(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded).ok() else {
+            return AuthResult::Failed(self.auth_required_response());
+        };
+        let Some(credentials) = String::from_utf8(decoded).ok() else {
+            return AuthResult::Failed(self.auth_required_response());
+        };
+        
+        let Some((username, password)) = credentials.split_once(':') else {
+            return AuthResult::Failed(self.auth_required_response());
+        };
+        
+        // Look up password hash for username
+        let Some(password_hash) = self.config.auth.get(username) else {
+            return AuthResult::Failed(self.auth_required_response());
+        };
+        
+        // Verify password using argon2
+        let Ok(parsed_hash) = PasswordHash::new(password_hash) else {
+            return AuthResult::Failed(self.auth_required_response());
+        };
+        if Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok() {
+            // Auth passed via basic auth - signal that cookie should be set
+            AuthResult::PassedSetCookie(username.to_string())
+        } else {
+            AuthResult::Failed(self.auth_required_response())
+        }
+    }
+
+    /// Generate a 401 Unauthorized response with WWW-Authenticate header
+    fn auth_required_response(&self) -> Response<StreamBody> {
+        Response::builder()
+            .status(401)
+            .header("WWW-Authenticate", "Basic realm=\"Authentication Required\"")
+            .body(body_from("Unauthorized"))
+            .unwrap()
     }
 
     async fn handle_redirect<B>(&self, req: &Request<B>, target: &str) -> Result<Response<StreamBody>> {

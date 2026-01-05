@@ -6,13 +6,31 @@ mod server;
 mod streams;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use tokio::signal;
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "webcentral")]
 #[command(about = "A reverse proxy that runs multiple web applications on a single server")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+
+    #[command(flatten)]
+    pub config: GlobalConfig,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum Commands {
+    /// Generate an argon2 password hash for use in [auth] config
+    Hash {
+        /// Password to hash
+        password: String,
+    },
+}
+
+#[derive(Debug, Clone, Parser)]
 pub struct GlobalConfig {
     #[arg(long, help = "Email for LetsEncrypt certificate registration")]
     pub email: Option<String>,
@@ -98,7 +116,30 @@ async fn main() -> Result<()> {
     #[cfg(feature = "console")]
     console_subscriber::init();
 
-    let config = GlobalConfig::parse();
+    let cli = Cli::parse();
+
+    // Handle subcommands
+    if let Some(command) = cli.command {
+        match command {
+            Commands::Hash { password } => {
+                use argon2::{Argon2, PasswordHasher};
+                use argon2::password_hash::SaltString;
+                
+                // Generate random salt bytes and encode as SaltString
+                let mut salt_bytes = [0u8; 16];
+                rand::fill(&mut salt_bytes);
+                let salt = SaltString::encode_b64(&salt_bytes)
+                    .expect("Failed to encode salt");
+                let argon2 = Argon2::default();
+                let hash = argon2.hash_password(password.as_bytes(), &salt)
+                    .expect("Failed to hash password");
+                println!("{}", hash);
+                return Ok(());
+            }
+        }
+    }
+
+    let config = cli.config;
 
     if config.https > 0 && config.email.is_none() {
         anyhow::bail!("--email is required when HTTPS is enabled");

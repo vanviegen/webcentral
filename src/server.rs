@@ -398,8 +398,9 @@ impl Server {
         
         // ALPN protocols for HTTP/2 and HTTP/1.1 negotiation
         tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        // Enable TLS 1.3 0-RTT early data for faster resumption (stateless tickets, no memory growth)
-        tls_config.max_early_data_size = 16384;
+        // Disable session tickets and early data - they become invalid after server restart,
+        // causing browsers to send encrypted data the server can't decrypt (appears as corrupt TLS).
+        tls_config.send_tls13_tickets = 0;
 
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
@@ -453,7 +454,8 @@ impl Server {
                 cert_manager: cert_manager.clone(),
             }));
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
-        tls_config.max_early_data_size = u32::MAX;
+        // Disable session tickets and early data for QUIC - they become invalid after server restart.
+        tls_config.send_tls13_tickets = 0;
 
         let quic_config = QuicServerConfig::try_from(tls_config)
             .map_err(|e| anyhow::anyhow!("Failed to create QUIC server config: {}", e))?;
@@ -487,12 +489,7 @@ impl Server {
         self: Arc<Self>,
         incoming: h3_quinn::quinn::Incoming,
     ) -> Result<()> {
-        // Use into_0rtt() to accept 0-RTT early data for faster resumption
-        let connecting = incoming.accept()?;
-        let conn = match connecting.into_0rtt() {
-            Ok((conn, _zero_rtt_accepted)) => conn,
-            Err(connecting) => connecting.await?,
-        };
+        let conn = incoming.accept()?.await?;
         let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn)).await?;
 
         loop {
