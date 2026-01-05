@@ -406,6 +406,9 @@ Make sure no other services are using ports 80 or 443.
 
 ## Changelog
 
+2026-01-05 (2.4.1):
+ - Dashboard shows port number for running apps
+
 2026-01-05 (2.4.0):
  - Add basic authentication with argon2 password hashing (`[auth]` section)
  - Persistent sessions via HTTP-only subdomain-scoped cookies

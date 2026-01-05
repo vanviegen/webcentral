@@ -131,6 +131,7 @@ Non-Application types (Static, Proxy, Forward, Redirect) don't have a lifecycle_
 - Add code comments only for explaining non-obvious logic, why things are done a certain way, and how thread-safety is ensured. Don't add comments describing what you're changing and why, as comments should reflect the final code, not the change history.
 - When you notice unexpected behavior or a bug at any time, create an issue on your todo-list for later investigation. Never let bugs go uninvestigated nor work around them.
 - When trying to debug problems, do not fiddle around with ad-hoc shell commands too much. The user needs to approve all of these. Instead, extend `test.py` to clearly demonstrate the problem, and if needed add (temporary, with a `TODO: remove` comment) logging to the code (but prefer to just improve error logging).
+- When creating a release increment the version number in `Cargo.toml` (for x.y.z implement y for major new features and z for minor new features, improvements and bugfixes) and add a changelog entry within README.md. When the user prompts for a commit or a release, do a git commit matching the message style from recent commits.
 
 ## AI guidance
 

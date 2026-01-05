@@ -1351,11 +1351,19 @@ tr:hover {{ background: #f5f5f5; }}
         match &self.config.project_type {
             ProjectType::Application { .. } => {
                 match *self.state_rx.borrow() {
-                    AppState::Stopped => "Stopped",
-                    AppState::Starting => "Starting",
-                    AppState::Running => "Running",
-                    AppState::Failed => "Failed",
-                }.to_string()
+                    AppState::Stopped => "Stopped".to_string(),
+                    AppState::Starting => "Starting".to_string(),
+                    AppState::Running => {
+                        // Try to get port from app_connection without blocking
+                        if let Ok(conn) = self.app_connection.try_lock() {
+                            if let Some(c) = conn.as_ref() {
+                                return format!("Running (port {})", c.port);
+                            }
+                        }
+                        "Running".to_string()
+                    }
+                    AppState::Failed => "Failed".to_string(),
+                }
             }
             _ => "Active".to_string()
         }
