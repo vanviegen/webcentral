@@ -33,20 +33,41 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 ## Quick Start
 
-```sh
-# Install dependencies
-sudo apt install git firejail docker.io rustc
+### Option 1: Download Pre-built Binary (Recommended)
 
-# Build (includes HTTP/3 support by default)
+```sh
+# Download and install latest release (statically linked, works on any Linux)
+curl -LsSf https://github.com/vanviegen/webcentral/releases/latest/download/webcentral-$(uname -m)-unknown-linux-musl.tar.xz | sudo tar xJf - -C /usr/local/bin
+
+# Install optional dependencies for sandboxing
+sudo apt install firejail docker.io  # Debian/Ubuntu
+# OR
+sudo dnf install firejail docker     # Fedora/RHEL
+
+# Run
+sudo webcentral --email you@example.com
+```
+
+### Option 2: Build from Source
+
+```sh
+# Install Rust toolchain (https://rustup.rs)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+
+# Install musl target and build tools
+sudo apt install musl-tools  # Debian/Ubuntu
+# OR
+sudo dnf install musl-gcc    # Fedora/RHEL
+
+rustup target add x86_64-unknown-linux-musl
+
+# Build
 git clone https://github.com/vanviegen/webcentral.git
 cd webcentral
 cargo build --release
 
-# Build without HTTP/3 (smaller binary, fewer dependencies)
-cargo build --release --no-default-features
-
-# Run
-sudo ./target/release/webcentral --email you@example.com
+# Binary is at target/release/webcentral (statically linked)
 ```
 
 The `email` flag is mandatory, as it's needed for Let’s Encrypt. Alternatively you can disable HTTPS (` ./target/release/webcentral -https 0`). See `./target/release/webcentral --help` for more options.
@@ -405,6 +426,10 @@ Make sure no other services are using ports 80 or 443.
 ---
 
 ## Changelog
+
+2026-01-06 (2.4.3):
+ - Default to static musl builds for universal Linux compatibility
+ - Updated README with pre-built binary installation instructions
 
 2026-01-06 (2.4.2):
  - Log directories and files now created with correct ownership (matching project user)
