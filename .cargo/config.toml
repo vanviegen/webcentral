@@ -1,3 +1,4 @@
 [build]
 rustflags = ["--cfg", "tokio_unstable"]
-target = "x86_64-unknown-linux-musl"
+# Builds to target/{debug,release}/ by default
+# For static musl builds: cargo build --target x86_64-unknown-linux-musl

@@ -43,8 +43,10 @@ sudo apt install firejail docker.io  # Debian/Ubuntu
 # Or
 sudo dnf install firejail docker     # Fedora/RHEL
 
-# Run
+# Run it (replace email)
 sudo webcentral --email you@example.com
+# Or set it up as a persistent systemd service and run (recommended)
+sudo webcentral --email you@example.com --systemd 
 ```
 
 The `email` flag is mandatory, as it's needed for Let's Encrypt. Alternatively you can disable HTTPS (`webcentral --https 0`). See `webcentral --help` for more options.
@@ -371,60 +373,41 @@ Application output is written to `_webcentral_data/log/<DATE>.log` in each proje
 
 ---
 
-## Running with systemd
-
-Create `/etc/systemd/system/webcentral.service`:
-
-```ini
-[Service]
-ExecStart=/usr/local/bin/webcentral --email YOUR-EMAIL-ADDRESS
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Start the service:
-
-```sh
-sudo systemctl daemon-reload
-sudo systemctl start webcentral
-sudo systemctl enable webcentral  # Start on boot
-```
-
-Check status:
-
-```sh
-sudo systemctl status webcentral -n 20
-```
-
-Make sure no other services are using ports 80 or 443.
-
----
-
 ## Building from Source
 
-For development or if pre-built binaries aren't available for your platform:
+For development or if pre-built binaries aren't available for your platform, assuming you have Rust and Cargo installed:
 
 ```sh
-# Install Rust toolchain
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-
-# Install musl target and build tools
-sudo apt install musl-tools  # Debian/Ubuntu
-# OR
-sudo dnf install musl-gcc    # Fedora/RHEL
-
-rustup target add x86_64-unknown-linux-musl
-
 # Clone and build
 git clone https://github.com/vanviegen/webcentral.git
 cd webcentral
-cargo build # optional: --release
+cargo build  # or: cargo build --release
 
-# Binary is at target/*/debug/webcentral
+# Binary is at target/debug/webcentral or target/release/webcentral
 ```
+
+### Static Builds
+
+For creating portable binaries that work across different Linux distributions (no glibc version dependencies), use musl:
+
+```sh
+# Install musl target and build tools
+sudo apt install rustup musl-tools  # Debian/Ubuntu
+# OR
+sudo dnf install rustup musl-gcc    # Fedora/RHEL
+
+rustup-init
+rustup target add x86_64-unknown-linux-musl
+
+# Build static binary
+cargo build --release --target x86_64-unknown-linux-musl
+
+# Binary is at target/x86_64-unknown-linux-musl/release/webcentral
+```
+
+Static musl builds have no runtime dependencies and can be copied to any Linux system regardless of installed libraries. The official release binaries use this approach.
+
+### Development Options
 
 For development with async debugging, use `cargo build --features console` and connect with `tokio-console`.
 
@@ -433,6 +416,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 ---
 
 ## Changelog
+
+2026-01-06 (2.4.4):
+ - Add `--systemd` flag to create and enable systemd service automatically
+ - Changed default build target from musl to native for faster development builds
 
 2026-01-06 (2.4.3):
  - Default to static musl builds for universal Linux compatibility
