@@ -1,11 +1,13 @@
 use crate::acme::CertManager;
 use crate::project::{self, Project, StreamBody, empty_body, body_from};
 use anyhow::Result;
+#[cfg(feature = "http3")]
 use bytes::Bytes;
 use dashmap::DashMap;
 
 #[cfg(feature = "http3")]
 use h3_quinn::quinn::crypto::rustls::QuicServerConfig;
+#[cfg(feature = "http3")]
 use http_body_util::BodyExt;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};

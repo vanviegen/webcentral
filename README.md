@@ -34,28 +34,26 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 ## Quick Start
 
 ```sh
-# Install dependencies
-sudo apt install git firejail docker.io rustc
+# Download and install latest statically linked release
+curl -LsSf https://github.com/vanviegen/webcentral/releases/latest/download/webcentral-$(uname -m)-unknown-linux-musl.tar.xz | sudo tar xJf - -C /usr/local/bin --strip-components=1 '*/webcentral'
+# Or build from source (see below)
 
-# Build (includes HTTP/3 support by default)
-git clone https://github.com/vanviegen/webcentral.git
-cd webcentral
-cargo build --release
-
-# Build without HTTP/3 (smaller binary, fewer dependencies)
-cargo build --release --no-default-features
+# Install optional dependencies for sandboxing
+sudo apt install firejail docker.io  # Debian/Ubuntu
+# Or
+sudo dnf install firejail docker     # Fedora/RHEL
 
 # Run
-sudo ./target/release/webcentral --email you@example.com
+sudo webcentral --email you@example.com
 ```
 
-The `email` flag is mandatory, as it's needed for Let’s Encrypt. Alternatively you can disable HTTPS (` ./target/release/webcentral -https 0`). See `./target/release/webcentral --help` for more options.
+The `email` flag is mandatory, as it's needed for Let's Encrypt. Alternatively you can disable HTTPS (`webcentral --https 0`). See `webcentral --help` for more options.
 
 Create a directory at `~/webcentral-projects/someapp.yourdomain.com/` with either:
 - A `Procfile` for Heroku-style applications
-- A `package.json` for Node.js apps
+- A `package.json` for Node.js apps (`npm run` should start a webserver on `$PORT`)
 - A `public/` folder for static files
-- A `webcentral.ini` for custom configuration
+- A `webcentral.ini` for custom configuration (see below)
 
 Point DNS for `someapp.yourdomain.com` at your server. Up and running!
 
@@ -80,15 +78,15 @@ Point DNS for `someapp.yourdomain.com` at your server. Up and running!
 
 **Dokku/Coolify** are self-hosted PaaS platforms with git-push deployment, but require more setup and resources. They're better suited for team environments with CI/CD pipelines.
 
-**Webcentral** fills the gap for developers who want to quickly host multiple small apps/sites on a single VPS without container orchestration overhead. Just drop files in a folder and go.
+**Webcentral** fills the gap for developers who want to quickly host multiple small apps/sites on a single server/VPS without container orchestration overhead. Just drop files in a folder and go. It allows multiple (non-privileged) users to share a single server. Unused apps don't consume resources.
 
 ---
 
 ## Non-root vs root usage
 
-When run as a regular user, by default Webcentral searches `~/webcentral-projects/` for project directories. When run as root, it searches all users' `webcentral-projects` directories by default and runs each project with its owner's permissions. This allows multiple users to share the precious ports 80 and 443, without having to give them privileged access to the server.
+When run as a regular user, by default Webcentral searches `~/webcentral-projects/` for project directories. When run as root, it searches all `/home/*/webcentral-projects/` directories by default and runs each project with its owner's permissions. This allows multiple users to share the precious ports 80 and 443, without having to give them privileged access to the server.
 
-If you want to run WebCentral as a regular user while still being able to bind to privileged ports, run `sudo setcap 'cap_net_bind_service=+ep' ./target/release/webcentral` once.
+If you want to run WebCentral as a regular user while still being able to bind to privileged ports, run `sudo setcap 'cap_net_bind_service=+ep' $(which webcentral)` once.
 
 ---
 
@@ -404,7 +402,41 @@ Make sure no other services are using ports 80 or 443.
 
 ---
 
+## Building from Source
+
+For development or if pre-built binaries aren't available for your platform:
+
+```sh
+# Install Rust toolchain
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+
+# Install musl target and build tools
+sudo apt install musl-tools  # Debian/Ubuntu
+# OR
+sudo dnf install musl-gcc    # Fedora/RHEL
+
+rustup target add x86_64-unknown-linux-musl
+
+# Clone and build
+git clone https://github.com/vanviegen/webcentral.git
+cd webcentral
+cargo build # optional: --release
+
+# Binary is at target/*/debug/webcentral
+```
+
+For development with async debugging, use `cargo build --features console` and connect with `tokio-console`.
+
+To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no-default-features`.
+
+---
+
 ## Changelog
+
+2026-01-06 (2.4.3):
+ - Default to static musl builds for universal Linux compatibility
+ - Updated README with pre-built binary installation instructions
 
 2026-01-06 (2.4.2):
  - Log directories and files now created with correct ownership (matching project user)

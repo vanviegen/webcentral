@@ -79,7 +79,7 @@ class TestRunner:
         stdout_f = open(stdout_log, 'w')
         stderr_f = open(stderr_log, 'w')
 
-        cmd = ['target/debug/webcentral',
+        cmd = ['./webcentral',
                '--projects', self.tmpdir,
                '--http', str(self.port),
                '--https', '0',

@@ -125,13 +125,13 @@ Non-Application types (Static, Proxy, Forward, Redirect) don't have a lifecycle_
 ## Developers notes
 
 - Keep AGENTS.md up-to-date when making architectural changes. Be succinct—no repetition, no code examples, bullet points over paragraphs.
-- Build and test using `cargo build && ./test.py --firejail false` (or `--firejail true` if Firejail is installed).
+- Build and test using `cargo build && ./test.py --firejail false` (or `--firejail true` if Firejail is installed). Builds default to musl target for static linking (configured in `.cargo/config.toml`).
 - For async task debugging, build with `cargo build --features console` and connect via `~/.cargo/bin/tokio-console` (install with `cargo install tokio-console`).
 - Run `./test.py` to execute the test suite. To run a single test: `./test.py test_name_of_test`. For new features, add tests in `test.py`. Don't create ad-hoc test scripts. When writing tests, you should not need to sleep (except in test-apps being run by webcentral to simulate loading times) - use `await_log` and/or `assert_http` instead. If a test fails, don't just work around it in the test code, but investigate deeply if there may be an actual bug (or unexpected behavior) in webcentral.
 - Add code comments only for explaining non-obvious logic, why things are done a certain way, and how thread-safety is ensured. Don't add comments describing what you're changing and why, as comments should reflect the final code, not the change history.
 - When you notice unexpected behavior or a bug at any time, create an issue on your todo-list for later investigation. Never let bugs go uninvestigated nor work around them.
 - When trying to debug problems, do not fiddle around with ad-hoc shell commands too much. The user needs to approve all of these. Instead, extend `test.py` to clearly demonstrate the problem, and if needed add (temporary, with a `TODO: remove` comment) logging to the code (but prefer to just improve error logging).
-- When creating a release increment the version number in `Cargo.toml` (for x.y.z implement y for major new features and z for minor new features, improvements and bugfixes) and add a changelog entry within README.md. When the user prompts for a commit or a release, do a git commit matching the message style from recent commits.
+- **Releases:** Increment version in `Cargo.toml` (x.y.z: x for rewrites, y for major features, z for minor/bugfixes) and add changelog entry in README.md. Create release by pushing git tag: `git tag v2.4.3 && git push origin v2.4.3`. GitHub Actions (`.github/workflows/release.yml` via cargo-dist) builds static binaries (musl x86_64, aarch64 gnu, x86_64 gnu) and creates GitHub Release with artifacts and installer script. Regular commits to main don't trigger releases.
 
 ## AI guidance
 
