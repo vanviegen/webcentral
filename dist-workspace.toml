@@ -10,8 +10,9 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
-# Using musl for static builds that work on any Linux distribution
-targets = ["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]
+# Using musl for Linux static builds that work on any Linux distribution
+# macOS builds for local development/testing
+targets = ["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl", "armv7-unknown-linux-musleabihf", "aarch64-apple-darwin", "x86_64-apple-darwin"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program
