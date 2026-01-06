@@ -16,9 +16,31 @@ pub struct Logger {
     pub prune_days: i64,
 }
 
+fn create_dir_all_owned(path: &std::path::Path, uid: u32, gid: u32) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        create_dir_all_owned(parent, uid, gid)?;
+    }
+
+    match fs::create_dir(path) {
+        Ok(_) => {
+            if nix::unistd::geteuid().is_root() && (uid > 0 || gid > 0) {
+                use nix::unistd::{chown, Uid, Gid};
+                let _ = chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl Logger {
     pub fn new(dir: PathBuf, uid: u32, gid: u32, prune_days: i64) -> Result<Self> {
-        fs::create_dir_all(&dir)?;
+        create_dir_all_owned(&dir, uid, gid)?;
 
         Ok(Logger {
             dir,
@@ -86,14 +108,9 @@ impl Logger {
             .open(&log_path)?;
 
         // Set ownership if running as root
-        #[cfg(target_os = "linux")]
-        {
-            if nix::unistd::geteuid().is_root() && (self.uid > 0 || self.gid > 0) {
-                unsafe {
-                    let path_cstr = std::ffi::CString::new(log_path.to_str().unwrap()).unwrap();
-                    let _ = libc::chown(path_cstr.as_ptr(), self.uid, self.gid);
-                }
-            }
+        if nix::unistd::geteuid().is_root() && (self.uid > 0 || self.gid > 0) {
+            use nix::unistd::{chown, Uid, Gid};
+            let _ = chown(&log_path, Some(Uid::from_raw(self.uid)), Some(Gid::from_raw(self.gid)));
         }
 
         *file = Some(new_file);

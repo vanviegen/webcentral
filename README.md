@@ -406,6 +406,9 @@ Make sure no other services are using ports 80 or 443.
 
 ## Changelog
 
+2026-01-06 (2.4.2):
+ - Log directories and files now created with correct ownership (matching project user)
+
 2026-01-05 (2.4.1):
  - Dashboard shows port number for running apps
 
