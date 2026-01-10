@@ -417,6 +417,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-01-10 (2.4.6):
+ - WebSocket connections now prevent inactivity shutdown
+ - Dashboard Idle column now shows number of active WebSockets
+
 2026-01-06 (2.4.5):
  - Simplified release builds to musl-only static binaries
 

@@ -2334,6 +2334,76 @@ def test_basic_auth_with_application(t):
     t.assert_http('/', check_body='App', headers={'Authorization': make_basic_auth_header('user', 'testpass')})
 
 
+@test
+def test_websocket_inactivity(t):
+    """WebSocket connection prevents inactivity timeout"""
+    import wstool
+    import shutil
+    import os
+    import time
+
+    # Copy wstool.py to project dir
+    project_dir = os.path.join(t.tmpdir, t.current_test_domain)
+    os.makedirs(project_dir, exist_ok=True)
+    wstool_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wstool.py')
+    shutil.copy(wstool_src, os.path.join(project_dir, 'wstool.py'))
+
+    # Start wstool server in echo mode with short inactivity timeout
+    t.write_file('webcentral.ini', 'command = python3 -u wstool.py server $PORT\n[reload]\ntimeout = 2')
+    
+    # Wait for webcentral to pick up the files (directory watcher might be slow)
+    time.sleep(0.5)
+
+    # Establish WebSocket
+    client = wstool.WebSocketClient(
+        f'ws://{t.current_test_domain}/',
+        connect_host='localhost',
+        connect_port=t.port,
+        host_header=t.current_test_domain
+    )
+    
+    # Try multiple times if it fails initially due to race
+    for i in range(5):
+        try:
+            client.connect()
+            break
+        except Exception as e:
+            if i == 4: raise e
+            time.sleep(0.5)
+    
+    t.await_log('Ready on port')
+    
+    # Send a message to confirm it's working
+    client.send('ping')
+    assert client.recv().decode('utf-8') == 'ping'
+
+    # Create a dashboard project to verify it shows active websocket
+    # Using a different domain for the dashboard
+    dashboard_domain = 'dashboard-view.test'
+    t.write_file('webcentral.ini', 'type=dashboard', domain=dashboard_domain)
+    # Wait for webcentral to pick up the new domain
+    time.sleep(0.5)
+
+    # Verify dashboard shows active websocket
+    t.assert_http('/', host=dashboard_domain, check_body='1 websocket')
+
+    print("Waiting for inactivity timeout (3 seconds)...")
+    time.sleep(3)
+    
+    # Send another message - should still work if websocket kept it alive
+    try:
+        client.send('pong')
+        assert client.recv().decode('utf-8') == 'pong'
+    except Exception as e:
+        # Check if it stopped
+        log = t.get_log_content(t.current_test_domain)
+        if "Stopping due to inactivity" in log:
+            raise AssertionError("Project stopped due to inactivity while WebSocket was active")
+        raise e
+
+    client.close()
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run webcentral tests')
     parser.add_argument('--firejail', type=str, choices=['true', 'false'], default='true',

@@ -106,7 +106,8 @@ pub struct Project {
     state_tx: watch::Sender<AppState>,
     state_rx: watch::Receiver<AppState>,
     stop_tx: mpsc::Sender<StopReason>,  // Send to request stop
-    pending_requests: AtomicU64,        // Requests currently being handled
+    pending_requests: AtomicU64,        // Requests currently being handled (for startup trigger)
+    active_upgrades: AtomicU64,         // Active WebSocket/upgraded connections
     total_requests: AtomicU64,          // Total requests served
     last_activity: Mutex<Instant>,
     watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -188,6 +189,7 @@ impl Project {
             state_rx,
             stop_tx,
             pending_requests: 0.into(),
+            active_upgrades: 0.into(),
             total_requests: 0.into(),
             last_activity: Mutex::new(Instant::now()),
             watcher_task: Mutex::new(None),
@@ -277,13 +279,13 @@ impl Project {
             match &self.config.project_type {
                 ProjectType::Application { .. } => {
                     self.wait_for_app_ready().await?;
-                    let result = self.proxy_upgrade(req).await;
+                    let result = self.clone().proxy_upgrade(req).await;
                     self.untrack_request();
                     return result;
                 }
                 ProjectType::Proxy { .. } | ProjectType::TcpForward { .. } | 
                 ProjectType::UnixForward { .. } => {
-                    return self.proxy_upgrade(req).await;
+                    return self.clone().proxy_upgrade(req).await;
                 }
                 _ => {} // Fall through to normal handling
             }
@@ -560,11 +562,15 @@ tr:hover {{ background: #f5f5f5; }}
                 "Active" => "status-active",
                 _ => "",
             };
-            let idle_str = d.idle_seconds.map(|s| {
-                if s < 60 { format!("{}s", s) }
-                else if s < 3600 { format!("{}m", s / 60) }
-                else { format!("{}h", s / 3600) }
-            }).unwrap_or_else(|| "-".to_string());
+            let idle_str = if d.active_upgrades > 0 {
+                format!("{} websocket{}", d.active_upgrades, if d.active_upgrades == 1 { "" } else { "s" })
+            } else {
+                d.idle_seconds.map(|s| {
+                    if s < 60 { format!("{}s", s) }
+                    else if s < 3600 { format!("{}m", s / 60) }
+                    else { format!("{}h", s / 3600) }
+                }).unwrap_or_else(|| "-".to_string())
+            };
             
             let (cert_class, cert_str) = match d.cert_status.as_deref() {
                 Some(s) if s.starts_with("Valid") => ("cert-valid", s),
@@ -1115,14 +1121,17 @@ tr:hover {{ background: #f5f5f5; }}
                     if let Some(timeout) = timeout_duration {
                         let last = *self.last_activity.lock().await;
                         if last.elapsed() >= timeout {
-                            self.logger.write("supervisor", "Stopping due to inactivity");
-                            // Immediately transition to Stopped so new requests wait for restart
-                            let _ = self.state_tx.send(AppState::Stopped);
-                            self.kill_processes_by_ref(&mut children).await;
-                            return StopReason::Inactivity;
+                            // Only stop if no active upgraded connections (WebSockets)
+                            if self.active_upgrades.load(Ordering::SeqCst) == 0 {
+                                self.logger.write("supervisor", "Stopping due to inactivity");
+                                // Immediately transition to Stopped so new requests wait for restart
+                                let _ = self.state_tx.send(AppState::Stopped);
+                                self.kill_processes_by_ref(&mut children).await;
+                                return StopReason::Inactivity;
+                            }
                         }
                     }
-                    // Activity happened, loop again
+                    // Activity happened or active upgrades exist, loop again
                 }
             }
         }
@@ -1379,19 +1388,28 @@ tr:hover {{ background: #f5f5f5; }}
         self.total_requests.load(Ordering::Relaxed)
     }
 
+    /// Get active upgraded (WebSocket) connections
+    pub fn get_active_upgrades(&self) -> u64 {
+        self.active_upgrades.load(Ordering::Relaxed)
+    }
+
     /// Get seconds since last activity (returns None if lock unavailable)
     pub fn get_idle_seconds(&self) -> Option<u64> {
         self.last_activity.try_lock().ok().map(|guard| guard.elapsed().as_secs())
     }
 
     async fn proxy_upgrade(
-        &self,
+        self: Arc<Self>,
         req: Request<Incoming>,
     ) -> Result<Response<StreamBody>> {
         let method = req.method().clone();
         let uri = req.uri().clone();
         let headers = req.headers().clone();
         let logger = self.logger.clone();
+        
+        // Track this as an active upgrade to prevent inactivity timeout
+        self.active_upgrades.fetch_add(1, Ordering::SeqCst);
+        let project = self.clone();
 
         // Get the upgrade future before we return a response
         let upgrade_fut = hyper::upgrade::on(req);
@@ -1490,7 +1508,7 @@ tr:hover {{ background: #f5f5f5; }}
 
         // Spawn task to pipe data bidirectionally after upgrade completes
         tokio::task::spawn(async move {
-            match upgrade_fut.await {
+            let result = match upgrade_fut.await {
                 Ok(upgraded) => {
                     let mut upgraded = TokioIo::new(upgraded);
 
@@ -1506,12 +1524,24 @@ tr:hover {{ background: #f5f5f5; }}
                     }
 
                     // Pipe data bidirectionally
-                    let _ = tokio::io::copy_bidirectional(&mut upgraded, &mut backend).await;
+                    tokio::io::copy_bidirectional(&mut upgraded, &mut backend).await.map(|_| ())
                 }
                 Err(e) => {
                     logger.write("error", &format!("Client upgrade failed: {}", e));
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+                }
+            };
+
+            if let Err(e) = result {
+                if e.kind() != std::io::ErrorKind::NotConnected && e.kind() != std::io::ErrorKind::ConnectionReset {
+                    logger.write("error", &format!("WebSocket error: {}", e));
                 }
             }
+
+            // Connection closed, update activity and decrement upgrade count
+            *project.last_activity.lock().await = Instant::now();
+            project.active_upgrades.fetch_sub(1, Ordering::SeqCst);
+            project.state_changed.notify_one();
         });
 
         Ok(response_builder.body(empty_body())?)

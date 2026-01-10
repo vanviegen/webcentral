@@ -56,6 +56,7 @@ Non-Application types (Static, Proxy, Forward, Redirect) don't have a lifecycle_
 - `watch::channel<AppState>` - State broadcasting, requests wait via `wait_for()`
 - `mpsc::channel<StopReason>` - Stop signals (FileChange, Inactivity, ProcessExit, Shutdown)
 - `AtomicUsize` pending_requests - Tracks in-flight requests, triggers startup
+- `AtomicUsize` active_upgrades - Tracks active WebSocket/upgraded connections. Inactivity timeout only triggers when count is 0.
 - `Notify` state_changed - Wakes lifecycle_task when pending_requests changes
 - `Mutex<Option<AppConnection>>` - Dynamic port/client per restart cycle
 - `Mutex<Instant>` last_activity - Tracks for inactivity timeout
