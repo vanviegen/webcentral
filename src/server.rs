@@ -562,7 +562,7 @@ impl Server {
         // Handle request with streaming body - HTTP/3 doesn't support upgrades
         let logger = project.logger.clone();
         let domain = project.domain.clone();
-        let response = project.handle_inner(req).await;
+        let response = project.clone().handle_inner(req).await;
 
         match response {
             Ok(resp) => {
@@ -583,7 +583,8 @@ impl Server {
                     builder = builder.header(name, value);
                 }
                 // HTTP/3 is always over TLS, so add HSTS
-                builder = builder.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+                let hsts = if self.should_redirect_to_https(&project) { "max-age=31536000; includeSubDomains" } else { "max-age=0" };
+                builder = builder.header("Strict-Transport-Security", hsts);
                 send_stream.send_response(builder.body(()).unwrap()).await?;
                 
                 // Stream response body
@@ -613,7 +614,7 @@ impl Server {
                 // HTTP/3 is always over TLS, so add HSTS
                 let resp = http::Response::builder()
                     .status(status)
-                    .header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+                    .header("Strict-Transport-Security", if self.should_redirect_to_https(&project) { "max-age=31536000; includeSubDomains" } else { "max-age=0" })
                     .body(()).unwrap();
                 send_stream.send_response(resp).await?;
                 send_stream.send_data(Bytes::from(status.canonical_reason().unwrap_or("Error"))).await?;
@@ -739,22 +740,15 @@ impl Server {
             }
         } else {
             // HTTP request - check if we should redirect to HTTPS
-            let should_redirect = if let Some(redirect_http) = project.config.redirect_http {
-                // Project config takes precedence
-                redirect_http && self.config.https > 0
-            } else {
-                // Fall back to server config
-                self.config.redirect_http() && self.config.https > 0
-            };
-
-            if should_redirect {
+            
+            if self.should_redirect_to_https(&project) {
                 return Ok(self.make_redirect("https", &project, &req));
             }
         }
 
         // Handle request with project - response body is streamed directly to client
         let logger = project.logger.clone();
-        let result = match project.handle(req).await {
+        let result = match project.clone().handle(req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 let msg = e.to_string();
@@ -770,7 +764,8 @@ impl Server {
         // Add HSTS and Alt-Svc headers for HTTPS responses
         if from_https {
             if let Ok(mut resp) = result {
-                resp.headers_mut().insert("Strict-Transport-Security", "max-age=31536000; includeSubDomains".parse().unwrap());
+                let hsts = if self.should_redirect_to_https(&project) { "max-age=31536000; includeSubDomains" } else { "max-age=0" };
+                resp.headers_mut().insert("Strict-Transport-Security", hsts.parse().unwrap());
                 if self.config.http3 {
                     let alt_svc = format!("h3=\":{}\"; ma=86400", self.config.https);
                     resp.headers_mut().insert("Alt-Svc", alt_svc.parse().unwrap());
@@ -791,6 +786,13 @@ impl Server {
         }
 
         Some(host)
+    }
+
+    fn should_redirect_to_https(&self, project: &Project) -> bool {
+        if self.config.https == 0 {
+            return false;
+        }
+        project.config.redirect_http.unwrap_or_else(|| self.config.redirect_http())
     }
 
     async fn get_project_for_domain(&self, domain: &str) -> Result<Arc<Project>> {
