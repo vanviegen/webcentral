@@ -417,6 +417,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-01-15 (2.4.8):
+ - Add `startup_deadline` config option (default 30s) for application startup timeout
+ - Fix startup timeout blocking forever on hung applications
+
 2026-01-15 (2.4.7):
  - Hardened Firejail sandboxing by using private-etc and more restrictive filesystem rules
  - Fix firejail UID handling when running as root

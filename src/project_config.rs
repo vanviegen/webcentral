@@ -237,6 +237,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
         environment: ini_map.fetch_prefix("environment"),
         reload: ReloadConfig {
             timeout: ini_map.fetch_parse_default("reload.timeout", 300),
+            startup_deadline: ini_map.fetch_parse_default("startup_deadline", 30),
             include,
             exclude,
         },
@@ -363,6 +364,7 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct ReloadConfig {
     pub timeout: i64,
+    pub startup_deadline: u64,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
 }
@@ -371,6 +373,7 @@ impl Default for ReloadConfig {
     fn default() -> Self {
         ReloadConfig {
             timeout: 300,
+            startup_deadline: 30,
             include: Vec::new(),
             exclude: Vec::new(),
         }

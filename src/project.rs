@@ -937,11 +937,45 @@ tr:hover {{ background: #f5f5f5; }}
                         }
                     };
 
-                    // Wait for port to be ready, but also listen for stop signals and process exit
-                    let port_ready = self.wait_for_port_ready(&mut stop_rx, &mut children).await;
-                    
+                    // Wait for port with deadline, checking stop signals and process exit
+                    let startup_deadline = self.config.reload.startup_deadline;
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(startup_deadline);
+                    let port_ready = loop {
+                        tokio::select! {
+                            reason = stop_rx.recv() => {
+                                self.kill_processes_by_ref(&mut children).await;
+                                match reason {
+                                    Some(StopReason::Shutdown) => {
+                                        self.logger.write("supervisor", "Shutdown during startup");
+                                        return;
+                                    }
+                                    Some(StopReason::FileChange) => {
+                                        crate::server::deregister_project(&self.domain, &self);
+                                        self.logger.write("supervisor", "File change during startup");
+                                        self.stop_watcher();
+                                        return;
+                                    }
+                                    _ => break false,
+                                }
+                            }
+                            status = async { children.first_mut().unwrap().wait().await } => {
+                                self.logger.write("supervisor", &format!("Process exited during startup: {:?}", status));
+                                break false;
+                            }
+                            ready = self.probe_port() => {
+                                if ready {
+                                    break true;
+                                } else if tokio::time::Instant::now() >= deadline {
+                                    self.logger.write("supervisor", &format!("Port did not become ready within {}s", startup_deadline));
+                                    break false;
+                                }
+                                sleep(Duration::from_millis(50)).await;
+                            }
+                        }
+                    };
+
                     if !port_ready {
-                        self.kill_processes(children).await;
+                        self.kill_processes_by_ref(&mut children).await;
                         retry_count += 1;
                         if retry_count >= 2 {
                             self.logger.write("supervisor", "Startup failed twice, giving up");
@@ -1004,59 +1038,20 @@ tr:hover {{ background: #f5f5f5; }}
         }
     }
 
-    /// Wait for port to become ready, returns false if stop signal received, timeout, or process exits
-    async fn wait_for_port_ready(&self, stop_rx: &mut mpsc::Receiver<StopReason>, children: &mut [tokio::process::Child]) -> bool {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let port = {
-            let conn = self.app_connection.lock().await;
-            match conn.as_ref() {
-                Some(c) => c.port,
-                None => return false, // No connection info = startup failed
-            }
-        };
+    /// Single port probe with 2s timeout. Returns true if ready, false if not yet.
+    async fn probe_port(&self) -> bool {
+        let port = self.app_connection.lock().await.as_ref().map(|c| c.port).unwrap_or(0);
         let addr = format!("localhost:{}", port);
 
-        loop {
-            // Check for stop signal (non-blocking)
-            match stop_rx.try_recv() {
-                Ok(StopReason::Shutdown) => return false,
-                Ok(_) => return false, // Any stop during startup = abort
-                Err(_) => {}
-            }
+        let probe = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = TcpStream::connect(&addr).await?;
+            stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").await?;
+            let mut buf = [0u8; 32];
+            let n = stream.read(&mut buf).await?;
+            Ok::<_, std::io::Error>((n, buf))
+        }).await;
 
-            // Check if main process has exited
-            if let Some(main) = children.first_mut() {
-                match main.try_wait() {
-                    Ok(Some(status)) => {
-                        self.logger.write("supervisor", &format!("Application failed to start listening on port {} (process exited: {})", port, status));
-                        return false;
-                    }
-                    Ok(None) => {} // Still running
-                    Err(e) => {
-                        self.logger.write("supervisor", &format!("Error checking process status: {}", e));
-                        return false;
-                    }
-                }
-            }
-
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-
-            // Try to connect
-            if let Ok(mut stream) = TcpStream::connect(&addr).await {
-                if stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").await.is_ok() {
-                    let mut buf = [0u8; 32];
-                    if let Ok(n) = stream.read(&mut buf).await {
-                        if n >= 12 && buf.starts_with(b"HTTP/1.") && buf[9] != b'5' {
-                            return true;
-                        }
-                    }
-                }
-            }
-
-            sleep(Duration::from_millis(50)).await;
-        }
+        matches!(probe, Ok(Ok((n, buf))) if n >= 12 && buf.starts_with(b"HTTP/1.") && buf[9] != b'5')
     }
 
     /// Run until a stop trigger occurs. Returns the stop reason.
@@ -1137,10 +1132,6 @@ tr:hover {{ background: #f5f5f5; }}
     }
 
     /// Kill all processes gracefully (SIGTERM then SIGKILL after 5s)
-    async fn kill_processes(&self, mut children: Vec<tokio::process::Child>) {
-        self.kill_processes_by_ref(&mut children).await;
-    }
-
     async fn kill_processes_by_ref(&self, children: &mut Vec<tokio::process::Child>) {
         // Send SIGTERM to all
         for child in children.iter() {

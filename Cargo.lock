@@ -2336,7 +2336,7 @@ dependencies = [
 
 [[package]]
 name = "webcentral"
-version = "2.4.6"
+version = "2.4.8"
 dependencies = [
  "anyhow",
  "argon2",

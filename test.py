@@ -48,7 +48,7 @@ class TestRunner:
         """Set up test environment and start webcentral"""
         # Use fixed test directory in current directory
         cwd = os.path.dirname(os.path.abspath(__file__))
-        self.tmpdir = os.path.join(cwd, '.maca-test')
+        self.tmpdir = os.path.join(cwd, '.test-tmp')
         
         # Empty the directory if it exists
         if os.path.exists(self.tmpdir):
@@ -566,6 +566,121 @@ with socketserver.TCPServer(("", PORT), Handler) as httpd:
     # Make HTTP request (will take ~1 second to start)
     t.assert_http('/data.txt', check_body='Slow Server Data')
     t.assert_log('Ready on port', count=1)
+
+
+@test
+def test_startup_timeout_with_hanging_port(t):
+    """Application that binds port but doesn't respond should timeout and fail"""
+    # Create a script that binds to port but never sends HTTP responses
+    # This simulates a hung application that accepts connections but doesn't respond
+    t.write_file('server.py', '''
+import socket
+import sys
+import os
+import time
+
+PORT = int(os.environ.get('PORT'))
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(('', PORT))
+sock.listen(1)
+print(f"Bound to port {PORT}, but will never respond", flush=True)
+
+# Accept connections but never send a response - simulates hung app
+while True:
+    conn, addr = sock.accept()
+    # Just hold the connection open, never respond
+    time.sleep(60)
+''')
+
+    # Use a 5s startup deadline for faster test (default is 30s)
+    t.write_file('webcentral.ini', '''
+command=python3 -u server.py
+startup_deadline=5
+''')
+    
+    # Request should timeout. The lifecycle should detect the hung port probe
+    # within ~2s (probe timeout) and try again, eventually failing after 5s.
+    # For this test, we just verify the timeout is logged and the request fails.
+    start_time = time.time()
+    try:
+        t.assert_http('/', check_code=200, timeout=20)
+    except Exception as e:
+        elapsed = time.time() - start_time
+        # Should take roughly 10s (5s deadline * 2 retries) but complete, not hang forever
+        if elapsed < 8:
+            raise AssertionError(f"Timeout too quick ({elapsed:.1f}s), expected ~10s")
+        if elapsed > 25:
+            raise AssertionError(f"Timeout too slow ({elapsed:.1f}s), lifecycle may be stuck")
+    else:
+        raise AssertionError("Expected HTTP request to fail due to startup timeout")
+    
+    # Verify we saw the timeout log
+    t.await_log('Port', timeout=2)  # "Port X did not become ready within 5s"
+    t.await_log('did not become ready', timeout=2)
+
+
+@test
+def test_file_change_during_slow_startup_aborts_startup(t):
+    """File change during startup should abort and deregister immediately"""
+    # Create a script that binds to port but delays before responding
+    t.write_file('server.py', '''
+import socket
+import sys
+import os
+import time
+
+PORT = int(os.environ.get('PORT'))
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(('', PORT))
+sock.listen(1)
+print(f"Bound to port {PORT}, waiting 10s before responding", flush=True)
+
+# Accept connections but delay response - simulates slow startup
+while True:
+    conn, addr = sock.accept()
+    time.sleep(10)
+    conn.send(b"HTTP/1.0 200 OK\\r\\n\\r\\nOK")
+    conn.close()
+''')
+
+    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    
+    # Start request in background thread
+    import threading
+    request_done = threading.Event()
+    request_result = [None]
+    
+    def make_request():
+        try:
+            t.assert_http('/', check_code=200, timeout=5)
+            request_result[0] = 'success'
+        except Exception as e:
+            request_result[0] = str(e)
+        request_done.set()
+    
+    thread = threading.Thread(target=make_request)
+    thread.start()
+    
+    # Wait for app to start binding
+    t.await_log('Bound to port', timeout=5)
+    
+    # Now trigger file change while startup probe is in progress
+    time.sleep(0.5)
+    t.mark_log_read()
+    t.write_file('trigger.txt', 'trigger reload')
+    
+    # Should see the file change stop and deregister
+    t.await_log('Stopping due to file changes', timeout=3)
+    t.await_log('File change during startup', timeout=3)
+    
+    # Wait for the request to complete (should fail eventually)
+    # After project deregisters, the request should timeout or fail
+    thread.join(timeout=10)
+    
+    # Either the thread completed or timed out - both are acceptable
+    # The key test is that the lifecycle properly aborted
 
 
 @test
@@ -2150,7 +2265,7 @@ sys.exit(1)
     
     # First request triggers startup, process exits
     # With the fix, wait_for_port should detect the stop signal and return false
-    # This should log "Application failed to start listening on port"
+    # This should log "Process exited during startup"
     start_time = time.time()
     try:
         t.assert_http('/', check_code=200, timeout=10)
@@ -2166,7 +2281,7 @@ sys.exit(1)
     # Key assertion: with the fix, we should see this message because wait_for_port
     # detects the stop signal and returns false. Without the fix, the project gets
     # replaced before wait_for_port can return, so this message is never logged.
-    t.await_log('Application failed to start listening on port', timeout=3)
+    t.await_log('Process exited during startup', timeout=3)
 
 
 @test
