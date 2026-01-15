@@ -417,6 +417,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-01-15 (2.4.7):
+ - Hardened Firejail sandboxing by using private-etc and more restrictive filesystem rules
+ - Fix firejail UID handling when running as root
+
 2026-01-10 (2.4.6):
  - WebSocket connections now prevent inactivity shutdown
  - Dashboard Idle column now shows number of active WebSockets

@@ -32,7 +32,6 @@ use hyper_util::{
     client::legacy::Client,
     rt::{TokioIo},
 };
-use nix::unistd::Uid;
 use regex::Regex;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -1185,17 +1184,16 @@ tr:hover {{ background: #f5f5f5; }}
         );
 
         let mut cmd = if self.use_firejail && !has_docker {
-            let home = get_user_home(self.uid);
             let mut c = Command::new("firejail");
             c.args(&[
-                "--quiet",
-                "--noprofile",
-                "--private-tmp",
-                "--private-dev",
-                &format!("--private={}", home),
-                &format!("--whitelist={}", self.dir.display()),
-                "--read-only=/",
-                &format!("--read-write={}", self.dir.display()),
+				"--noprofile",
+				format!("--private={}", self.dir.display()).as_str(),
+				"--private-dev",
+				"--private-etc=group,hostname,localtime,nsswitch.conf,passwd,resolv.conf,alternatives",
+				"--private-tmp",
+				"--seccomp",
+				"--caps.drop=all",
+				"--disable-mnt",
                 "--",
                 "/bin/sh",
                 "-c",
@@ -1210,7 +1208,7 @@ tr:hover {{ background: #f5f5f5; }}
 
         // Set user if running as root
         #[cfg(target_os = "linux")]
-        if nix::unistd::geteuid().is_root() && !self.use_firejail {
+        if nix::unistd::geteuid().is_root() {
             cmd.uid(self.uid);
             cmd.gid(self.gid);
         }
@@ -1573,14 +1571,6 @@ fn get_ownership(path: &Path) -> (u32, u32) {
         .ok()
         .map(|m| (m.uid(), m.gid()))
         .unwrap_or((0, 0))
-}
-
-fn get_user_home(uid: u32) -> String {
-    nix::unistd::User::from_uid(Uid::from_raw(uid))
-        .ok()
-        .flatten()
-        .map(|u| u.dir.to_string_lossy().to_string())
-        .unwrap_or_else(|| "/tmp".to_string())
 }
 
 /// Returns the path to podman or docker, checking PATH on first call.
