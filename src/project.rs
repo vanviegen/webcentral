@@ -1176,9 +1176,11 @@ tr:hover {{ background: #f5f5f5; }}
 
         let mut cmd = if self.use_firejail && !has_docker {
             let mut c = Command::new("firejail");
+            // Wrap command with cd to set working directory inside sandbox
+            let wrapped_command = format!("cd {} && {}", self.dir.display(), command);
             c.args(&[
 				"--noprofile",
-				format!("--private={}", self.dir.display()).as_str(),
+				format!("--whitelist={}", self.dir.display()).as_str(),  // Project dir accessible, home is empty tmpfs
 				"--private-dev",
 				"--private-etc=group,hostname,localtime,nsswitch.conf,passwd,resolv.conf,alternatives",
 				"--private-tmp",
@@ -1188,8 +1190,8 @@ tr:hover {{ background: #f5f5f5; }}
                 "--",
                 "/bin/sh",
                 "-c",
-                &command,
             ]);
+            c.arg(&wrapped_command);
             c
         } else {
             let mut c = Command::new("/bin/sh");
@@ -1197,11 +1199,12 @@ tr:hover {{ background: #f5f5f5; }}
             c
         };
 
-        // Set user if running as root
+        // Set user and HOME if running as root
         #[cfg(target_os = "linux")]
         if nix::unistd::geteuid().is_root() {
             cmd.uid(self.uid);
             cmd.gid(self.gid);
+            cmd.env("HOME", get_user_home(self.uid));
         }
 
         Ok(cmd)
@@ -1562,6 +1565,15 @@ fn get_ownership(path: &Path) -> (u32, u32) {
         .ok()
         .map(|m| (m.uid(), m.gid()))
         .unwrap_or((0, 0))
+}
+
+fn get_user_home(uid: u32) -> PathBuf {
+    fs::read_to_string("/etc/passwd").ok()
+        .and_then(|s| s.lines()
+            .filter_map(|l| l.split(':').collect::<Vec<_>>().try_into().ok())
+            .find(|f: &[&str; 7]| f[2].parse::<u32>().ok() == Some(uid))
+            .map(|f| PathBuf::from(f[5])))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
 /// Returns the path to podman or docker, checking PATH on first call.

@@ -417,6 +417,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-01-16 (2.4.9):
+ - When using Firejail, set $HOME to a volatile directory outside the project directory.
+ - Show correct running time in dashboard.
+
 2026-01-15 (2.4.8):
  - Add `startup_deadline` config option (default 30s) for application startup timeout
  - Fix startup timeout blocking forever on hung applications
