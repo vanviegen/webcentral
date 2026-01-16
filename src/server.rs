@@ -190,6 +190,9 @@ pub struct Server {
 
 impl Server {
     pub async fn new(config: crate::GlobalConfig) -> Result<Self> {
+        // Initialize SERVER_START_TIME, as otherwise it will initialize when we first open the dashoard
+        let _ = *SERVER_START_TIME;
+
         // Create certificate manager if HTTPS is enabled
         let cert_manager = if config.https > 0 {
             let email = config.email.clone().expect("Email required for HTTPS");
