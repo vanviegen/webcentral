@@ -1525,7 +1525,13 @@ tr:hover {{ background: #f5f5f5; }}
             };
 
             if let Err(e) = result {
-                if e.kind() != std::io::ErrorKind::NotConnected && e.kind() != std::io::ErrorKind::ConnectionReset {
+                // Ignore common benign connection closure errors:
+                // - NotConnected/ConnectionReset: peer closed abruptly
+                // - UnexpectedEof: peer closed without TLS close_notify (common with browsers)
+                if e.kind() != std::io::ErrorKind::NotConnected
+                    && e.kind() != std::io::ErrorKind::ConnectionReset
+                    && e.kind() != std::io::ErrorKind::UnexpectedEof
+                {
                     logger.write("error", &format!("WebSocket error: {}", e));
                 }
             }
