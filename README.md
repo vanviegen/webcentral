@@ -417,6 +417,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-01-19 (2.4.10):
+ - Ensure webcentral.ini is always watched for changes, even when custom reload.include is specified
+ - Don't log spurious errors when clients drop connections
+
 2026-01-16 (2.4.9):
  - When using Firejail, set $HOME to a volatile directory outside the project directory.
  - Show correct running time in dashboard.

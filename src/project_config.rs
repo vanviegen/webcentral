@@ -210,16 +210,16 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
         ProjectType::Static
     };
 
-    let include = if ini_map.map.contains_key("reload.include") {
+    let mut include = if ini_map.map.contains_key("reload.include") {
         ini_map.fetch_array("reload.include")
+    } else if let ProjectType::Application { .. } = project_type {
+        vec!["**/*".to_string()]
     } else {
-        // Default includes when not specified
-        if let ProjectType::Application { .. } = project_type {
-            vec!["**/*".to_string()]
-        } else {
-            vec!["/webcentral.ini".to_string(), "/Procfile".to_string()]
-        }
+        vec!["/Procfile".to_string()]
     };
+
+    // *Always* include webcentral.ini, to make sure we won't get into an unchangeable state
+    include.push("/webcentral.ini".to_string());
 
     let mut exclude = ini_map.fetch_array("reload.exclude");
     exclude.extend(DEFAULT_EXCLUDES.iter().map(|s| s.to_string()));
