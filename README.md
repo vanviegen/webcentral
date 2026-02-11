@@ -417,6 +417,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-02-11 (2.4.11):
+ - Fix concurrent certificate acquisition bug where one domain's validation completion would clear HTTP-01 challenges for all in-flight domains
+ - Improve ACME error logging to show full error chains
+
 2026-01-19 (2.4.10):
  - Ensure webcentral.ini is always watched for changes, even when custom reload.include is specified
  - Don't log spurious errors when clients drop connections
