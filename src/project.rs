@@ -1182,7 +1182,7 @@ tr:hover {{ background: #f5f5f5; }}
 				"--noprofile",
 				format!("--whitelist={}", self.dir.display()).as_str(),  // Project dir accessible, home is empty tmpfs
 				"--private-dev",
-				"--private-etc=group,hostname,localtime,nsswitch.conf,passwd,resolv.conf,alternatives",
+				"--private-etc=group,hostname,localtime,nsswitch.conf,passwd,resolv.conf,alternatives,pki,crypto-policies",
 				"--private-tmp",
 				"--seccomp",
 				"--caps.drop=all",
