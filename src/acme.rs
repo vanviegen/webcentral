@@ -48,7 +48,7 @@ impl CertManager {
         }
 
         // Create new account (or get existing if already created with this email)
-        let (account, _credentials) = Account::builder()?
+        let result = Account::builder()?
             .create(
                 &NewAccount {
                     contact: &[&format!("mailto:{}", self.email)],
@@ -58,9 +58,15 @@ impl CertManager {
                 self.acme_url.clone(),
                 None,
             )
-            .await
-            .context("Failed to create ACME account")?;
-
+            .await;
+        
+        let (account, _credentials) = match result {
+            Ok(acc) => acc,
+            Err(e) => {
+                eprintln!("Failed to create ACME account ({}): {:?}", self.email, e);
+                return Err(e.into());
+            }
+        };
         *account_lock = Some(account.clone());
         Ok(account)
     }
@@ -71,13 +77,21 @@ impl CertManager {
         let account = self.get_or_create_account().await?;
 
         // Create new order
-        let mut order = account
+        let order_result = account
             .new_order(&NewOrder::new(&[Identifier::Dns(domain.to_string())]))
-            .await
-            .with_context(|| format!("Failed to create new ACME order for {}", domain))?;
+            .await;
+            
+        let mut order = match order_result {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("Failed to create certificate order for {}: {:?}", domain, e);
+                return Err(anyhow::anyhow!("Failed to create new ACME order for {}", domain));
+            }
+        };
 
-        // Get authorizations
+        // Get authorizations and store tokens for later cleanup
         let mut authorizations = order.authorizations();
+        let mut tokens_to_clean = Vec::new();
 
         while let Some(result) = authorizations.next().await {
             let mut authz = result.with_context(|| format!("Failed to get authorization for {}", domain))?;
@@ -87,15 +101,17 @@ impl CertManager {
                 .challenge(ChallengeType::Http01)
                 .with_context(|| format!("No HTTP-01 challenge found for {}", domain))?;
 
-            let token = &challenge.token;
+            let token = challenge.token.clone();
             let key_auth = challenge.key_authorization();
-
+            
             // Store challenge for HTTP-01 server to serve
             {
                 let mut challenges = self.challenges.write().await;
-                challenges.insert(token.to_string(), (token.to_string(), key_auth.as_str().to_string()));
+                challenges.insert(token.clone(), (token.clone(), key_auth.as_str().to_string()));
             }
-
+            
+            tokens_to_clean.push(token.clone());
+            
             // Tell ACME server we're ready
             challenge.set_ready().await.with_context(|| format!("Failed to set challenge ready for {}", domain))?;
         }
@@ -107,10 +123,12 @@ impl CertManager {
             .await
             .context("Failed to poll order ready - this usually means the HTTP-01 challenge failed. Check that DNS points to this server and port 80 is accessible.")?;
 
-        // Now we can clear challenges since validation is complete
+        // Now clean up only this domain's challenges
         {
             let mut challenges = self.challenges.write().await;
-            challenges.clear();
+            for token in tokens_to_clean {
+                challenges.remove(&token);
+            }
         }
 
         // Finalize order - this generates the private key and returns it

@@ -314,13 +314,11 @@ impl Server {
         // Start directory watcher to maintain DOMAINS
         let server = self.clone();
         tokio::spawn(async move {
-            use include_exclude_watcher as file_watcher;
-
-            if let Err(e) = file_watcher::Watcher::new()
+            if let Err(e) = include_exclude_watcher::Watcher::new()
                 .set_base_dir("/")
                 .add_include(format!("{}/*.*", server.config.projects))
                 .return_absolute(true)
-                .match_files(false)
+                .match_files(true)
                 .watch_update(false)
                 .watch_initial(true)
                 .run(move |_event, path| {
@@ -646,8 +644,8 @@ impl Server {
         // Handle ACME HTTP-01 challenges
         let path = req.uri().path();
         if path.starts_with("/.well-known/acme-challenge/") {
+            let token = &path[28..]; // Skip "/.well-known/acme-challenge/"
             if let Some(cert_manager) = &self.cert_manager {
-                let token = &path[28..]; // Skip "/.well-known/acme-challenge/"
                 if let Some(key_auth) = cert_manager.get_challenge(token).await {
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
@@ -656,6 +654,8 @@ impl Server {
                         .unwrap());
                 }
             }
+            eprintln!("ACME challenge not found for token {} (domain: {})", token,
+                req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or("unknown"));
             return Ok(Self::make_error(
                 StatusCode::NOT_FOUND,
                 "Challenge not found",
@@ -837,7 +837,7 @@ impl Server {
         path: &std::path::Path,
     ) {
         if !path.is_dir() {
-            return; // It's a file
+            return; // Not a directory (is_dir follows symlinks)
         }
         let Some(domain_name) = path.file_name().and_then(|n| n.to_str()) else {
             return ; // Shouldn't happen?
@@ -956,7 +956,7 @@ impl Server {
                             backoff_time *= 4;
                         }
                         CERT_STATUS.insert(domain.clone(), format!("Error (retry {}m)", sleep_time.as_secs() / 60));
-                        eprintln!("Failed to acquire certificate for {}: {} (retrying in {}s)", domain, e, sleep_time.as_secs());
+                        eprintln!("Failed to acquire certificate for {}: {:?} (retrying in {}s)", domain, e, sleep_time.as_secs());
                         tokio::time::sleep(sleep_time).await;
                     }
                 }
