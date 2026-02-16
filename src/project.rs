@@ -1305,9 +1305,13 @@ tr:hover {{ background: #f5f5f5; }}
     async fn watch_files(self: Arc<Self>) -> Result<()> {
         let proj = self.clone();
 
+        // Canonicalize directory to resolve symlinks (inotify doesn't follow symlinks)
+        let watch_dir = std::fs::canonicalize(&self.dir)
+            .unwrap_or_else(|_| self.dir.clone());
+
         // Watch files with callback
         file_watcher::Watcher::new()
-            .set_base_dir(&self.dir)
+            .set_base_dir(&watch_dir)
             .add_includes(&self.config.reload.include)
             .add_excludes(&self.config.reload.exclude)
             .run_debounced(100, move |path| {

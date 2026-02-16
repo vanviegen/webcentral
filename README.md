@@ -417,6 +417,9 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-02-16 (2.4.12):
+  - Fix change-reload for symlinked project directories
+
 2026-02-11 (2.4.11):
  - Fix concurrent certificate acquisition bug where one domain's validation completion would clear HTTP-01 challenges for all in-flight domains
  - Improve ACME error logging to show full error chains
