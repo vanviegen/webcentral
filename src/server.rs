@@ -7,6 +7,7 @@ use dashmap::DashMap;
 
 #[cfg(feature = "http3")]
 use h3_quinn::quinn::crypto::rustls::QuicServerConfig;
+use http::HeaderValue;
 #[cfg(feature = "http3")]
 use http_body_util::BodyExt;
 use hyper::service::service_fn;
@@ -367,7 +368,7 @@ impl Server {
 
     async fn run_http_server(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, addr) = listener.accept().await?;
             let server = self.clone();
 
             tokio::spawn(async move {
@@ -377,7 +378,7 @@ impl Server {
                         io,
                         service_fn(move |req| {
                             let server = server.clone();
-                            async move { server.handle_http(req).await }
+                            async move { server.handle_http(req, addr).await }
                         }),
                     )
                     .await
@@ -411,7 +412,7 @@ impl Server {
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
         loop {
-            let (stream, _addr) = listener.accept().await?;
+            let (stream, addr) = listener.accept().await?;
             let acceptor = acceptor.clone();
             let server = self.clone();
 
@@ -435,7 +436,7 @@ impl Server {
                         io,
                         service_fn(move |req| {
                             let server = server.clone();
-                            async move { server.handle_https(req).await }
+                            async move { server.handle_https(req, addr).await }
                         }),
                     )
                     .await
@@ -495,6 +496,7 @@ impl Server {
         self: Arc<Self>,
         incoming: h3_quinn::quinn::Incoming,
     ) -> Result<()> {
+        let addr = incoming.remote_address();
         let conn = incoming.accept()?.await?;
         let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn)).await?;
 
@@ -503,7 +505,7 @@ impl Server {
                 Ok(Some(resolver)) => {
                     let server = self.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = server.handle_http3_request(resolver).await {
+                        if let Err(e) = server.handle_http3_request(resolver, addr).await {
                             eprintln!("HTTP/3 request error: {}", e);
                         }
                     });
@@ -522,6 +524,7 @@ impl Server {
     async fn handle_http3_request<C>(
         &self,
         resolver: h3::server::RequestResolver<C, Bytes>,
+        addr: SocketAddr,
     ) -> Result<()>
     where
         C: h3::quic::Connection<Bytes>,
@@ -534,7 +537,7 @@ impl Server {
         let (mut send_stream, recv_stream) = stream.split();
 
         // Extract domain from headers before consuming request
-        let (parts, _) = req.into_parts();
+        let (mut parts, _) = req.into_parts();
         let domain = match self.extract_domain_from_parts(&parts) {
             Some(d) => d,
             None => {
@@ -558,6 +561,13 @@ impl Server {
 
         // Wrap recv stream as streaming body
         let body = H3RecvBody { stream: recv_stream };
+
+        // Add forwarding headers (for the likely case this connection will be proxied)
+        if let Ok(forwarded_for) = HeaderValue::from_str(&addr.ip().to_string()) {
+            parts.headers.insert("X-Forwarded-For", forwarded_for);
+        }
+        parts.headers.insert("X-Forwarded-Proto", HeaderValue::from_static("https"));
+ 
         let req = Request::from_parts(parts, body);
 
         // Handle request with streaming body - HTTP/3 doesn't support upgrades
@@ -640,6 +650,7 @@ impl Server {
     async fn handle_http(
         &self,
         req: Request<hyper::body::Incoming>,
+        addr: std::net::SocketAddr,
     ) -> Result<Response<StreamBody>, hyper::Error> {
         // Handle ACME HTTP-01 challenges
         let path = req.uri().path();
@@ -662,14 +673,15 @@ impl Server {
             ));
         }
 
-        self.route_request(req, false).await
+        self.route_request(req, addr, false).await
     }
 
     async fn handle_https(
         &self,
         req: Request<hyper::body::Incoming>,
+        addr: std::net::SocketAddr,
     ) -> Result<Response<StreamBody>, hyper::Error> {
-        self.route_request(req, true).await
+        self.route_request(req, addr, true).await
     }
 
     fn make_redirect(&self, scheme: &str, project: &Project, req: &Request<hyper::body::Incoming>) -> Response<StreamBody> {
@@ -697,6 +709,7 @@ impl Server {
     async fn route_request(
         &self,
         mut req: Request<hyper::body::Incoming>,
+        addr: std::net::SocketAddr,
         from_https: bool,
     ) -> Result<Response<StreamBody>, hyper::Error> {
         if let Some(host) = req.headers().get("host").and_then(|h| h.to_str().ok()) {
@@ -751,6 +764,13 @@ impl Server {
 
         // Handle request with project - response body is streamed directly to client
         let logger = project.logger.clone();
+
+        // Add forwarding headers (for the likely case this connection will be proxied)
+        if let Ok(forwarded_for) = HeaderValue::from_str(&addr.ip().to_string()) {
+            req.headers_mut().insert("X-Forwarded-For", forwarded_for);
+        }
+        req.headers_mut().insert("X-Forwarded-Proto", HeaderValue::from_static(if from_https { "https" } else { "http" }));
+
         let result = match project.clone().handle(req).await {
             Ok(resp) => Ok(resp),
             Err(e) => {

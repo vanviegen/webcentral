@@ -262,9 +262,8 @@ impl Project {
         if is_upgrade_request(&req) {
             // Log upgrade requests (handle_inner does logging for non-upgrades)
             *self.last_activity.lock().await = Instant::now();
-            if self.config.log_requests {
-                let _ = self.logger.write("request", &format!("{} {}", req.method(), req.uri().path()));
-            }
+            
+            self.log_request(&req);
 
             // Check auth if configured (no cookie setting for upgrades)
             if !self.config.auth.is_empty() {
@@ -303,9 +302,7 @@ impl Project {
         // Update activity timestamp
         *self.last_activity.lock().await = Instant::now();
 
-        if self.config.log_requests {
-            let _ = self.logger.write("request", &format!("{} {}", req.method(), req.uri().path()));
-        }
+        self.log_request(&req);
 
         // Track if we need to set auth cookie on successful response
         let mut set_auth_cookie: Option<String> = None;
@@ -362,6 +359,13 @@ impl Project {
         }
 
         Ok(response)
+    }
+
+    fn log_request<B>(&self, req: &Request<B>) {
+        if self.config.log_requests {
+            let addr = req.headers().get("X-Forwarded-For").and_then(|h| h.to_str().ok()).unwrap_or("-");
+            let _ = self.logger.write("request", &format!("{} {} {}", addr, req.method(), req.uri().path()));
+        }
     }
 
     fn apply_rewrites(&self, path: &str) -> (String, String) {
@@ -618,15 +622,13 @@ tr:hover {{ background: #f5f5f5; }}
 
         // Set X-Forwarded headers to preserve original request info
         new_parts.headers.insert("X-Forwarded-Host", HeaderValue::from_str(original_host)?);
-        new_parts.headers.insert("X-Forwarded-Proto", HeaderValue::from_str(parts.uri.scheme_str().unwrap_or("https"))?);
 
         // Rewrite Host header to match the backend (extracted from target URI)
         if let Some(authority) = new_uri.authority() {
             new_parts.headers.insert("host", HeaderValue::from_str(authority.as_str())?);
         }
 
-        let proxy_req = Request::from_parts(new_parts, body);
-        self.forward_request(proxy_req).await
+        self.forward_request_parts(new_parts, body).await
     }
 
     async fn forward_request<B>(
@@ -639,10 +641,19 @@ tr:hover {{ background: #f5f5f5; }}
     {
         // Note: WebSocket upgrades are handled separately in handle_upgrade
         // because they require the hyper::body::Incoming type specifically.
+        let (parts, body) = req.into_parts();
+        self.forward_request_parts(parts, body).await
+    }
 
-        // Buffer the request body (we must send the full request to upstream)
-        let (mut parts, body) = req.into_parts();
-        
+    async fn forward_request_parts<B>(
+        self: &Arc<Self>,
+        mut parts: http::request::Parts,
+        body: B,
+    ) -> Result<Response<StreamBody>>
+    where
+        B: http_body::Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         // Upstream connections are always HTTP/1.1
         parts.version = http::Version::HTTP_11;
         
