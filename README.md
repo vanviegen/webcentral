@@ -417,6 +417,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-06-01 (2.4.14):
+  - Add www-prefixed variant to certificate for redirect
+  - Updates deps
+
 2026-02-18 (2.4.13):
   - Added X-Forwarded-For header and now also send X-Forwarded-Proto header when only doing forwarding (as opposed to proxying)
 
