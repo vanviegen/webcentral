@@ -35,7 +35,7 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 ```sh
 # Download and install latest statically linked release
-curl -LsSf https://github.com/vanviegen/webcentral/releases/latest/download/webcentral-$(uname -m)-unknown-linux-musl.tar.xz | sudo tar xJf - -C /usr/local/bin --strip-components=1 '*/webcentral'
+curl -LsSf https://github.com/vanviegen/webcentral/releases/latest/download/webcentral-$(uname -m)-unknown-linux-musl.tar.xz | sudo tar xJf - -C /usr/local/bin --strip-components=1 --wildcards '*/webcentral'
 # Or build from source (see below)
 
 # Install optional dependencies for sandboxing
@@ -416,6 +416,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 ---
 
 ## Changelog
+
+2026-06-01 (2.4.14):
+  - Add www-prefixed variant to certificate for redirect
+  - Updates deps
 
 2026-02-18 (2.4.13):
   - Added X-Forwarded-For header and now also send X-Forwarded-Proto header when only doing forwarding (as opposed to proxying)
