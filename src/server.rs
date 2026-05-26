@@ -960,10 +960,22 @@ impl Server {
                 }
             };
 
+            // When redirect_www is enabled, include the www. variant as a SAN in the
+            // same certificate so the TLS handshake succeeds before the redirect fires.
+            let www_domain = if self.config.redirect_www && !domain.starts_with("www.") {
+                Some(format!("www.{}", domain))
+            } else {
+                None
+            };
+
             let mut backoff_time = 15 * 60; // 15 minutes
             loop {
                 CERT_STATUS.insert(domain.clone(), "Acquiring".to_string());
-                match cert_manager.acquire_certificate(&domain).await {
+                let domains: Vec<&str> = match &www_domain {
+                    Some(www) => vec![&domain, www.as_str()],
+                    None => vec![&domain],
+                };
+                match cert_manager.acquire_certificate(&domains).await {
                     Ok(_) => {
                         CERT_STATUS.insert(domain.clone(), "Valid".to_string());
                         println!("Successfully acquired certificate for {}", domain);

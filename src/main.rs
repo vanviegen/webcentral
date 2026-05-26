@@ -41,7 +41,7 @@ pub struct GlobalConfig {
     #[arg(long, default_value_t = default_projects(), help = "Projects directory pattern")]
     pub projects: String,
 
-    #[arg(long, default_value_t = default_config(), help = "Certificates and bindings storage directory (defaults to ~/.config/webcentral/)")]
+    #[arg(long, default_value_t = default_config(), help = "Certificates and bindings storage directory (defaults to ~/.webcentral/ or /var/lib/webcentral/ if run as root)")]
     pub data_dir: String,
 
     #[arg(long, default_value = "443", help = "HTTPS port (0 to disable)")]
