@@ -1,5 +1,5 @@
 use crate::acme::CertManager;
-use crate::project::{self, Project, StreamBody, empty_body, body_from};
+use crate::project::{self, body_from, empty_body, Project, StreamBody};
 use anyhow::Result;
 #[cfg(feature = "http3")]
 use bytes::Bytes;
@@ -81,14 +81,14 @@ impl<S: h3::quic::RecvStream> http_body::Body for H3RecvBody<S> {
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         use bytes::Buf;
         use std::future::Future;
-        
+
         let fut = self.stream.recv_data();
         tokio::pin!(fut);
-        
+
         match fut.poll(cx) {
-            std::task::Poll::Ready(Ok(Some(mut buf))) => {
-                std::task::Poll::Ready(Some(Ok(http_body::Frame::data(buf.copy_to_bytes(buf.remaining())))))
-            }
+            std::task::Poll::Ready(Ok(Some(mut buf))) => std::task::Poll::Ready(Some(Ok(
+                http_body::Frame::data(buf.copy_to_bytes(buf.remaining())),
+            ))),
             std::task::Poll::Ready(Ok(None)) => std::task::Poll::Ready(None),
             std::task::Poll::Ready(Err(e)) => {
                 std::task::Poll::Ready(Some(Err(anyhow::anyhow!("H3 recv error: {}", e))))
@@ -121,36 +121,39 @@ pub fn stop_all_projects() {
 
 /// Get status info for all domains (for dashboard display)
 pub fn get_domain_status() -> Vec<DomainStatus> {
-    let mut result: Vec<DomainStatus> = DOMAINS.iter().map(|entry| {
-        let domain = entry.key().clone();
-        let directory = entry.directory.clone();
-        let cert_status = CERT_STATUS.get(&domain).map(|s| s.clone());
-        if let Some(project) = &entry.project {
-            DomainStatus {
-                domain,
-                directory,
-                project_type: project.get_type_name(),
-                status: project.get_status(),
-                pending_requests: project.get_pending_requests(),
-                active_upgrades: project.get_active_upgrades(),
-                total_requests: project.get_total_requests(),
-                idle_seconds: project.get_idle_seconds(),
-                cert_status,
+    let mut result: Vec<DomainStatus> = DOMAINS
+        .iter()
+        .map(|entry| {
+            let domain = entry.key().clone();
+            let directory = entry.directory.clone();
+            let cert_status = CERT_STATUS.get(&domain).map(|s| s.clone());
+            if let Some(project) = &entry.project {
+                DomainStatus {
+                    domain,
+                    directory,
+                    project_type: project.get_type_name(),
+                    status: project.get_status(),
+                    pending_requests: project.get_pending_requests(),
+                    active_upgrades: project.get_active_upgrades(),
+                    total_requests: project.get_total_requests(),
+                    idle_seconds: project.get_idle_seconds(),
+                    cert_status,
+                }
+            } else {
+                DomainStatus {
+                    domain,
+                    directory,
+                    project_type: "Unknown".to_string(),
+                    status: "Not loaded".to_string(),
+                    pending_requests: 0,
+                    active_upgrades: 0,
+                    total_requests: 0,
+                    idle_seconds: None,
+                    cert_status,
+                }
             }
-        } else {
-            DomainStatus {
-                domain,
-                directory,
-                project_type: "Unknown".to_string(),
-                status: "Not loaded".to_string(),
-                pending_requests: 0,
-                active_upgrades: 0,
-                total_requests: 0,
-                idle_seconds: None,
-                cert_status,
-            }
-        }
-    }).collect();
+        })
+        .collect();
     result.sort_by(|a, b| a.domain.cmp(&b.domain));
     result
 }
@@ -220,10 +223,10 @@ impl Server {
     fn load_bindings(data_dir: &str) -> HashSet<String> {
         let mut bindings = HashSet::new();
         let bindings_path = PathBuf::from(data_dir).join("bindings.list");
-        
-        if let Ok(file) =  fs::File::open(&bindings_path) {
+
+        if let Ok(file) = fs::File::open(&bindings_path) {
             let reader = std::io::BufReader::new(file);
-            
+
             for line in reader.lines() {
                 if let Ok(path) = line {
                     let path = path.trim();
@@ -297,7 +300,11 @@ impl Server {
         let http_listener = if self.config.http > 0 {
             let addr = format!("0.0.0.0:{}", self.config.http);
             Some(TcpListener::bind(&addr).await.map_err(|e| {
-                anyhow::anyhow!("Failed to bind HTTP server on port {}: {}", self.config.http, e)
+                anyhow::anyhow!(
+                    "Failed to bind HTTP server on port {}: {}",
+                    self.config.http,
+                    e
+                )
             })?)
         } else {
             None
@@ -306,7 +313,11 @@ impl Server {
         let https_listener = if self.config.https > 0 {
             let addr = format!("0.0.0.0:{}", self.config.https);
             Some(TcpListener::bind(&addr).await.map_err(|e| {
-                anyhow::anyhow!("Failed to bind HTTPS server on port {}: {}", self.config.https, e)
+                anyhow::anyhow!(
+                    "Failed to bind HTTPS server on port {}: {}",
+                    self.config.https,
+                    e
+                )
             })?)
         } else {
             None
@@ -325,7 +336,8 @@ impl Server {
                 .run(move |_event, path| {
                     server.process_project_directory(&path);
                 })
-                .await {
+                .await
+            {
                 eprintln!("Directory watcher error: {}", e);
             }
         });
@@ -402,7 +414,7 @@ impl Server {
             .with_cert_resolver(Arc::new(CertResolver {
                 cert_manager: cert_manager_clone,
             }));
-        
+
         // ALPN protocols for HTTP/2 and HTTP/1.1 negotiation
         tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         // Disable session tickets and early data - they become invalid after server restart,
@@ -473,7 +485,10 @@ impl Server {
         let endpoint = h3_quinn::quinn::Endpoint::server(server_config, addr)
             .map_err(|e| anyhow::anyhow!("Failed to create QUIC endpoint: {}", e))?;
 
-        println!("HTTP/3 server listening on port {} (UDP)", self.config.https);
+        println!(
+            "HTTP/3 server listening on port {} (UDP)",
+            self.config.https
+        );
 
         while let Some(incoming) = endpoint.accept().await {
             let server = self.clone();
@@ -541,7 +556,10 @@ impl Server {
         let domain = match self.extract_domain_from_parts(&parts) {
             Some(d) => d,
             None => {
-                let resp = http::Response::builder().status(StatusCode::BAD_REQUEST).body(()).unwrap();
+                let resp = http::Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(())
+                    .unwrap();
                 send_stream.send_response(resp).await?;
                 send_stream.send_data(Bytes::from("Bad Request")).await?;
                 return Ok(send_stream.finish().await?);
@@ -552,7 +570,10 @@ impl Server {
         let project = match self.get_project_for_domain(&domain).await {
             Ok(p) => p,
             Err(_) => {
-                let resp = http::Response::builder().status(StatusCode::NOT_FOUND).body(()).unwrap();
+                let resp = http::Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(())
+                    .unwrap();
                 send_stream.send_response(resp).await?;
                 send_stream.send_data(Bytes::from("Not Found")).await?;
                 return Ok(send_stream.finish().await?);
@@ -560,14 +581,18 @@ impl Server {
         };
 
         // Wrap recv stream as streaming body
-        let body = H3RecvBody { stream: recv_stream };
+        let body = H3RecvBody {
+            stream: recv_stream,
+        };
 
         // Add forwarding headers (for the likely case this connection will be proxied)
         if let Ok(forwarded_for) = HeaderValue::from_str(&addr.ip().to_string()) {
             parts.headers.insert("X-Forwarded-For", forwarded_for);
         }
-        parts.headers.insert("X-Forwarded-Proto", HeaderValue::from_static("https"));
- 
+        parts
+            .headers
+            .insert("X-Forwarded-Proto", HeaderValue::from_static("https"));
+
         let req = Request::from_parts(parts, body);
 
         // Handle request with streaming body - HTTP/3 doesn't support upgrades
@@ -583,7 +608,7 @@ impl Server {
                 for (name, value) in resp_parts.headers.iter() {
                     // Skip connection-specific headers forbidden in HTTP/3
                     let name_lower = name.as_str().to_lowercase();
-                    if name_lower == "transfer-encoding" 
+                    if name_lower == "transfer-encoding"
                         || name_lower == "connection"
                         || name_lower == "keep-alive"
                         || name_lower == "upgrade"
@@ -594,10 +619,14 @@ impl Server {
                     builder = builder.header(name, value);
                 }
                 // HTTP/3 is always over TLS, so add HSTS
-                let hsts = if self.should_redirect_to_https(&project) { "max-age=31536000; includeSubDomains" } else { "max-age=0" };
+                let hsts = if self.should_redirect_to_https(&project) {
+                    "max-age=31536000; includeSubDomains"
+                } else {
+                    "max-age=0"
+                };
                 builder = builder.header("Strict-Transport-Security", hsts);
                 send_stream.send_response(builder.body(()).unwrap()).await?;
-                
+
                 // Stream response body
                 while let Some(chunk) = body.frame().await {
                     match chunk {
@@ -625,10 +654,20 @@ impl Server {
                 // HTTP/3 is always over TLS, so add HSTS
                 let resp = http::Response::builder()
                     .status(status)
-                    .header("Strict-Transport-Security", if self.should_redirect_to_https(&project) { "max-age=31536000; includeSubDomains" } else { "max-age=0" })
-                    .body(()).unwrap();
+                    .header(
+                        "Strict-Transport-Security",
+                        if self.should_redirect_to_https(&project) {
+                            "max-age=31536000; includeSubDomains"
+                        } else {
+                            "max-age=0"
+                        },
+                    )
+                    .body(())
+                    .unwrap();
                 send_stream.send_response(resp).await?;
-                send_stream.send_data(Bytes::from(status.canonical_reason().unwrap_or("Error"))).await?;
+                send_stream
+                    .send_data(Bytes::from(status.canonical_reason().unwrap_or("Error")))
+                    .await?;
             }
         }
 
@@ -638,12 +677,28 @@ impl Server {
     #[cfg(feature = "http3")]
     fn extract_domain_from_parts(&self, parts: &http::request::Parts) -> Option<String> {
         // h3 puts :authority in the URI, fall back to headers
-        let host = parts.uri.host()
+        let host = parts
+            .uri
+            .host()
             .map(|h| h.to_string())
-            .or_else(|| parts.headers.get("host").and_then(|h| h.to_str().ok()).map(|s| s.to_string()))
-            .or_else(|| parts.headers.get(":authority").and_then(|h| h.to_str().ok()).map(|s| s.to_string()))?;
+            .or_else(|| {
+                parts
+                    .headers
+                    .get("host")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| {
+                parts
+                    .headers
+                    .get(":authority")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_string())
+            })?;
         let host = host.split(':').next().unwrap_or(&host).to_lowercase();
-        if !VALID_DOMAIN.is_match(&host) { return None; }
+        if !VALID_DOMAIN.is_match(&host) {
+            return None;
+        }
         Some(host)
     }
 
@@ -656,8 +711,17 @@ impl Server {
         let path = req.uri().path();
         if path.starts_with("/.well-known/acme-challenge/") {
             let token = &path[28..]; // Skip "/.well-known/acme-challenge/"
+            let challenge_domain = req
+                .headers()
+                .get("host")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|host| host.split(':').next())
+                .map(|host| host.to_lowercase());
             if let Some(cert_manager) = &self.cert_manager {
-                if let Some(key_auth) = cert_manager.get_challenge(token).await {
+                if let Some(key_auth) = cert_manager
+                    .get_challenge(challenge_domain.as_deref(), token)
+                    .await
+                {
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "text/plain")
@@ -665,8 +729,11 @@ impl Server {
                         .unwrap());
                 }
             }
-            eprintln!("ACME challenge not found for token {} (domain: {})", token,
-                req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or("unknown"));
+            eprintln!(
+                "ACME challenge not found for token {} (domain: {})",
+                token,
+                challenge_domain.as_deref().unwrap_or("unknown")
+            );
             return Ok(Self::make_error(
                 StatusCode::NOT_FOUND,
                 "Challenge not found",
@@ -684,13 +751,22 @@ impl Server {
         self.route_request(req, addr, true).await
     }
 
-    fn make_redirect(&self, scheme: &str, project: &Project, req: &Request<hyper::body::Incoming>) -> Response<StreamBody> {
+    fn make_redirect(
+        &self,
+        scheme: &str,
+        project: &Project,
+        req: &Request<hyper::body::Incoming>,
+    ) -> Response<StreamBody> {
         let port_suffix = match scheme {
             "http" if self.config.http != 80 => format!(":{}", self.config.http),
             "https" if self.config.https != 443 => format!(":{}", self.config.https),
             _ => String::new(),
         };
-        let path = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/");
         let url = format!("{}://{}{}{}", scheme, &project.domain, port_suffix, path);
         Response::builder()
             .status(StatusCode::MOVED_PERMANENTLY)
@@ -714,7 +790,11 @@ impl Server {
     ) -> Result<Response<StreamBody>, hyper::Error> {
         if let Some(host) = req.headers().get("host").and_then(|h| h.to_str().ok()) {
             let scheme = if from_https { "https" } else { "http" };
-            let path_and_query = req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+            let path_and_query = req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/");
             let uri_string = format!("{}://{}{}", scheme, host, path_and_query);
             if let Ok(uri) = uri_string.parse() {
                 *req.uri_mut() = uri;
@@ -735,7 +815,8 @@ impl Server {
             Err(_) => {
                 // Check for www redirect
                 if self.config.redirect_www {
-                    let alt_domain = domain.strip_prefix("www.")
+                    let alt_domain = domain
+                        .strip_prefix("www.")
                         .map(str::to_owned)
                         .unwrap_or_else(|| format!("www.{}", domain));
 
@@ -756,7 +837,7 @@ impl Server {
             }
         } else {
             // HTTP request - check if we should redirect to HTTPS
-            
+
             if self.should_redirect_to_https(&project) {
                 return Ok(self.make_redirect("https", &project, &req));
             }
@@ -769,7 +850,10 @@ impl Server {
         if let Ok(forwarded_for) = HeaderValue::from_str(&addr.ip().to_string()) {
             req.headers_mut().insert("X-Forwarded-For", forwarded_for);
         }
-        req.headers_mut().insert("X-Forwarded-Proto", HeaderValue::from_static(if from_https { "https" } else { "http" }));
+        req.headers_mut().insert(
+            "X-Forwarded-Proto",
+            HeaderValue::from_static(if from_https { "https" } else { "http" }),
+        );
 
         let result = match project.clone().handle(req).await {
             Ok(resp) => Ok(resp),
@@ -779,7 +863,10 @@ impl Server {
                 if msg.starts_with("502 ") {
                     Ok(Self::make_error(StatusCode::BAD_GATEWAY, "Bad Gateway"))
                 } else {
-                    Ok(Self::make_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"))
+                    Ok(Self::make_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal Server Error",
+                    ))
                 }
             }
         };
@@ -787,11 +874,17 @@ impl Server {
         // Add HSTS and Alt-Svc headers for HTTPS responses
         if from_https {
             if let Ok(mut resp) = result {
-                let hsts = if self.should_redirect_to_https(&project) { "max-age=31536000; includeSubDomains" } else { "max-age=0" };
-                resp.headers_mut().insert("Strict-Transport-Security", hsts.parse().unwrap());
+                let hsts = if self.should_redirect_to_https(&project) {
+                    "max-age=31536000; includeSubDomains"
+                } else {
+                    "max-age=0"
+                };
+                resp.headers_mut()
+                    .insert("Strict-Transport-Security", hsts.parse().unwrap());
                 if self.config.http3 {
                     let alt_svc = format!("h3=\":{}\"; ma=86400", self.config.https);
-                    resp.headers_mut().insert("Alt-Svc", alt_svc.parse().unwrap());
+                    resp.headers_mut()
+                        .insert("Alt-Svc", alt_svc.parse().unwrap());
                 }
                 return Ok(resp);
             }
@@ -815,7 +908,10 @@ impl Server {
         if self.config.https == 0 {
             return false;
         }
-        project.config.redirect_http.unwrap_or_else(|| self.config.redirect_http())
+        project
+            .config
+            .redirect_http
+            .unwrap_or_else(|| self.config.redirect_http())
     }
 
     async fn get_project_for_domain(&self, domain: &str) -> Result<Arc<Project>> {
@@ -852,15 +948,12 @@ impl Server {
     }
 
     // Process a directory path, validating domain and setting up project + certificate
-    fn process_project_directory(
-        self: &Arc<Self>,
-        path: &std::path::Path,
-    ) {
+    fn process_project_directory(self: &Arc<Self>, path: &std::path::Path) {
         if !path.is_dir() {
             return; // Not a directory (is_dir follows symlinks)
         }
         let Some(domain_name) = path.file_name().and_then(|n| n.to_str()) else {
-            return ; // Shouldn't happen?
+            return; // Shouldn't happen?
         };
         if !VALID_DOMAIN.is_match(domain_name) {
             return; // It doesn't look like a domain name
@@ -876,9 +969,9 @@ impl Server {
             }
             return;
         }
-        
+
         let directory = path.to_string_lossy().to_string();
-        
+
         // Check if domain exists and if transfer is allowed
         if let Some(existing) = DOMAINS.get(&domain) {
             let existing_dir_gone = !std::path::Path::new(&existing.directory).exists();
@@ -902,8 +995,7 @@ impl Server {
                 }
             );
         }
-        
-        
+
         // Start certificate management task if HTTPS is enabled
         let cert_task = if self.cert_manager.is_some() {
             let server = self.clone();
@@ -922,11 +1014,11 @@ impl Server {
 
     async fn manage_certificate(&self, domain: String) {
         let cert_manager = self.cert_manager.as_ref().unwrap();
-        
+
         loop {
             // 1. Check certificate status
             let now = std::time::SystemTime::now();
-            
+
             // Determine if we need to acquire a certificate
             // If we have a valid certificate, we will sleep and continue the loop
             // If we need to acquire, we will break out of this match and proceed to acquisition
@@ -934,17 +1026,27 @@ impl Server {
                 Ok(expiration) => {
                     if let Ok(duration_until_expiry) = expiration.duration_since(now) {
                         // Renew if expires in < 8 days
-                        if duration_until_expiry < std::time::Duration::from_secs(8 * 24 * 60 * 60) {
+                        if duration_until_expiry < std::time::Duration::from_secs(8 * 24 * 60 * 60)
+                        {
                             let days = duration_until_expiry.as_secs() / 86400;
-                            CERT_STATUS.insert(domain.clone(), format!("Renewing ({}d left)", days));
-                            println!("Certificate for {} expires in {:?}, renewing...", domain, duration_until_expiry);
+                            CERT_STATUS
+                                .insert(domain.clone(), format!("Renewing ({}d left)", days));
+                            println!(
+                                "Certificate for {} expires in {:?}, renewing...",
+                                domain, duration_until_expiry
+                            );
                             // Acquire!
                         } else {
                             // Valid certificate, sleep until renewal time (expiration - 7 days)
                             let days = duration_until_expiry.as_secs() / 86400;
                             CERT_STATUS.insert(domain.clone(), format!("Valid ({}d)", days));
-                            let sleep_time = duration_until_expiry - to_jittered_duration(7 * 24 * 60 * 60);
-                            println!("Certificate for {} is valid. Sleeping for {}s", domain, sleep_time.as_secs());
+                            let sleep_time =
+                                duration_until_expiry - to_jittered_duration(7 * 24 * 60 * 60);
+                            println!(
+                                "Certificate for {} is valid. Sleeping for {}s",
+                                domain,
+                                sleep_time.as_secs()
+                            );
                             tokio::time::sleep(sleep_time).await;
                             continue; // Do not acquire
                         }
@@ -984,11 +1086,20 @@ impl Server {
                     Err(e) => {
                         // Add +/- 10% jitter
                         let sleep_time = to_jittered_duration(backoff_time);
-                        if backoff_time < 12*60*60 { // 15m, 1h, 4h, 16h
+                        if backoff_time < 12 * 60 * 60 {
+                            // 15m, 1h, 4h, 16h
                             backoff_time *= 4;
                         }
-                        CERT_STATUS.insert(domain.clone(), format!("Error (retry {}m)", sleep_time.as_secs() / 60));
-                        eprintln!("Failed to acquire certificate for {}: {:?} (retrying in {}s)", domain, e, sleep_time.as_secs());
+                        CERT_STATUS.insert(
+                            domain.clone(),
+                            format!("Error (retry {}m)", sleep_time.as_secs() / 60),
+                        );
+                        eprintln!(
+                            "Failed to acquire certificate for {}: {:?} (retrying in {}s)",
+                            domain,
+                            e,
+                            sleep_time.as_secs()
+                        );
                         tokio::time::sleep(sleep_time).await;
                     }
                 }
@@ -1020,7 +1131,10 @@ impl rustls::server::ResolvesServerCert for CertResolver {
         let (certs, key) = match self.cert_manager.get_certificate(domain) {
             Ok(cert) => cert,
             Err(_) => {
-                eprintln!("HTTPS request for {} but no certificate is available yet", domain);
+                eprintln!(
+                    "HTTPS request for {} but no certificate is available yet",
+                    domain
+                );
                 return None;
             }
         };

@@ -11,8 +11,9 @@ pub struct CertManager {
     email: String,
     acme_url: String,
     account: Arc<RwLock<Option<Account>>>,
-    // Store pending challenges: domain -> (token, key_authorization)
-    pub challenges: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
+    // Store pending challenges: domain -> token -> key_authorization
+    pub challenges:
+        Arc<RwLock<std::collections::HashMap<String, std::collections::HashMap<String, String>>>>,
 }
 
 impl std::fmt::Debug for CertManager {
@@ -59,7 +60,7 @@ impl CertManager {
                 None,
             )
             .await;
-        
+
         let (account, _credentials) = match result {
             Ok(acc) => acc,
             Err(e) => {
@@ -82,24 +83,30 @@ impl CertManager {
             .iter()
             .map(|d| Identifier::Dns(d.to_string()))
             .collect();
-        let order_result = account
-            .new_order(&NewOrder::new(&identifiers))
-            .await;
-            
+        let order_result = account.new_order(&NewOrder::new(&identifiers)).await;
+
         let mut order = match order_result {
             Ok(o) => o,
             Err(e) => {
-                eprintln!("Failed to create certificate order for {}: {:?}", domains.join(", "), e);
-                return Err(anyhow::anyhow!("Failed to create new ACME order for {}", domains.join(", ")));
+                eprintln!(
+                    "Failed to create certificate order for {}: {:?}",
+                    domains.join(", "),
+                    e
+                );
+                return Err(anyhow::anyhow!(
+                    "Failed to create new ACME order for {}",
+                    domains.join(", ")
+                ));
             }
         };
 
         // Get authorizations and store tokens for later cleanup
         let mut authorizations = order.authorizations();
-        let mut tokens_to_clean = Vec::new();
+        let mut challenges_to_clean = Vec::new();
 
         while let Some(result) = authorizations.next().await {
-            let mut authz = result.with_context(|| format!("Failed to get authorization for {}", primary))?;
+            let mut authz =
+                result.with_context(|| format!("Failed to get authorization for {}", primary))?;
 
             // Find HTTP-01 challenge
             let mut challenge = authz
@@ -108,17 +115,24 @@ impl CertManager {
 
             let token = challenge.token.clone();
             let key_auth = challenge.key_authorization();
-            
+            let challenge_domain = challenge.identifier().to_string().to_lowercase();
+
             // Store challenge for HTTP-01 server to serve
             {
                 let mut challenges = self.challenges.write().await;
-                challenges.insert(token.clone(), (token.clone(), key_auth.as_str().to_string()));
+                challenges
+                    .entry(challenge_domain.clone())
+                    .or_default()
+                    .insert(token.clone(), key_auth.as_str().to_string());
             }
-            
-            tokens_to_clean.push(token.clone());
-            
+
+            challenges_to_clean.push((challenge_domain, token.clone()));
+
             // Tell ACME server we're ready
-            challenge.set_ready().await.with_context(|| format!("Failed to set challenge ready for {}", primary))?;
+            challenge
+                .set_ready()
+                .await
+                .with_context(|| format!("Failed to set challenge ready for {}", primary))?;
         }
 
         // Wait for order to be ready (this is when ACME server validates the challenges)
@@ -131,8 +145,13 @@ impl CertManager {
         // Now clean up only this domain's challenges
         {
             let mut challenges = self.challenges.write().await;
-            for token in tokens_to_clean {
-                challenges.remove(&token);
+            for (domain, token) in challenges_to_clean {
+                if let Some(domain_challenges) = challenges.get_mut(&domain) {
+                    domain_challenges.remove(&token);
+                    if domain_challenges.is_empty() {
+                        challenges.remove(&domain);
+                    }
+                }
             }
         }
 
@@ -149,8 +168,14 @@ impl CertManager {
             .context("Failed to poll for certificate")?;
 
         // Save certificate and key under the primary domain name only.
-        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", primary));
-        let key_path = self.config_dir.join("keys").join(format!("{}.pem", primary));
+        let cert_path = self
+            .config_dir
+            .join("certs")
+            .join(format!("{}.pem", primary));
+        let key_path = self
+            .config_dir
+            .join("keys")
+            .join(format!("{}.pem", primary));
         fs::write(&cert_path, &cert_chain_pem)?;
         fs::write(&key_path, &private_key_pem)?;
 
@@ -160,7 +185,10 @@ impl CertManager {
     fn resolve_cert_domain<'a>(&self, domain: &'a str) -> Option<&'a str> {
         // Look up the domain directly, or fall back to the non-www base domain for www. variants
         // whose certificate was issued under the base domain name.
-        let primary_path = self.config_dir.join("certs").join(format!("{}.pem", domain));
+        let primary_path = self
+            .config_dir
+            .join("certs")
+            .join(format!("{}.pem", domain));
         if primary_path.exists() {
             return Some(domain);
         }
@@ -181,8 +209,14 @@ impl CertManager {
             .resolve_cert_domain(domain)
             .ok_or_else(|| anyhow::anyhow!("Certificate not found for domain: {}", domain))?;
 
-        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", resolved));
-        let key_path = self.config_dir.join("keys").join(format!("{}.pem", resolved));
+        let cert_path = self
+            .config_dir
+            .join("certs")
+            .join(format!("{}.pem", resolved));
+        let key_path = self
+            .config_dir
+            .join("keys")
+            .join(format!("{}.pem", resolved));
 
         if !cert_path.exists() || !key_path.exists() {
             anyhow::bail!("Certificate not found for domain: {}", domain);
@@ -200,11 +234,23 @@ impl CertManager {
         Ok((certs, key))
     }
 
-
-
-    pub async fn get_challenge(&self, token: &str) -> Option<String> {
+    pub async fn get_challenge(&self, domain: Option<&str>, token: &str) -> Option<String> {
         let challenges = self.challenges.read().await;
-        challenges.get(token).map(|(_, key_auth)| key_auth.clone())
+
+        // Prefer the requested host, but fall back to any matching token to keep
+        // challenge serving resilient when host headers are rewritten.
+        if let Some(domain) = domain {
+            let normalized = domain.to_lowercase();
+            if let Some(domain_challenges) = challenges.get(&normalized) {
+                if let Some(key_auth) = domain_challenges.get(token) {
+                    return Some(key_auth.clone());
+                }
+            }
+        }
+
+        challenges
+            .values()
+            .find_map(|domain_challenges| domain_challenges.get(token).cloned())
     }
 
     pub fn get_certificate_expiration(&self, domain: &str) -> Result<std::time::SystemTime> {
@@ -212,7 +258,10 @@ impl CertManager {
             .resolve_cert_domain(domain)
             .ok_or_else(|| anyhow::anyhow!("Certificate not found for domain: {}", domain))?;
 
-        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", resolved));
+        let cert_path = self
+            .config_dir
+            .join("certs")
+            .join(format!("{}.pem", resolved));
 
         if !cert_path.exists() {
             anyhow::bail!("Certificate not found for domain: {}", domain);
@@ -221,18 +270,81 @@ impl CertManager {
         let cert_data = fs::read(&cert_path)?;
         let (_, pem) = x509_parser::pem::parse_x509_pem(&cert_data)
             .map_err(|e| anyhow::anyhow!("Failed to parse PEM: {}", e))?;
-        
-        let cert = pem.parse_x509()
+
+        let cert = pem
+            .parse_x509()
             .map_err(|e| anyhow::anyhow!("Failed to parse X.509 certificate: {}", e))?;
 
         // Convert ASN.1 time to SystemTime
         // x509-parser returns ASN1Time, which has a to_datetime() method returning OffsetDateTime
         // We need to convert that to SystemTime
         let expiration = cert.validity().not_after.to_datetime();
-        
+
         // Convert time::OffsetDateTime to std::time::SystemTime
-        let system_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(expiration.unix_timestamp() as u64);
-        
+        let system_time = std::time::SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(expiration.unix_timestamp() as u64);
+
         Ok(system_time)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CertManager;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_manager() -> CertManager {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("webcentral-acme-test-{}-{}", nanos, unique));
+        CertManager::new(
+            PathBuf::from(dir),
+            "test@example.com".to_string(),
+            "https://acme-staging-v02.api.letsencrypt.org/directory".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn get_challenge_prefers_requested_domain() {
+        let manager = test_manager();
+        let token = "token1".to_string();
+
+        {
+            let mut challenges = manager.challenges.write().await;
+            challenges
+                .entry("example.com".to_string())
+                .or_default()
+                .insert(token.clone(), "key-auth-example".to_string());
+            challenges
+                .entry("www.example.com".to_string())
+                .or_default()
+                .insert(token.clone(), "key-auth-www".to_string());
+        }
+
+        let value = manager.get_challenge(Some("www.example.com"), &token).await;
+        assert_eq!(value.as_deref(), Some("key-auth-www"));
+    }
+
+    #[tokio::test]
+    async fn get_challenge_falls_back_when_host_missing() {
+        let manager = test_manager();
+        let token = "token2".to_string();
+
+        {
+            let mut challenges = manager.challenges.write().await;
+            challenges
+                .entry("example.com".to_string())
+                .or_default()
+                .insert(token.clone(), "key-auth-example".to_string());
+        }
+
+        let value = manager.get_challenge(None, &token).await;
+        assert_eq!(value.as_deref(), Some("key-auth-example"));
     }
 }

@@ -28,7 +28,7 @@ fn create_dir_all_owned(path: &std::path::Path, uid: u32, gid: u32) -> Result<()
     match fs::create_dir(path) {
         Ok(_) => {
             if nix::unistd::geteuid().is_root() && (uid > 0 || gid > 0) {
-                use nix::unistd::{chown, Uid, Gid};
+                use nix::unistd::{chown, Gid, Uid};
                 let _ = chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)));
             }
             Ok(())
@@ -109,8 +109,12 @@ impl Logger {
 
         // Set ownership if running as root
         if nix::unistd::geteuid().is_root() && (self.uid > 0 || self.gid > 0) {
-            use nix::unistd::{chown, Uid, Gid};
-            let _ = chown(&log_path, Some(Uid::from_raw(self.uid)), Some(Gid::from_raw(self.gid)));
+            use nix::unistd::{chown, Gid, Uid};
+            let _ = chown(
+                &log_path,
+                Some(Uid::from_raw(self.uid)),
+                Some(Gid::from_raw(self.gid)),
+            );
         }
 
         *file = Some(new_file);

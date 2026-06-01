@@ -1,18 +1,18 @@
-use include_exclude_watcher as file_watcher;
 use crate::logger::Logger;
 use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
 use crate::server::SHARED_EXECUTOR;
 use crate::streams::AnyConnector;
-use tower::Service;
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use base64::Engine;
+use include_exclude_watcher as file_watcher;
+use tower::Service;
 
 use anyhow::Result;
 use bytes::Bytes;
 use http::HeaderValue;
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use std::error::Error as StdError;
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::{body::Incoming, Request, Response};
+use std::error::Error as StdError;
 
 /// Streaming response body type used throughout the proxy.
 /// Wraps BoxBody to allow streaming responses from upstream to clients.
@@ -20,38 +20,39 @@ pub type StreamBody = BoxBody<Bytes, anyhow::Error>;
 
 /// Create an empty StreamBody (for redirects, upgrade responses, etc.)
 pub fn empty_body() -> StreamBody {
-    BoxBody::new(Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e)))
+    BoxBody::new(
+        Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e)),
+    )
 }
 
 /// Create a StreamBody from any data that can be converted to Bytes
 pub fn body_from<T: Into<Bytes>>(data: T) -> StreamBody {
-    BoxBody::new(Full::new(data.into()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e)))
+    BoxBody::new(
+        Full::new(data.into()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e)),
+    )
 }
-use hyper_util::client::legacy::connect::{HttpConnector};
-use hyper_util::{
-    client::legacy::Client,
-    rt::{TokioIo},
-};
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::{client::legacy::Client, rt::TokioIo};
 use regex::Regex;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex, Notify, watch};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::time::sleep;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Application lifecycle state for Application-type projects
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
-    Stopped,   // No process running, will start on demand
-    Starting,  // Process spawning, waiting for port
-    Running,   // Process running and accepting requests
-    Failed,    // Startup failed twice, project should be deregistered
+    Stopped,  // No process running, will start on demand
+    Starting, // Process spawning, waiting for port
+    Running,  // Process running and accepting requests
+    Failed,   // Startup failed twice, project should be deregistered
 }
 
 /// Reasons for stopping the application
@@ -60,13 +61,13 @@ pub enum StopReason {
     FileChange,
     Inactivity,
     ProcessExit,
-    Shutdown,  // Server shutdown
+    Shutdown, // Server shutdown
 }
 
 /// Result of authentication check
 enum AuthResult {
-    Passed,                     // Auth passed (via cookie)
-    PassedSetCookie(String),    // Auth passed via basic auth, set cookie for username
+    Passed,                       // Auth passed (via cookie)
+    PassedSetCookie(String),      // Auth passed via basic auth, set cookie for username
     Failed(Response<StreamBody>), // Auth failed, return this response
 }
 
@@ -74,7 +75,6 @@ lazy_static::lazy_static! {
      static ref DEFAULT_HTTP_CLIENT: Client<AnyConnector, Full<Bytes>> = Client::builder(SHARED_EXECUTOR.clone()).build(AnyConnector::Http(HttpConnector::new()));
      static ref DEFAULT_CONNECTOR: AnyConnector = AnyConnector::Http(HttpConnector::new());
 }
-
 
 // --- Project ---
 
@@ -104,13 +104,13 @@ pub struct Project {
     // Application state (only meaningful for Application type projects)
     state_tx: watch::Sender<AppState>,
     state_rx: watch::Receiver<AppState>,
-    stop_tx: mpsc::Sender<StopReason>,  // Send to request stop
-    pending_requests: AtomicU64,        // Requests currently being handled (for startup trigger)
-    active_upgrades: AtomicU64,         // Active WebSocket/upgraded connections
-    total_requests: AtomicU64,          // Total requests served
+    stop_tx: mpsc::Sender<StopReason>, // Send to request stop
+    pending_requests: AtomicU64,       // Requests currently being handled (for startup trigger)
+    active_upgrades: AtomicU64,        // Active WebSocket/upgraded connections
+    total_requests: AtomicU64,         // Total requests served
     last_activity: Mutex<Instant>,
     watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    state_changed: Notify,              // Notified when pending_requests changes
+    state_changed: Notify, // Notified when pending_requests changes
 }
 
 impl Project {
@@ -136,32 +136,32 @@ impl Project {
             (None, None)
         } else {
             let (connector, descr) = match &config.project_type {
-                ProjectType::Redirect { target } => {
-                    (None, format!("Redirect to {}", target))
-                }
-                ProjectType::Proxy { target } => {
-                    (None, format!("Proxy to {}", target))
-                }
-                ProjectType::TcpForward { address } => {
-                    (Some(AnyConnector::FixedTcp(address.clone())), format!("Forward to port {}", address))
-                }
-                ProjectType::UnixForward { socket_path } => {
-                    (Some(AnyConnector::FixedUnix(socket_path.clone())), format!("Forward to unix socket {}", socket_path))
-                }
-                ProjectType::Static => {
-                    (None, "Static file server".to_string())
-                }
-                ProjectType::Dashboard => {
-                    (None, "Dashboard".to_string())
-                }
+                ProjectType::Redirect { target } => (None, format!("Redirect to {}", target)),
+                ProjectType::Proxy { target } => (None, format!("Proxy to {}", target)),
+                ProjectType::TcpForward { address } => (
+                    Some(AnyConnector::FixedTcp(address.clone())),
+                    format!("Forward to port {}", address),
+                ),
+                ProjectType::UnixForward { socket_path } => (
+                    Some(AnyConnector::FixedUnix(socket_path.clone())),
+                    format!("Forward to unix socket {}", socket_path),
+                ),
+                ProjectType::Static => (None, "Static file server".to_string()),
+                ProjectType::Dashboard => (None, "Dashboard".to_string()),
                 ProjectType::Application { .. } => unreachable!(),
             };
             logger.write("supervisor", &descr);
 
             if let Some(c) = connector {
-                (Some(c.clone()), Some(Client::builder(SHARED_EXECUTOR.clone()).build(c)))
+                (
+                    Some(c.clone()),
+                    Some(Client::builder(SHARED_EXECUTOR.clone()).build(c)),
+                )
             } else {
-                (Some(DEFAULT_CONNECTOR.clone()), Some(DEFAULT_HTTP_CLIENT.clone()))
+                (
+                    Some(DEFAULT_CONNECTOR.clone()),
+                    Some(DEFAULT_HTTP_CLIENT.clone()),
+                )
             }
         };
 
@@ -172,7 +172,7 @@ impl Project {
 
         let (state_tx, state_rx) = watch::channel(AppState::Stopped);
         let (stop_tx, stop_rx) = mpsc::channel(8);
-        
+
         let project = Arc::new(Project {
             domain: domain.clone(),
             dir: dir.to_path_buf(),
@@ -200,10 +200,12 @@ impl Project {
         let proj_for_watcher = project.clone();
         let watcher_handle = tokio::spawn(async move {
             if let Err(e) = proj.clone().watch_files().await {
-                let _ = proj.logger.write("supervisor", &format!("File watcher error: {}", e));
+                let _ = proj
+                    .logger
+                    .write("supervisor", &format!("File watcher error: {}", e));
             }
         });
-        
+
         // Store the watcher handle (spawn a task to do it since we're not async)
         tokio::spawn(async move {
             *proj_for_watcher.watcher_task.lock().await = Some(watcher_handle);
@@ -262,7 +264,7 @@ impl Project {
         if is_upgrade_request(&req) {
             // Log upgrade requests (handle_inner does logging for non-upgrades)
             *self.last_activity.lock().await = Instant::now();
-            
+
             self.log_request(&req);
 
             // Check auth if configured (no cookie setting for upgrades)
@@ -281,8 +283,9 @@ impl Project {
                     self.untrack_request();
                     return result;
                 }
-                ProjectType::Proxy { .. } | ProjectType::TcpForward { .. } | 
-                ProjectType::UnixForward { .. } => {
+                ProjectType::Proxy { .. }
+                | ProjectType::TcpForward { .. }
+                | ProjectType::UnixForward { .. } => {
                     return self.clone().proxy_upgrade(req).await;
                 }
                 _ => {} // Fall through to normal handling
@@ -314,7 +317,10 @@ impl Project {
                 return Ok(Response::builder()
                     .status(302)
                     .header("Location", "/")
-                    .header("Set-Cookie", "webcentral_auth=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+                    .header(
+                        "Set-Cookie",
+                        "webcentral_auth=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0",
+                    )
                     .body(empty_body())?);
             }
 
@@ -351,10 +357,13 @@ impl Project {
         // Add auth cookie if authentication just succeeded via basic auth
         if let Some(username) = set_auth_cookie {
             let password_hash = self.config.auth.get(&username).unwrap();
-            let cookie = format!("webcentral_auth={}:{}; Path=/; HttpOnly; SameSite=Strict; Max-Age=315360000", username, password_hash);
+            let cookie = format!(
+                "webcentral_auth={}:{}; Path=/; HttpOnly; SameSite=Strict; Max-Age=315360000",
+                username, password_hash
+            );
             response.headers_mut().insert(
                 http::header::SET_COOKIE,
-                HeaderValue::from_str(&cookie).unwrap()
+                HeaderValue::from_str(&cookie).unwrap(),
             );
         }
 
@@ -363,8 +372,15 @@ impl Project {
 
     fn log_request<B>(&self, req: &Request<B>) {
         if self.config.log_requests {
-            let addr = req.headers().get("X-Forwarded-For").and_then(|h| h.to_str().ok()).unwrap_or("-");
-            let _ = self.logger.write("request", &format!("{} {} {}", addr, req.method(), req.uri().path()));
+            let addr = req
+                .headers()
+                .get("X-Forwarded-For")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("-");
+            let _ = self.logger.write(
+                "request",
+                &format!("{} {} {}", addr, req.method(), req.uri().path()),
+            );
         }
     }
 
@@ -407,7 +423,7 @@ impl Project {
                 }
             }
         }
-        
+
         // No valid cookie, check for basic auth header
         let Some(auth_header) = req.headers().get(http::header::AUTHORIZATION) else {
             return AuthResult::Failed(self.auth_required_response());
@@ -415,33 +431,39 @@ impl Project {
         let Some(auth_str) = auth_header.to_str().ok() else {
             return AuthResult::Failed(self.auth_required_response());
         };
-        
+
         if !auth_str.starts_with("Basic ") {
             return AuthResult::Failed(self.auth_required_response());
         }
-        
+
         let encoded = &auth_str[6..];
-        let Some(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded).ok() else {
+        let Some(decoded) = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()
+        else {
             return AuthResult::Failed(self.auth_required_response());
         };
         let Some(credentials) = String::from_utf8(decoded).ok() else {
             return AuthResult::Failed(self.auth_required_response());
         };
-        
+
         let Some((username, password)) = credentials.split_once(':') else {
             return AuthResult::Failed(self.auth_required_response());
         };
-        
+
         // Look up password hash for username
         let Some(password_hash) = self.config.auth.get(username) else {
             return AuthResult::Failed(self.auth_required_response());
         };
-        
+
         // Verify password using argon2
         let Ok(parsed_hash) = PasswordHash::new(password_hash) else {
             return AuthResult::Failed(self.auth_required_response());
         };
-        if Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok() {
+        if Argon2::default()
+            .verify_password(password.as_bytes(), &parsed_hash)
+            .is_ok()
+        {
             // Auth passed via basic auth - signal that cookie should be set
             AuthResult::PassedSetCookie(username.to_string())
         } else {
@@ -453,12 +475,19 @@ impl Project {
     fn auth_required_response(&self) -> Response<StreamBody> {
         Response::builder()
             .status(401)
-            .header("WWW-Authenticate", "Basic realm=\"Authentication Required\"")
+            .header(
+                "WWW-Authenticate",
+                "Basic realm=\"Authentication Required\"",
+            )
             .body(body_from("Unauthorized"))
             .unwrap()
     }
 
-    async fn handle_redirect<B>(&self, req: &Request<B>, target: &str) -> Result<Response<StreamBody>> {
+    async fn handle_redirect<B>(
+        &self,
+        req: &Request<B>,
+        target: &str,
+    ) -> Result<Response<StreamBody>> {
         Ok(Response::builder()
             .status(301)
             .header("Location", &format!("{}{}", target, req.uri().path()))
@@ -502,7 +531,7 @@ impl Project {
     async fn handle_dashboard<B>(&self, _req: &Request<B>) -> Result<Response<StreamBody>> {
         let domains = crate::server::get_domain_status();
         let server_info = crate::server::get_server_info();
-        
+
         // Format uptime nicely
         let uptime_secs = server_info.uptime_seconds;
         let uptime_str = if uptime_secs < 60 {
@@ -514,8 +543,9 @@ impl Project {
         } else {
             format!("{}d {}h", uptime_secs / 86400, (uptime_secs % 86400) / 3600)
         };
-        
-        let mut html = format!(r#"<!DOCTYPE html>
+
+        let mut html = format!(
+            r#"<!DOCTYPE html>
 <html>
 <head>
 <title>Webcentral Dashboard</title>
@@ -554,7 +584,9 @@ tr:hover {{ background: #f5f5f5; }}
 <h2>Projects</h2>
 <table>
 <tr><th>Domain</th><th>Type</th><th>Status</th><th>TLS</th><th>Requests</th><th>Pending</th><th>Idle</th><th>Directory</th></tr>
-"#, uptime_str, server_info.domain_count);
+"#,
+            uptime_str, server_info.domain_count
+        );
 
         for d in domains {
             let status_class = match d.status.as_str() {
@@ -566,15 +598,25 @@ tr:hover {{ background: #f5f5f5; }}
                 _ => "",
             };
             let idle_str = if d.active_upgrades > 0 {
-                format!("{} websocket{}", d.active_upgrades, if d.active_upgrades == 1 { "" } else { "s" })
+                format!(
+                    "{} websocket{}",
+                    d.active_upgrades,
+                    if d.active_upgrades == 1 { "" } else { "s" }
+                )
             } else {
-                d.idle_seconds.map(|s| {
-                    if s < 60 { format!("{}s", s) }
-                    else if s < 3600 { format!("{}m", s / 60) }
-                    else { format!("{}h", s / 3600) }
-                }).unwrap_or_else(|| "-".to_string())
+                d.idle_seconds
+                    .map(|s| {
+                        if s < 60 {
+                            format!("{}s", s)
+                        } else if s < 3600 {
+                            format!("{}m", s / 60)
+                        } else {
+                            format!("{}h", s / 3600)
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string())
             };
-            
+
             let (cert_class, cert_str) = match d.cert_status.as_deref() {
                 Some(s) if s.starts_with("Valid") => ("cert-valid", s),
                 Some(s) if s.starts_with("Error") => ("cert-error", s),
@@ -582,7 +624,7 @@ tr:hover {{ background: #f5f5f5; }}
                 Some(s) => ("cert-acquiring", s),
                 None => ("", "-"),
             };
-            
+
             html.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td class=\"{}\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"dir\" title=\"{}\">{}</td></tr>\n",
                 d.domain, d.project_type, status_class, d.status, cert_class, cert_str, d.total_requests, d.pending_requests, idle_str, d.directory, d.directory
@@ -607,7 +649,15 @@ tr:hover {{ background: #f5f5f5; }}
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let (parts, body) = req.into_parts();
-        let uri_str = format!("{}{}", target, parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
+        let uri_str = format!(
+            "{}{}",
+            target,
+            parts
+                .uri
+                .path_and_query()
+                .map(|pq| pq.as_str())
+                .unwrap_or("/")
+        );
 
         let mut new_parts = parts.clone();
         let new_uri: http::Uri = uri_str.parse()?;
@@ -621,20 +671,21 @@ tr:hover {{ background: #f5f5f5; }}
             .unwrap_or("");
 
         // Set X-Forwarded headers to preserve original request info
-        new_parts.headers.insert("X-Forwarded-Host", HeaderValue::from_str(original_host)?);
+        new_parts
+            .headers
+            .insert("X-Forwarded-Host", HeaderValue::from_str(original_host)?);
 
         // Rewrite Host header to match the backend (extracted from target URI)
         if let Some(authority) = new_uri.authority() {
-            new_parts.headers.insert("host", HeaderValue::from_str(authority.as_str())?);
+            new_parts
+                .headers
+                .insert("host", HeaderValue::from_str(authority.as_str())?);
         }
 
         self.forward_request_parts(new_parts, body).await
     }
 
-    async fn forward_request<B>(
-        self: &Arc<Self>,
-        req: Request<B>,
-    ) -> Result<Response<StreamBody>>
+    async fn forward_request<B>(self: &Arc<Self>, req: Request<B>) -> Result<Response<StreamBody>>
     where
         B: http_body::Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -656,7 +707,7 @@ tr:hover {{ background: #f5f5f5; }}
     {
         // Upstream connections are always HTTP/1.1
         parts.version = http::Version::HTTP_11;
-        
+
         // Remove HTTP/2 and HTTP/3 pseudo-headers (they start with ':')
         // These are not valid in HTTP/1.1 and will cause upstream errors
         parts.headers.remove(":authority");
@@ -665,8 +716,11 @@ tr:hover {{ background: #f5f5f5; }}
         parts.headers.remove(":scheme");
         parts.headers.remove(":status");
         parts.headers.remove(":protocol");
-        
-        let body_bytes = BodyExt::collect(body).await.map_err(|e| anyhow::anyhow!("{}", e.into()))?.to_bytes();
+
+        let body_bytes = BodyExt::collect(body)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e.into()))?
+            .to_bytes();
         let req = Request::from_parts(parts, Full::new(body_bytes));
 
         // Get the http_client from the appropriate source
@@ -686,7 +740,9 @@ tr:hover {{ background: #f5f5f5; }}
                 if e.is_connect() {
                     // Upstream refused connection - stop the project and return specific error
                     self.clone().stop();
-                    let source = StdError::source(&e).map(|s| s.to_string()).unwrap_or_default();
+                    let source = StdError::source(&e)
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
                     anyhow::bail!("502 upstream connect failed: {}", source);
                 }
                 return Err(e.into());
@@ -697,7 +753,10 @@ tr:hover {{ background: #f5f5f5; }}
         // When the client disconnects, the response is dropped, which drops the body,
         // which closes the connection to the upstream server.
         let (parts, body) = resp.into_parts();
-        Ok(Response::from_parts(parts, BoxBody::new(body.map_err(|e| anyhow::anyhow!("{}", e)))))
+        Ok(Response::from_parts(
+            parts,
+            BoxBody::new(body.map_err(|e| anyhow::anyhow!("{}", e))),
+        ))
     }
 
     async fn handle_application<B>(self: Arc<Self>, req: Request<B>) -> Result<Response<StreamBody>>
@@ -715,13 +774,14 @@ tr:hover {{ background: #f5f5f5; }}
     /// On success, caller MUST call untrack_request() when done.
     async fn wait_for_app_ready(&self) -> Result<()> {
         self.track_request();
-        
+
         let state = {
             let mut rx = self.state_rx.clone();
             let wait_result = tokio::time::timeout(
                 Duration::from_secs(30),
-                rx.wait_for(|&s| s == AppState::Running || s == AppState::Failed)
-            ).await;
+                rx.wait_for(|&s| s == AppState::Running || s == AppState::Failed),
+            )
+            .await;
 
             match wait_result {
                 Ok(Ok(s)) => *s,
@@ -753,7 +813,7 @@ tr:hover {{ background: #f5f5f5; }}
         let addr = format!("localhost:{}", port);
         let connector = AnyConnector::FixedTcp(addr.clone());
         let http_client = Client::builder(SHARED_EXECUTOR.clone()).build(connector.clone());
-        
+
         // Store the new connection info
         *self.app_connection.lock().await = Some(AppConnection {
             port,
@@ -761,7 +821,8 @@ tr:hover {{ background: #f5f5f5; }}
             connector,
         });
 
-        self.logger.write("supervisor", &format!("Starting on port {}", port));
+        self.logger
+            .write("supervisor", &format!("Starting on port {}", port));
 
         let (command, docker, workers) = match &self.config.project_type {
             ProjectType::Application {
@@ -793,7 +854,10 @@ tr:hover {{ background: #f5f5f5; }}
         process.stdout(std::process::Stdio::piped());
         process.stderr(std::process::Stdio::piped());
 
-        self.logger.write("supervisor", &format!("Starting application: {:?}", process));
+        self.logger.write(
+            "supervisor",
+            &format!("Starting application: {:?}", process),
+        );
 
         let mut child = process.spawn()?;
         let mut children = Vec::new();
@@ -826,14 +890,20 @@ tr:hover {{ background: #f5f5f5; }}
 
         // Spawn workers
         if !workers.is_empty() {
-            self.logger.write("supervisor", &format!("Starting {} worker(s)", workers.len()));
+            self.logger.write(
+                "supervisor",
+                &format!("Starting {} worker(s)", workers.len()),
+            );
         }
 
         for (name, cmd) in &workers {
             let mut process = match self.build_shell_command(cmd) {
                 Ok(p) => p,
                 Err(e) => {
-                    self.logger.write("supervisor", &format!("Failed to build worker {}: {}", name, e));
+                    self.logger.write(
+                        "supervisor",
+                        &format!("Failed to build worker {}: {}", name, e),
+                    );
                     continue;
                 }
             };
@@ -875,7 +945,10 @@ tr:hover {{ background: #f5f5f5; }}
                     children.push(worker_child);
                 }
                 Err(e) => {
-                    self.logger.write("supervisor", &format!("Failed to start worker {}: {}", name, e));
+                    self.logger.write(
+                        "supervisor",
+                        &format!("Failed to start worker {}: {}", name, e),
+                    );
                 }
             }
         }
@@ -896,7 +969,7 @@ tr:hover {{ background: #f5f5f5; }}
 
         loop {
             let state = *self.state_rx.borrow();
-            
+
             match state {
                 AppState::Stopped => {
                     // Wait for a pending request to trigger startup
@@ -923,21 +996,23 @@ tr:hover {{ background: #f5f5f5; }}
                             }
                         }
                     }
-                    
+
                     let _ = self.state_tx.send(AppState::Starting);
                 }
-                
+
                 AppState::Starting => {
                     self.logger.write("supervisor", "Starting application");
-                    
+
                     // Spawn processes
                     let mut children = match self.spawn_processes().await {
                         Ok(c) => c,
                         Err(e) => {
-                            self.logger.write("supervisor", &format!("Failed to spawn: {}", e));
+                            self.logger
+                                .write("supervisor", &format!("Failed to spawn: {}", e));
                             retry_count += 1;
                             if retry_count >= 2 {
-                                self.logger.write("supervisor", "Startup failed twice, giving up");
+                                self.logger
+                                    .write("supervisor", "Startup failed twice, giving up");
                                 let _ = self.state_tx.send(AppState::Failed);
                             } else {
                                 self.logger.write("supervisor", "Will retry once");
@@ -950,7 +1025,8 @@ tr:hover {{ background: #f5f5f5; }}
 
                     // Wait for port with deadline, checking stop signals and process exit
                     let startup_deadline = self.config.reload.startup_deadline;
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(startup_deadline);
+                    let deadline =
+                        tokio::time::Instant::now() + Duration::from_secs(startup_deadline);
                     let port_ready = loop {
                         tokio::select! {
                             reason = stop_rx.recv() => {
@@ -989,7 +1065,8 @@ tr:hover {{ background: #f5f5f5; }}
                         self.kill_processes_by_ref(&mut children).await;
                         retry_count += 1;
                         if retry_count >= 2 {
-                            self.logger.write("supervisor", "Startup failed twice, giving up");
+                            self.logger
+                                .write("supervisor", "Startup failed twice, giving up");
                             let _ = self.state_tx.send(AppState::Failed);
                         } else {
                             self.logger.write("supervisor", "Will retry once");
@@ -1003,13 +1080,16 @@ tr:hover {{ background: #f5f5f5; }}
                         let conn = self.app_connection.lock().await;
                         conn.as_ref().map(|c| c.port).unwrap_or(0)
                     };
-                    self.logger.write("supervisor", &format!("Ready on port {}", port));
+                    self.logger
+                        .write("supervisor", &format!("Ready on port {}", port));
                     retry_count = 0;
                     let _ = self.state_tx.send(AppState::Running);
-                    
+
                     // Run until stop trigger or process exit
-                    let stop_reason = self.run_until_stop(children, &mut stop_rx, timeout_duration).await;
-                    
+                    let stop_reason = self
+                        .run_until_stop(children, &mut stop_rx, timeout_duration)
+                        .await;
+
                     match stop_reason {
                         StopReason::Shutdown => {
                             self.logger.write("supervisor", "Stopped app (shutdown)");
@@ -1026,21 +1106,23 @@ tr:hover {{ background: #f5f5f5; }}
                             // Loop continues, will restart on next request
                         }
                         StopReason::ProcessExit => {
-                            self.logger.write("supervisor", "Stopped app (process exit)");
+                            self.logger
+                                .write("supervisor", "Stopped app (process exit)");
                             // Loop continues, will restart on next request
                         }
                     }
                     // State is already Stopped (set by run_until_stop before killing processes)
                 }
-                
+
                 AppState::Running => {
                     // Should not reach here - run_until_stop handles Running state
                     unreachable!("lifecycle_task in Running state outside run_until_stop");
                 }
-                
+
                 AppState::Failed => {
                     // Deregister from server and exit
-                    self.logger.write("supervisor", "Deregistering failed project");
+                    self.logger
+                        .write("supervisor", "Deregistering failed project");
                     crate::server::deregister_project(&self.domain, &self);
                     self.stop_watcher();
                     return;
@@ -1051,16 +1133,25 @@ tr:hover {{ background: #f5f5f5; }}
 
     /// Single port probe with 2s timeout. Returns true if ready, false if not yet.
     async fn probe_port(&self) -> bool {
-        let port = self.app_connection.lock().await.as_ref().map(|c| c.port).unwrap_or(0);
+        let port = self
+            .app_connection
+            .lock()
+            .await
+            .as_ref()
+            .map(|c| c.port)
+            .unwrap_or(0);
         let addr = format!("localhost:{}", port);
 
         let probe = tokio::time::timeout(Duration::from_secs(2), async {
             let mut stream = TcpStream::connect(&addr).await?;
-            stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").await?;
+            stream
+                .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                .await?;
             let mut buf = [0u8; 32];
             let n = stream.read(&mut buf).await?;
             Ok::<_, std::io::Error>((n, buf))
-        }).await;
+        })
+        .await;
 
         matches!(probe, Ok(Ok((n, buf))) if n >= 12 && buf.starts_with(b"HTTP/1.") && buf[9] != b'5')
     }
@@ -1085,18 +1176,18 @@ tr:hover {{ background: #f5f5f5; }}
                 // Stop signal received
                 reason = stop_rx.recv() => {
                     let reason = reason.unwrap_or(StopReason::Shutdown);
-                    
+
                     // For FileChange, deregister immediately so new requests create fresh project
                     if let StopReason::FileChange = reason {
                         crate::server::deregister_project(&self.domain, &self);
                     }
-                    
+
                     // Immediately transition to Stopped so new requests wait for restart
                     let _ = self.state_tx.send(AppState::Stopped);
                     self.kill_processes_by_ref(&mut children).await;
                     return reason;
                 }
-                
+
                 // Check for main process exit (first child is the main process)
                 result = async {
                     if let Some(main) = children.first_mut() {
@@ -1113,7 +1204,7 @@ tr:hover {{ background: #f5f5f5; }}
                     self.kill_processes_by_ref(&mut children).await;
                     return StopReason::ProcessExit;
                 }
-                
+
                 // Inactivity timeout
                 _ = async {
                     if let Some(deadline) = inactivity_deadline {
@@ -1291,7 +1382,8 @@ tr:hover {{ background: #f5f5f5; }}
             } else {
                 format!("{}/{}", dc.app_dir, mount)
             };
-            let host_path = self.dir
+            let host_path = self
+                .dir
                 .join("_webcentral_data/mounts")
                 .join(&container_path.trim_start_matches('/'));
             fs::create_dir_all(&host_path)?;
@@ -1317,8 +1409,7 @@ tr:hover {{ background: #f5f5f5; }}
         let proj = self.clone();
 
         // Canonicalize directory to resolve symlinks (inotify doesn't follow symlinks)
-        let watch_dir = std::fs::canonicalize(&self.dir)
-            .unwrap_or_else(|_| self.dir.clone());
+        let watch_dir = std::fs::canonicalize(&self.dir).unwrap_or_else(|_| self.dir.clone());
 
         // Watch files with callback
         file_watcher::Watcher::new()
@@ -1326,7 +1417,10 @@ tr:hover {{ background: #f5f5f5; }}
             .add_includes(&self.config.reload.include)
             .add_excludes(&self.config.reload.exclude)
             .run_debounced(100, move |path| {
-                proj.logger.write("supervisor", &format!("Stopping due to file changes: {}", path.display()));
+                proj.logger.write(
+                    "supervisor",
+                    &format!("Stopping due to file changes: {}", path.display()),
+                );
                 proj.request_stop(StopReason::FileChange);
             })
             .await?;
@@ -1351,7 +1445,9 @@ tr:hover {{ background: #f5f5f5; }}
     /// Get the project type name for dashboard display
     pub fn get_type_name(&self) -> String {
         match &self.config.project_type {
-            ProjectType::Application { docker: Some(_), .. } => "Docker",
+            ProjectType::Application {
+                docker: Some(_), ..
+            } => "Docker",
             ProjectType::Application { .. } => "Application",
             ProjectType::Static => "Static",
             ProjectType::Redirect { .. } => "Redirect",
@@ -1359,7 +1455,8 @@ tr:hover {{ background: #f5f5f5; }}
             ProjectType::TcpForward { .. } => "TCP Forward",
             ProjectType::UnixForward { .. } => "Unix Forward",
             ProjectType::Dashboard => "Dashboard",
-        }.to_string()
+        }
+        .to_string()
     }
 
     /// Get the current status for dashboard display
@@ -1381,7 +1478,7 @@ tr:hover {{ background: #f5f5f5; }}
                     AppState::Failed => "Failed".to_string(),
                 }
             }
-            _ => "Active".to_string()
+            _ => "Active".to_string(),
         }
     }
 
@@ -1402,7 +1499,10 @@ tr:hover {{ background: #f5f5f5; }}
 
     /// Get seconds since last activity (returns None if lock unavailable)
     pub fn get_idle_seconds(&self) -> Option<u64> {
-        self.last_activity.try_lock().ok().map(|guard| guard.elapsed().as_secs())
+        self.last_activity
+            .try_lock()
+            .ok()
+            .map(|guard| guard.elapsed().as_secs())
     }
 
     async fn proxy_upgrade(
@@ -1413,7 +1513,7 @@ tr:hover {{ background: #f5f5f5; }}
         let uri = req.uri().clone();
         let headers = req.headers().clone();
         let logger = self.logger.clone();
-        
+
         // Track this as an active upgrade to prevent inactivity timeout
         self.active_upgrades.fetch_add(1, Ordering::SeqCst);
         let project = self.clone();
@@ -1433,7 +1533,10 @@ tr:hover {{ background: #f5f5f5; }}
         };
 
         // Connect to backend
-        let io = connector.call(uri.clone()).await.map_err(|e| anyhow::anyhow!("Connector error: {}", e))?;
+        let io = connector
+            .call(uri.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Connector error: {}", e))?;
         let mut backend = io.into_tokio();
 
         // Build and send the upgrade request to backend
@@ -1525,13 +1628,18 @@ tr:hover {{ background: #f5f5f5; }}
                             .write_all(&response_buf[header_end..bytes_read])
                             .await
                         {
-                            logger.write("error", &format!("Failed to write excess data to client: {}", e));
+                            logger.write(
+                                "error",
+                                &format!("Failed to write excess data to client: {}", e),
+                            );
                             return;
                         }
                     }
 
                     // Pipe data bidirectionally
-                    tokio::io::copy_bidirectional(&mut upgraded, &mut backend).await.map(|_| ())
+                    tokio::io::copy_bidirectional(&mut upgraded, &mut backend)
+                        .await
+                        .map(|_| ())
                 }
                 Err(e) => {
                     logger.write("error", &format!("Client upgrade failed: {}", e));
@@ -1575,8 +1683,13 @@ fn get_free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     // Allow immediate port reuse - without this, ~5% failure rate in tests
     unsafe {
-        libc::setsockopt(listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR,
-            &1i32 as *const _ as _, std::mem::size_of::<i32>() as _);
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEADDR,
+            &1i32 as *const _ as _,
+            std::mem::size_of::<i32>() as _,
+        );
     }
     Ok(listener.local_addr()?.port())
 }
@@ -1589,19 +1702,22 @@ fn get_ownership(path: &Path) -> (u32, u32) {
 }
 
 fn get_user_home(uid: u32) -> PathBuf {
-    fs::read_to_string("/etc/passwd").ok()
-        .and_then(|s| s.lines()
-            .filter_map(|l| l.split(':').collect::<Vec<_>>().try_into().ok())
-            .find(|f: &[&str; 7]| f[2].parse::<u32>().ok() == Some(uid))
-            .map(|f| PathBuf::from(f[5])))
+    fs::read_to_string("/etc/passwd")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .filter_map(|l| l.split(':').collect::<Vec<_>>().try_into().ok())
+                .find(|f: &[&str; 7]| f[2].parse::<u32>().ok() == Some(uid))
+                .map(|f| PathBuf::from(f[5]))
+        })
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
 /// Returns the path to podman or docker, checking PATH on first call.
 /// Prefers podman if available, falls back to docker, warns if neither found.
 fn get_docker_path() -> &'static str {
-    use std::sync::OnceLock;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::OnceLock;
     static DOCKER_PATH: OnceLock<String> = OnceLock::new();
 
     DOCKER_PATH.get_or_init(|| {

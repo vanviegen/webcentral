@@ -1,12 +1,12 @@
-use tower::Service;
-use tokio::net::{TcpStream, UnixStream};
+use http::Uri;
+use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
+use hyper_util::rt::TokioIo;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use http::Uri;
-use hyper_util::client::legacy::connect::{HttpConnector, Connection, Connected};
-use hyper_util::rt::TokioIo;
 use tokio::io::ReadBuf;
+use tokio::net::{TcpStream, UnixStream};
+use tower::Service;
 
 #[derive(Clone, Debug)]
 pub enum AnyConnector {
@@ -116,7 +116,10 @@ impl hyper::rt::Write for AnyStream {
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
             AnyStream::Http(s) => Pin::new(s).poll_shutdown(cx),
             AnyStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
@@ -166,7 +169,10 @@ impl tokio::io::AsyncWrite for AnyTokioStream {
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
             AnyTokioStream::Http(s) => Pin::new(s).poll_shutdown(cx),
             AnyTokioStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),

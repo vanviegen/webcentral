@@ -167,25 +167,41 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
     let project_type = if ini_map.fetch("type").as_deref() == Some("dashboard") {
         ProjectType::Dashboard
     } else if let Some(target) = ini_map.fetch("redirect") {
-        ProjectType::Redirect { target: target.trim_end_matches('/').to_string() }
+        ProjectType::Redirect {
+            target: target.trim_end_matches('/').to_string(),
+        }
     } else if let Some(target) = ini_map.fetch("proxy") {
         ProjectType::Proxy { target }
     } else if let Some(socket_path) = ini_map.fetch("socket_path") {
         ProjectType::UnixForward { socket_path }
     } else if let Some(port) = ini_map.fetch_parse::<i32>("port") {
-        let host = ini_map.fetch("host").unwrap_or_else(|| "localhost".to_string());
-        ProjectType::TcpForward { address: format!("{}:{}", host, port) }
+        let host = ini_map
+            .fetch("host")
+            .unwrap_or_else(|| "localhost".to_string());
+        ProjectType::TcpForward {
+            address: format!("{}:{}", host, port),
+        }
     } else if let Some(host) = ini_map.fetch("host") {
         let port = ini_map.fetch_parse_default("port", 80);
-        ProjectType::TcpForward { address: format!("{}:{}", host, port) }
-    } else if ini_map.map.contains_key("command") || ini_map.map.keys().any(|k| k.starts_with("docker.")) {
+        ProjectType::TcpForward {
+            address: format!("{}:{}", host, port),
+        }
+    } else if ini_map.map.contains_key("command")
+        || ini_map.map.keys().any(|k| k.starts_with("docker."))
+    {
         let command = ini_map.fetch("command").unwrap_or_default();
 
         let mut workers = HashMap::new();
         if let Some(worker_cmd) = ini_map.fetch("worker") {
             workers.insert("default".to_string(), worker_cmd);
         }
-        for key in ini_map.map.keys().filter(|k| k.starts_with("worker:")).cloned().collect::<Vec<_>>() {
+        for key in ini_map
+            .map
+            .keys()
+            .filter(|k| k.starts_with("worker:"))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
             if let Some(cmd) = ini_map.fetch(&key) {
                 workers.insert(key[7..].to_string(), cmd);
             }
@@ -193,11 +209,15 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
 
         let docker = if ini_map.map.keys().any(|k| k.starts_with("docker.")) {
             Some(DockerConfig {
-                base: ini_map.fetch("docker.base").unwrap_or_else(|| "alpine".to_string()),
+                base: ini_map
+                    .fetch("docker.base")
+                    .unwrap_or_else(|| "alpine".to_string()),
                 packages: ini_map.fetch_array("docker.packages"),
                 commands: ini_map.fetch_array("docker.commands"),
                 http_port: ini_map.fetch_parse_default("docker.http_port", 8000),
-                app_dir: ini_map.fetch("docker.app_dir").unwrap_or_else(|| "/app".to_string()),
+                app_dir: ini_map
+                    .fetch("docker.app_dir")
+                    .unwrap_or_else(|| "/app".to_string()),
                 mount_app_dir: ini_map.fetch_bool("docker.mount_app_dir").unwrap_or(true),
                 mounts: ini_map.fetch_array("docker.mounts"),
             })
@@ -205,7 +225,11 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
             None
         };
 
-        ProjectType::Application { command, docker, workers }
+        ProjectType::Application {
+            command,
+            docker,
+            workers,
+        }
     } else {
         ProjectType::Static
     };
@@ -310,12 +334,20 @@ pub enum ProjectType {
     // Static file server (serves from public/ directory)
     Static,
     // HTTP redirect
-    Redirect { target: String, },
+    Redirect {
+        target: String,
+    },
     // Reverse proxy to external URL
-    Proxy { target: String },
+    Proxy {
+        target: String,
+    },
     // Forward to local port or unix socket
-    UnixForward { socket_path: String },
-    TcpForward { address: String },
+    UnixForward {
+        socket_path: String,
+    },
+    TcpForward {
+        address: String,
+    },
     // Dashboard showing server status
     Dashboard,
 }
@@ -354,7 +386,7 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "node_modules",
     "*.bak",
     "*.sw?", // vim swap files
-    ".*", // hidden files
+    ".*",    // hidden files
     "data",
     "*.log",
     "log",
@@ -379,7 +411,6 @@ impl Default for ReloadConfig {
         }
     }
 }
-
 
 impl ProjectConfig {
     pub fn load(dir: &Path) -> Result<Self> {
@@ -469,5 +500,3 @@ impl ProjectConfig {
         ))
     }
 }
-
-
