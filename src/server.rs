@@ -190,6 +190,12 @@ pub struct Server {
 }
 
 impl Server {
+    fn certificate_domains(domain: &str) -> Vec<&str> {
+        // Keep certificate issuance scoped to the configured domain.
+        // redirect_www only affects host routing/redirect behavior.
+        vec![domain]
+    }
+
     pub async fn new(config: crate::GlobalConfig) -> Result<Self> {
         // Initialize SERVER_START_TIME, as otherwise it will initialize when we first open the dashoard
         let _ = *SERVER_START_TIME;
@@ -960,21 +966,10 @@ impl Server {
                 }
             };
 
-            // When redirect_www is enabled, include the www. variant as a SAN in the
-            // same certificate so the TLS handshake succeeds before the redirect fires.
-            let www_domain = if self.config.redirect_www && !domain.starts_with("www.") {
-                Some(format!("www.{}", domain))
-            } else {
-                None
-            };
-
             let mut backoff_time = 15 * 60; // 15 minutes
             loop {
                 CERT_STATUS.insert(domain.clone(), "Acquiring".to_string());
-                let domains: Vec<&str> = match &www_domain {
-                    Some(www) => vec![&domain, www.as_str()],
-                    None => vec![&domain],
-                };
+                let domains = Self::certificate_domains(&domain);
                 match cert_manager.acquire_certificate(&domains).await {
                     Ok(_) => {
                         CERT_STATUS.insert(domain.clone(), "Valid".to_string());
@@ -1039,4 +1034,21 @@ fn to_jittered_duration(seconds: i32) -> std::time::Duration {
     std::time::Duration::from_secs(
         ((seconds as f64 * rand::rng().random_range(0.9..=1.1)).max(0.0)).round() as u64,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Server;
+
+    #[test]
+    fn certificate_domains_does_not_add_www_for_subdomain() {
+        let domains = Server::certificate_domains("wildtest.vanviegen.net");
+        assert_eq!(domains, vec!["wildtest.vanviegen.net"]);
+    }
+
+    #[test]
+    fn certificate_domains_does_not_add_www_for_apex() {
+        let domains = Server::certificate_domains("example.com");
+        assert_eq!(domains, vec!["example.com"]);
+    }
 }
