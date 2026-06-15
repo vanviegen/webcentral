@@ -909,11 +909,23 @@ tr:hover {{ background: #f5f5f5; }}
                         // in case we missed a notification
                         tokio::select! {
                             reason = stop_rx.recv() => {
-                                if let Some(StopReason::Shutdown) = reason {
-                                    self.logger.write("supervisor", "Shutdown requested");
-                                    return;
+                                match reason {
+                                    Some(StopReason::Shutdown) | None => {
+                                        self.logger.write("supervisor", "Shutdown requested");
+                                        return;
+                                    }
+                                    Some(StopReason::FileChange) => {
+                                        // Config/files changed while idle. Deregister so the next
+                                        // request builds a fresh project with the new config, and
+                                        // stop watching so this (now orphaned) instance goes away.
+                                        crate::server::deregister_project(&self.domain, &self);
+                                        self.logger.write("supervisor", "Stopped app (file change while idle)");
+                                        self.stop_watcher();
+                                        return;
+                                    }
+                                    // Inactivity/ProcessExit are meaningless while already stopped.
+                                    _ => {}
                                 }
-                                // Other stop reasons in Stopped state - ignore
                             }
                             _ = self.state_changed.notified() => {
                                 // Got notification, loop back to check pending_requests
@@ -1013,6 +1025,7 @@ tr:hover {{ background: #f5f5f5; }}
                     match stop_reason {
                         StopReason::Shutdown => {
                             self.logger.write("supervisor", "Stopped app (shutdown)");
+                            self.stop_watcher();
                             return;
                         }
                         StopReason::FileChange => {
@@ -1346,6 +1359,15 @@ tr:hover {{ background: #f5f5f5; }}
     /// Stop this project (for server shutdown)
     pub fn stop(self: Arc<Self>) {
         self.request_stop(StopReason::Shutdown);
+    }
+
+    /// Fully tear down this project: abort its file watcher and tell its lifecycle/stop-listener
+    /// task to exit. Called when the domain is removed or re-registered (its `DomainInfo` is
+    /// dropped), so a replaced project doesn't keep a zombie watcher running on the same
+    /// directory (which would log spurious file-change events and leak the lifecycle task).
+    pub fn shutdown(&self) {
+        self.request_stop(StopReason::Shutdown);
+        self.stop_watcher();
     }
 
     /// Get the project type name for dashboard display

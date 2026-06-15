@@ -54,6 +54,12 @@ impl Drop for DomainInfo {
         if let Some(cert_task) = self.cert_task.take() {
             cert_task.abort();
         }
+        // Tear down the project so its file watcher and lifecycle task don't keep running
+        // after the domain is removed or re-registered (otherwise they become zombies that
+        // log spurious "Stopping due to file changes" and never get cleaned up).
+        if let Some(project) = self.project.take() {
+            project.shutdown();
+        }
     }
 }
 
@@ -856,9 +862,6 @@ impl Server {
         self: &Arc<Self>,
         path: &std::path::Path,
     ) {
-        if !path.is_dir() {
-            return; // Not a directory (is_dir follows symlinks)
-        }
         let Some(domain_name) = path.file_name().and_then(|n| n.to_str()) else {
             return ; // Shouldn't happen?
         };
@@ -867,17 +870,22 @@ impl Server {
         }
         let domain = domain_name.to_lowercase();
 
-        if !path.exists() {
-            // Handle deletion
-            if DOMAINS.contains_key(&domain) {
-                println!("Domain {} removed ({:?})", domain, path.to_string_lossy());
-                DOMAINS.remove(&domain);
-                self.schedule_write_bindings();
+        let directory = path.to_string_lossy().to_string();
+
+        if !path.is_dir() {
+            // Path is gone (or no longer a directory; is_dir follows symlinks). Handle deletion,
+            // but only if the registered project is the one for this directory - otherwise a
+            // stale delete event could tear down a project that was since re-registered elsewhere.
+            if let Some(existing) = DOMAINS.get(&domain) {
+                if existing.directory == directory {
+                    drop(existing);
+                    println!("Domain {} removed ({:?})", domain, directory);
+                    DOMAINS.remove(&domain); // Dropping the DomainInfo shuts down its project
+                    self.schedule_write_bindings();
+                }
             }
             return;
         }
-        
-        let directory = path.to_string_lossy().to_string();
         
         // Check if domain exists and if transfer is allowed
         if let Some(existing) = DOMAINS.get(&domain) {

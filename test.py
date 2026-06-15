@@ -835,6 +835,82 @@ def test_application_restarts_after_timeout(t):
     t.await_log('Ready on port')
 
 
+def _count_file_change_msgs(t):
+    t.mark_log_read()
+    t.write_file('webcentral.ini',
+                 f'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=300\n# {time.time()}')
+    time.sleep(0.6)  # allow debounce (100ms) + processing
+    content = t.get_log_content(t.current_test_domain,
+                                t.log_positions.get(t.current_test_domain, 0))
+    return content.count('Stopping due to file changes')
+
+
+@test
+def test_deleted_project_directory_is_removed(t):
+    """Removing a project directory deregisters the domain (404 afterwards)."""
+    domain = t.current_test_domain
+    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=300')
+    t.write_file('index.html', 'hi')
+    t.assert_http('/', check_body='hi')
+    t.await_log('Ready on port', timeout=5)
+
+    # Remove the project directory (simulating undeploy)
+    ddir = os.path.join(t.tmpdir, domain)
+    shutil.rmtree(ddir)
+
+    # The directory watcher should notice and deregister the domain.
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        try:
+            t.assert_http('/', check_code=404)
+            break
+        except AssertionError:
+            time.sleep(0.1)
+    else:
+        raise AssertionError("domain still served after its directory was removed")
+
+
+@test
+def test_idle_app_picks_up_config_change(t):
+    """A config change while the app is idle (stopped) must take effect on next request."""
+    t.write_file('index.html', 'VERSION ONE')
+    t.write_file('webcentral.ini',
+                 'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=1')
+    # Start the application and serve v1
+    t.assert_http('/', check_body='VERSION ONE')
+    t.await_log('Ready on port', timeout=5)
+    # Let it go fully idle (stopped)
+    t.await_log('Stopping due to inactivity', timeout=3)
+    t.mark_log_read()
+    # Change config while idle: turn the project into a redirect
+    t.write_file('webcentral.ini', 'redirect=http://example.com/')
+    t.await_log('Stopping due to file changes', timeout=3)
+    time.sleep(0.3)
+    # Next request must use the NEW config (a 301 redirect), not restart the old app
+    t.assert_http('/', check_code=301, check_header=('Location', 'http://example.com/'))
+
+
+@test
+def test_watcher_leak_on_running_reload(t):
+    """Repeated reload-while-running cycles must not accumulate file watchers."""
+    t.write_file('webcentral.ini',
+                 'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=300')
+    t.write_file('index.html', '<h1>Leak Test</h1>')
+
+    for i in range(6):
+        # Trigger start (project is Running, long inactivity timeout)
+        t.assert_http('/', check_body='Leak Test')
+        t.await_log('Ready on port', timeout=5)
+        # Change config while Running -> deregister + reload
+        n = _count_file_change_msgs(t)
+        print(f"\n  cycle {i}: {n} 'file changes' message(s)")
+        t.await_log('Stopped app (file change)', timeout=3)
+        if n > 1:
+            raise AssertionError(
+                f"cycle {i}: expected exactly 1 'Stopping due to file changes' "
+                f"message per touch, got {n} (leaked watchers)")
+
+
 @test
 def test_no_command_serves_static_only(t):
     """Project without command serves only static files"""
