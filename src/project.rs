@@ -684,8 +684,10 @@ tr:hover {{ background: #f5f5f5; }}
             Ok(resp) => resp,
             Err(e) => {
                 if e.is_connect() {
-                    // Upstream refused connection - stop the project and return specific error
-                    self.clone().stop();
+                    // Upstream unreachable. ProcessExit (not Shutdown) so an Application's
+                    // lifecycle restarts it on the next request instead of exiting permanently;
+                    // harmlessly ignored by proxy/forward stop-listeners.
+                    self.request_stop(StopReason::ProcessExit);
                     let source = StdError::source(&e).map(|s| s.to_string()).unwrap_or_default();
                     anyhow::bail!("502 upstream connect failed: {}", source);
                 }
@@ -713,26 +715,19 @@ tr:hover {{ background: #f5f5f5; }}
 
     /// Wait for application to be ready, tracking the request.
     /// On success, caller MUST call untrack_request() when done.
+    ///
+    /// No timeout here on purpose: the lifecycle always resolves to Running or Failed (it gives up
+    /// after `startup_deadline`), so a slow startup is left to finish and the client's own timeout
+    /// applies instead of us forcing a premature error.
     async fn wait_for_app_ready(&self) -> Result<()> {
         self.track_request();
-        
-        let state = {
-            let mut rx = self.state_rx.clone();
-            let wait_result = tokio::time::timeout(
-                Duration::from_secs(30),
-                rx.wait_for(|&s| s == AppState::Running || s == AppState::Failed)
-            ).await;
 
-            match wait_result {
-                Ok(Ok(s)) => *s,
-                Ok(Err(_)) => {
-                    self.untrack_request();
-                    anyhow::bail!("Application state channel closed");
-                }
-                Err(_) => {
-                    self.untrack_request();
-                    anyhow::bail!("Application startup timeout");
-                }
+        let mut rx = self.state_rx.clone();
+        let state = match rx.wait_for(|&s| s == AppState::Running || s == AppState::Failed).await {
+            Ok(s) => *s,
+            Err(_) => {
+                self.untrack_request();
+                anyhow::bail!("Application state channel closed");
             }
         };
 
@@ -884,15 +879,15 @@ tr:hover {{ background: #f5f5f5; }}
     }
 
     /// Main lifecycle state machine for Application projects.
-    /// Manages: Stopped -> Starting -> Running -> (stop trigger) -> Stopped cycle
-    /// On startup failure (twice), transitions to Failed and deregisters.
+    /// Manages: Stopped -> Starting -> Running -> (stop trigger) -> Stopped cycle.
+    /// On startup failure (not ready within startup_deadline) -> Failed -> deregister; the next
+    /// request builds a fresh project.
     async fn lifecycle_task(self: Arc<Self>, mut stop_rx: mpsc::Receiver<StopReason>) {
         let timeout_duration = if self.config.reload.timeout > 0 {
             Some(Duration::from_secs(self.config.reload.timeout as u64))
         } else {
             None
         };
-        let mut retry_count = 0;
 
         loop {
             let state = *self.state_rx.borrow();
@@ -946,16 +941,8 @@ tr:hover {{ background: #f5f5f5; }}
                     let mut children = match self.spawn_processes().await {
                         Ok(c) => c,
                         Err(e) => {
-                            self.logger.write("supervisor", &format!("Failed to spawn: {}", e));
-                            retry_count += 1;
-                            if retry_count >= 2 {
-                                self.logger.write("supervisor", "Startup failed twice, giving up");
-                                let _ = self.state_tx.send(AppState::Failed);
-                            } else {
-                                self.logger.write("supervisor", "Will retry once");
-                                // Brief delay before retry
-                                sleep(Duration::from_millis(500)).await;
-                            }
+                            self.logger.write("supervisor", &format!("Failed to spawn: {}; giving up", e));
+                            let _ = self.state_tx.send(AppState::Failed);
                             continue;
                         }
                     };
@@ -998,15 +985,11 @@ tr:hover {{ background: #f5f5f5; }}
                     };
 
                     if !port_ready {
+                        // Single attempt: terminate and give up. Failed fails waiting requests; a
+                        // later request rebuilds.
+                        self.logger.write("supervisor", "Startup failed; terminating application and giving up");
                         self.kill_processes_by_ref(&mut children).await;
-                        retry_count += 1;
-                        if retry_count >= 2 {
-                            self.logger.write("supervisor", "Startup failed twice, giving up");
-                            let _ = self.state_tx.send(AppState::Failed);
-                        } else {
-                            self.logger.write("supervisor", "Will retry once");
-                            sleep(Duration::from_millis(500)).await;
-                        }
+                        let _ = self.state_tx.send(AppState::Failed);
                         continue;
                     }
 
@@ -1016,7 +999,6 @@ tr:hover {{ background: #f5f5f5; }}
                         conn.as_ref().map(|c| c.port).unwrap_or(0)
                     };
                     self.logger.write("supervisor", &format!("Ready on port {}", port));
-                    retry_count = 0;
                     let _ = self.state_tx.send(AppState::Running);
                     
                     // Run until stop trigger or process exit
@@ -1047,8 +1029,10 @@ tr:hover {{ background: #f5f5f5; }}
                 }
                 
                 AppState::Running => {
-                    // Should not reach here - run_until_stop handles Running state
-                    unreachable!("lifecycle_task in Running state outside run_until_stop");
+                    // Shouldn't happen (run_until_stop owns Running). Recover instead of panicking,
+                    // which would kill the lifecycle task and wedge the project.
+                    self.logger.write("supervisor", "Unexpected Running state in lifecycle; resetting to Stopped");
+                    let _ = self.state_tx.send(AppState::Stopped);
                 }
                 
                 AppState::Failed => {
@@ -1176,8 +1160,11 @@ tr:hover {{ background: #f5f5f5; }}
             tokio::select! {
                 _ = child.wait() => {}
                 _ = sleep(remaining) => {
-                    let _ = child.kill();
-                    let _ = child.wait().await;
+                    // start_kill() (sync) actually sends SIGKILL; Child::kill() is async and a
+                    // no-op if its future is dropped unawaited.
+                    let _ = child.start_kill();
+                    // Bound the reap: an unkillable (D-state) process must not freeze the lifecycle.
+                    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
                 }
             }
         }

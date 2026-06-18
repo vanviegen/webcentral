@@ -599,25 +599,25 @@ command=python3 -u server.py
 startup_deadline=5
 ''')
     
-    # Request should timeout. The lifecycle should detect the hung port probe
-    # within ~2s (probe timeout) and try again, eventually failing after 5s.
-    # For this test, we just verify the timeout is logged and the request fails.
+    # Request should fail. The lifecycle makes a single startup attempt bounded by
+    # startup_deadline (5s here); when the port never becomes ready it terminates the app and
+    # gives up (-> Failed), which fails the waiting request.
     start_time = time.time()
     try:
         t.assert_http('/', check_code=200, timeout=20)
     except Exception as e:
         elapsed = time.time() - start_time
-        # Should take roughly 10s (5s deadline * 2 retries) but complete, not hang forever
-        if elapsed < 8:
-            raise AssertionError(f"Timeout too quick ({elapsed:.1f}s), expected ~10s")
-        if elapsed > 25:
-            raise AssertionError(f"Timeout too slow ({elapsed:.1f}s), lifecycle may be stuck")
+        # Should fail in roughly one startup_deadline (~5-7s), not hang forever.
+        if elapsed < 3:
+            raise AssertionError(f"Failed too quick ({elapsed:.1f}s), expected ~one 5s deadline")
+        if elapsed > 15:
+            raise AssertionError(f"Failed too slow ({elapsed:.1f}s), lifecycle may be stuck")
     else:
         raise AssertionError("Expected HTTP request to fail due to startup timeout")
-    
-    # Verify we saw the timeout log
-    t.await_log('Port', timeout=2)  # "Port X did not become ready within 5s"
+
+    # Verify we saw the deadline + give-up logs
     t.await_log('did not become ready', timeout=2)
+    t.await_log('giving up', timeout=2)
 
 
 @test
@@ -812,6 +812,81 @@ def test_application_stops_on_inactivity(t):
 
     # Wait for timeout (1 second + some buffer)
     t.await_log('Stopping due to inactivity', timeout=3)
+
+
+@test
+def test_application_recovers_after_connect_refused(t):
+    """If a running app's port dies (but the process lingers), the next requests recreate it."""
+    # App serves normally; a request to /die makes it stop listening while the process stays
+    # alive (so process-exit detection doesn't fire) - the classic "connect refused while Running".
+    app = (
+        "import os, http.server, socketserver, threading, time\n"
+        "PORT = int(os.environ['PORT'])\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200); self.end_headers()\n"
+        "        if self.path == '/die':\n"
+        "            self.wfile.write(b'dying')\n"
+        "            threading.Thread(target=lambda: (time.sleep(0.2), self.server.shutdown())).start()\n"
+        "        else:\n"
+        "            self.wfile.write(b'alive')\n"
+        "    def log_message(self, *a): pass\n"
+        "srv = socketserver.TCPServer(('', PORT), H)\n"
+        "srv.serve_forever()\n"
+        "srv.server_close()\n"   # port closed, but process stays alive below
+        "time.sleep(3600)\n"
+    )
+    t.write_file('app.py', app)
+    t.write_file('webcentral.ini', 'command=python3 -u app.py\n\n[reload]\ntimeout=300')
+
+    t.assert_http('/', check_body='alive', timeout=10)
+    t.await_log('Ready on port', timeout=5)
+
+    # Make the app stop listening (process stays alive).
+    t.assert_http('/die', check_body='dying')
+    time.sleep(0.6)
+    t.mark_log_read()
+
+    # Next request hits the dead port -> connect refused -> lifecycle restarts (not bricked).
+    t.assert_http('/', check_code=502)
+    t.await_log('upstream connect failed', timeout=3)
+
+    # A subsequent request must rebuild and serve again.
+    t.assert_http('/', check_body='alive', timeout=10)
+    t.await_log('Ready on port', timeout=8)
+
+
+@test
+def test_sigterm_ignoring_process_is_killed_not_wedged(t):
+    """A process that ignores SIGTERM must be SIGKILLed; the lifecycle must not freeze."""
+    # App that ignores SIGTERM and keeps serving. `exec` makes the shell replace itself with
+    # python so the process webcentral tracks is the one ignoring SIGTERM.
+    app = (
+        "import signal, os, http.server, socketserver\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "PORT = int(os.environ['PORT'])\n"
+        "class H(http.server.BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200); self.end_headers(); self.wfile.write(b'alive')\n"
+        "    def log_message(self, *a): pass\n"
+        "socketserver.TCPServer(('', PORT), H).serve_forever()\n"
+    )
+    t.write_file('app.py', app)
+    t.write_file('webcentral.ini', 'command=exec python3 -u app.py\n\n[reload]\ntimeout=1')
+
+    # Start and serve
+    t.assert_http('/', check_body='alive', timeout=10)
+    t.await_log('Ready on port', timeout=5)
+
+    # Inactivity fires -> SIGTERM (ignored) -> must escalate to SIGKILL within the 5s grace,
+    # rather than blocking the lifecycle task forever on child.wait().
+    t.await_log('Stopping due to inactivity', timeout=4)
+    t.await_log('Stopped app (inactivity)', timeout=10)
+    t.mark_log_read()
+
+    # The lifecycle survived the kill: a new request restarts and serves.
+    t.assert_http('/', check_body='alive', timeout=10)
+    t.await_log('Ready on port', timeout=8)
 
 
 @test

@@ -417,6 +417,16 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-06-15 (2.4.16):
+  - Fix a freeze where a process ignoring SIGTERM was never SIGKILLed (the async `kill()` future was dropped), wedging the lifecycle so the app could not restart or reload
+  - Process kills can no longer block the lifecycle indefinitely
+  - Restart an app whose port has become unreachable on the next request, instead of disabling the domain
+  - Single startup attempt bounded by `startup_deadline` (default 30s → 60s); no forced early error while a startup is still in progress
+
+2026-06-15 (2.4.15):
+  - Tear down a domain's watcher and lifecycle on removal/re-registration, instead of leaking zombie watchers
+  - Reload config changed while an app is idle, and deregister a domain when its directory is deleted
+
 2026-06-01 (2.4.14):
   - Add www-prefixed variant to certificate for redirect
   - Updates deps

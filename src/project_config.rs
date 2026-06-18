@@ -237,7 +237,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
         environment: ini_map.fetch_prefix("environment"),
         reload: ReloadConfig {
             timeout: ini_map.fetch_parse_default("reload.timeout", 300),
-            startup_deadline: ini_map.fetch_parse_default("startup_deadline", 30),
+            startup_deadline: ini_map.fetch_parse_default("startup_deadline", 60),
             include,
             exclude,
         },
@@ -373,7 +373,7 @@ impl Default for ReloadConfig {
     fn default() -> Self {
         ReloadConfig {
             timeout: 300,
-            startup_deadline: 30,
+            startup_deadline: 60,
             include: Vec::new(),
             exclude: Vec::new(),
         }
