@@ -198,8 +198,32 @@ WantedBy=multi-user.target
     Ok(())
 }
 
+/// Raise the open-file soft limit to the hard limit.
+///
+/// systemd gives services a soft limit of 1024 by default (for compatibility with select(2)),
+/// which a reverse proxy exhausts easily: every client connection, every upstream connection,
+/// every child process pipe and every file watcher costs descriptors. Hitting the limit makes
+/// accept() fail with EMFILE, so raise it as far as the hard limit allows.
+fn raise_fd_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+
+    match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok((soft, hard)) if soft < hard => {
+            if let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
+                eprintln!("Failed to raise open file limit from {} to {}: {}", soft, hard, e);
+            } else {
+                println!("Raised open file limit from {} to {}", soft, hard);
+            }
+        }
+        Ok((soft, _)) => println!("Open file limit: {}", soft),
+        Err(e) => eprintln!("Failed to read open file limit: {}", e),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    raise_fd_limit();
+
     // Install rustls crypto provider (needed when multiple providers available, e.g. with HTTP/3)
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()

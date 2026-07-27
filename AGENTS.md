@@ -50,6 +50,12 @@ Non-Application types (Static, Proxy, Forward, Redirect) don't have a lifecycle_
 - Directory watcher - Detects new/removed project directories
 - Certificate acquisition - One task per domain, deduplicated via atomic flag
 
+Accept loops must never return on an `accept()` error: that drops the `TcpListener` and stops
+listening for the rest of the process lifetime, while the process stays alive so systemd's
+`Restart=always` never fires. Errors go to `handle_accept_error`, which retries and backs off
+500ms on resource exhaustion (retrying immediately would spin, as the pending connection keeps
+the listener readable). `main` also raises `RLIMIT_NOFILE` to the hard limit at startup.
+
 ### Synchronization
 
 **Project-level:**

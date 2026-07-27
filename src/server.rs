@@ -374,7 +374,13 @@ impl Server {
 
     async fn run_http_server(self: Arc<Self>, listener: TcpListener) -> Result<()> {
         loop {
-            let (stream, addr) = listener.accept().await?;
+            let (stream, addr) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    handle_accept_error("HTTP", e).await;
+                    continue;
+                }
+            };
             let server = self.clone();
 
             tokio::spawn(async move {
@@ -418,7 +424,13 @@ impl Server {
         let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
         loop {
-            let (stream, addr) = listener.accept().await?;
+            let (stream, addr) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    handle_accept_error("HTTPS", e).await;
+                    continue;
+                }
+            };
             let acceptor = acceptor.clone();
             let server = self.clone();
 
@@ -1039,6 +1051,33 @@ impl rustls::server::ResolvesServerCert for CertResolver {
             certs,
             signing_key,
         )))
+    }
+}
+
+/// Handle an error from `TcpListener::accept()` without leaving the accept loop.
+///
+/// An accept error is never fatal to the listening socket, but returning from the accept loop
+/// would drop the `TcpListener` and stop listening for the rest of the process lifetime - while
+/// the process itself stays alive, so systemd's `Restart=always` never kicks in and the port
+/// silently disappears until someone restarts it manually.
+///
+/// Per-connection errors (ECONNABORTED, and the Linux "pending network error" family that
+/// accept(2) says to treat like EAGAIN) are retried immediately. Resource exhaustion is retried
+/// after a delay: the pending connection stays in the accept queue and keeps the listener
+/// readable, so retrying immediately would spin a core at 100% without making progress.
+async fn handle_accept_error(proto: &str, e: std::io::Error) {
+    let exhausted = matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM)
+    );
+    eprintln!(
+        "{} accept error: {}{}",
+        proto,
+        e,
+        if exhausted { " (retrying in 500ms)" } else { " (retrying)" }
+    );
+    if exhausted {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 

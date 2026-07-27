@@ -2670,6 +2670,106 @@ def test_websocket_inactivity(t):
     client.close()
 
 
+@test
+def test_listener_survives_accept_error(t):
+    """A transient accept() error must not permanently close the listening socket.
+
+    The accept loops use `listener.accept().await?`, so any errno propagates out of the loop,
+    ends the task and drops the TcpListener - the port stops listening for the rest of the
+    process lifetime while the process itself stays alive (so systemd never restarts it).
+    Reproduced by running a webcentral instance under a low RLIMIT_NOFILE and exhausting its
+    descriptors with concurrent connections, which makes accept() fail with EMFILE.
+    """
+    import resource
+
+    root = tempfile.mkdtemp(prefix='webcentral-fdlimit-')
+    domain = 'fdlimit.test'
+    public = os.path.join(root, 'projects', domain, 'public')
+    os.makedirs(public)
+    with open(os.path.join(public, 'index.html'), 'w') as f:
+        f.write('still alive')
+
+    port = t.find_free_port()
+    log_path = os.path.join(root, 'webcentral.log')
+    log_f = open(log_path, 'w')
+
+    def limit_fds():
+        resource.setrlimit(resource.RLIMIT_NOFILE, (96, 96))
+
+    proc = subprocess.Popen(
+        ['./webcentral',
+         '--projects', os.path.join(root, 'projects'),
+         '--http', str(port), '--https', '0',
+         '--data-dir', os.path.join(root, 'data'),
+         '--firejail', 'false'],
+        stdout=log_f, stderr=subprocess.STDOUT,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+        preexec_fn=limit_fds,
+    )
+
+    def fetch(timeout=2):
+        conn = http.client.HTTPConnection('localhost', port, timeout=timeout)
+        try:
+            conn.request('GET', '/', headers={'Host': domain})
+            return conn.getresponse().read().decode('utf-8')
+        finally:
+            conn.close()
+
+    def read_log():
+        log_f.flush()
+        with open(log_path) as f:
+            return f.read()
+
+    def wait_serving(deadline):
+        last = None
+        while time.time() < deadline:
+            try:
+                body = fetch()
+                if body == 'still alive':
+                    return None
+                last = AssertionError(f"unexpected body {body!r}")
+            except Exception as e:
+                last = e
+            time.sleep(0.1)
+        return last
+
+    try:
+        err = wait_serving(time.time() + 15)
+        if err is not None:
+            raise AssertionError(f"instance never started serving ({err!r})\n{read_log()}")
+
+        # Exhaust the server's descriptors so accept() fails with EMFILE
+        hogs = []
+        try:
+            for _ in range(400):
+                hogs.append(socket.create_connection(('localhost', port), timeout=2))
+        except OSError:
+            pass
+        time.sleep(1)
+        for s in hogs:
+            s.close()
+
+        if proc.poll() is not None:
+            raise AssertionError(f"webcentral exited entirely (rc={proc.returncode})\n{read_log()}")
+
+        # With the pressure gone, the listener must still accept connections
+        err = wait_serving(time.time() + 10)
+        if err is not None:
+            raise AssertionError(
+                f"port {port} no longer accepts connections after a transient accept() error "
+                f"({err!r}), while the process is still running\n"
+                f"--- webcentral log ---\n{read_log()[-2000:]}")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_f.close()
+        shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run webcentral tests')
     parser.add_argument('--firejail', type=str, choices=['true', 'false'], default='true',

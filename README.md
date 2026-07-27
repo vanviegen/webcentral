@@ -417,6 +417,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-07-27 (2.4.17):
+  - Fix the HTTP/HTTPS listeners permanently going away after a transient `accept()` error (such as `EMFILE`): the accept loop returned, dropping the listening socket, while the process stayed alive so systemd never restarted it. Accept errors are now logged and retried, backing off 500ms on resource exhaustion
+  - Raise the open-file soft limit to the hard limit at startup, since systemd defaults services to 1024
+
 2026-06-15 (2.4.16):
   - Fix a freeze where a process ignoring SIGTERM was never SIGKILLed (the async `kill()` future was dropped), wedging the lifecycle so the app could not restart or reload
   - Process kills can no longer block the lifecycle indefinitely
