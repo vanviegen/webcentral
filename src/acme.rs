@@ -71,70 +71,63 @@ impl CertManager {
         Ok(account)
     }
 
-    pub async fn acquire_certificate(&self, domains: &[&str]) -> Result<()> {
-        let primary = domains[0];
-        println!("Acquiring certificate for {}", domains.join(", "));
+    pub async fn acquire_certificate(&self, domain: &str) -> Result<()> {
+        println!("Acquiring certificate for {}", domain);
 
         let account = self.get_or_create_account().await?;
 
-        // Create new order with all domains as identifiers
-        let identifiers: Vec<Identifier> = domains
-            .iter()
-            .map(|d| Identifier::Dns(d.to_string()))
-            .collect();
+        let identifiers = [Identifier::Dns(domain.to_string())];
         let order_result = account
             .new_order(&NewOrder::new(&identifiers))
             .await;
-            
+
         let mut order = match order_result {
             Ok(o) => o,
             Err(e) => {
-                eprintln!("Failed to create certificate order for {}: {:?}", domains.join(", "), e);
-                return Err(anyhow::anyhow!("Failed to create new ACME order for {}", domains.join(", ")));
+                eprintln!("Failed to create certificate order for {}: {:?}", domain, e);
+                return Err(anyhow::anyhow!("Failed to create new ACME order for {}", domain));
             }
         };
 
-        // Get authorizations and store tokens for later cleanup
-        let mut authorizations = order.authorizations();
-        let mut tokens_to_clean = Vec::new();
+        // A single-identifier order yields exactly one authorization. The authorization borrows
+        // `order` mutably, so it must go out of scope before the order can be polled below.
+        let (token, ready_result) = {
+            let mut authorizations = order.authorizations();
+            let mut authz = authorizations
+                .next()
+                .await
+                .with_context(|| format!("No authorization returned for {}", domain))?
+                .with_context(|| format!("Failed to get authorization for {}", domain))?;
 
-        while let Some(result) = authorizations.next().await {
-            let mut authz = result.with_context(|| format!("Failed to get authorization for {}", primary))?;
-
-            // Find HTTP-01 challenge
             let mut challenge = authz
                 .challenge(ChallengeType::Http01)
-                .with_context(|| format!("No HTTP-01 challenge found for {}", primary))?;
+                .with_context(|| format!("No HTTP-01 challenge found for {}", domain))?;
 
             let token = challenge.token.clone();
             let key_auth = challenge.key_authorization();
-            
-            // Store challenge for HTTP-01 server to serve
-            {
-                let mut challenges = self.challenges.write().await;
-                challenges.insert(token.clone(), (token.clone(), key_auth.as_str().to_string()));
-            }
-            
-            tokens_to_clean.push(token.clone());
-            
+
+            // Store challenge for the HTTP-01 server to serve
+            self.challenges.write().await.insert(token.clone(), (token.clone(), key_auth.as_str().to_string()));
+
             // Tell ACME server we're ready
-            challenge.set_ready().await.with_context(|| format!("Failed to set challenge ready for {}", primary))?;
-        }
+            let ready_result = challenge.set_ready().await
+                .with_context(|| format!("Failed to set challenge ready for {}", domain));
+            (token, ready_result)
+        };
 
-        // Wait for order to be ready (this is when ACME server validates the challenges)
+        // Wait for order to be ready (this is when ACME server validates the challenge)
         use instant_acme::RetryPolicy;
-        order
-            .poll_ready(&RetryPolicy::default())
-            .await
-            .context("Failed to poll order ready - this usually means the HTTP-01 challenge failed. Check that DNS points to this server and port 80 is accessible.")?;
+        let poll_result = match ready_result {
+            Ok(()) => order
+                .poll_ready(&RetryPolicy::default())
+                .await
+                .context("Failed to poll order ready - this usually means the HTTP-01 challenge failed. Check that DNS points to this server and port 80 is accessible."),
+            Err(e) => Err(e),
+        };
 
-        // Now clean up only this domain's challenges
-        {
-            let mut challenges = self.challenges.write().await;
-            for token in tokens_to_clean {
-                challenges.remove(&token);
-            }
-        }
+        // Clean up this domain's challenge, whether or not validation succeeded
+        self.challenges.write().await.remove(&token);
+        poll_result?;
 
         // Finalize order - this generates the private key and returns it
         let private_key_pem = order
@@ -148,41 +141,20 @@ impl CertManager {
             .await
             .context("Failed to poll for certificate")?;
 
-        // Save certificate and key under the primary domain name only.
-        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", primary));
-        let key_path = self.config_dir.join("keys").join(format!("{}.pem", primary));
+        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", domain));
+        let key_path = self.config_dir.join("keys").join(format!("{}.pem", domain));
         fs::write(&cert_path, &cert_chain_pem)?;
         fs::write(&key_path, &private_key_pem)?;
 
         Ok(())
     }
 
-    fn resolve_cert_domain<'a>(&self, domain: &'a str) -> Option<&'a str> {
-        // Look up the domain directly, or fall back to the non-www base domain for www. variants
-        // whose certificate was issued under the base domain name.
-        let primary_path = self.config_dir.join("certs").join(format!("{}.pem", domain));
-        if primary_path.exists() {
-            return Some(domain);
-        }
-        if let Some(base) = domain.strip_prefix("www.") {
-            let base_path = self.config_dir.join("certs").join(format!("{}.pem", base));
-            if base_path.exists() {
-                return Some(base);
-            }
-        }
-        None
-    }
-
     pub fn get_certificate(
         &self,
         domain: &str,
     ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
-        let resolved = self
-            .resolve_cert_domain(domain)
-            .ok_or_else(|| anyhow::anyhow!("Certificate not found for domain: {}", domain))?;
-
-        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", resolved));
-        let key_path = self.config_dir.join("keys").join(format!("{}.pem", resolved));
+        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", domain));
+        let key_path = self.config_dir.join("keys").join(format!("{}.pem", domain));
 
         if !cert_path.exists() || !key_path.exists() {
             anyhow::bail!("Certificate not found for domain: {}", domain);
@@ -208,11 +180,7 @@ impl CertManager {
     }
 
     pub fn get_certificate_expiration(&self, domain: &str) -> Result<std::time::SystemTime> {
-        let resolved = self
-            .resolve_cert_domain(domain)
-            .ok_or_else(|| anyhow::anyhow!("Certificate not found for domain: {}", domain))?;
-
-        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", resolved));
+        let cert_path = self.config_dir.join("certs").join(format!("{}.pem", domain));
 
         if !cert_path.exists() {
             anyhow::bail!("Certificate not found for domain: {}", domain);

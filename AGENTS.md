@@ -48,7 +48,14 @@ Non-Application types (Static, Proxy, Forward, Redirect) don't have a lifecycle_
 - HTTP listener - Spawns connection handler per TCP connection
 - HTTPS listener - TLS handshake then spawns connection handler
 - Directory watcher - Detects new/removed project directories
-- Certificate acquisition - One task per domain, deduplicated via atomic flag
+- Certificate acquisition - One task per registered domain (`DomainInfo::cert_task`), plus an
+  on-demand task for that domain's www/non-www counterpart (`DomainInfo::alt_cert_task`); both are
+  aborted when the `DomainInfo` is dropped
+
+Each certificate covers exactly one name. The counterpart name (`www.` added or stripped, when
+`redirect_www` is on) gets its own certificate, requested only when the SNI resolver sees a
+handshake for it — that's the first proof the name is DNS-pointed at this server, and ACME orders
+for names that aren't would fail the HTTP-01 challenge forever.
 
 Accept loops must never return on an `accept()` error: that drops the `TcpListener` and stops
 listening for the rest of the process lifetime, while the process stays alive so systemd's

@@ -417,6 +417,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-07-28 (2.4.18):
+  - Request a separate certificate for the www/non-www counterpart of a domain instead of adding it as a second name on the domain's own certificate, which failed whenever that name wasn't pointed at this server. The counterpart certificate is requested on demand, the first time a TLS handshake asks for that name (so the first such handshake still fails, and the next one succeeds)
+  - Updated deps
+
 2026-07-27 (2.4.17):
   - Fix the HTTP/HTTPS listeners permanently going away after a transient `accept()` error (such as `EMFILE`): the accept loop returned, dropping the listening socket, while the process stayed alive so systemd never restarted it. Accept errors are now logged and retried, backing off 500ms on resource exhaustion
   - Raise the open-file soft limit to the hard limit at startup, since systemd defaults services to 1024

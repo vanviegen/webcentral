@@ -37,6 +37,10 @@ struct DomainInfo {
     directory: String,
     project: Option<Arc<Project>>,
     cert_task: Option<tokio::task::JoinHandle<()>>,
+    /// Certificate task for the www/non-www counterpart of this domain, started on demand the
+    /// first time a TLS handshake asks for that name (we can't know up front whether it is
+    /// DNS-pointed at this server, and ACME would keep failing if it isn't).
+    alt_cert_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DomainInfo {
@@ -45,13 +49,14 @@ impl DomainInfo {
             directory,
             project: None,
             cert_task,
+            alt_cert_task: None,
         }
     }
 }
 
 impl Drop for DomainInfo {
     fn drop(&mut self) {
-        if let Some(cert_task) = self.cert_task.take() {
+        for cert_task in [self.cert_task.take(), self.alt_cert_task.take()].into_iter().flatten() {
             cert_task.abort();
         }
         // Tear down the project so its file watcher and lifecycle task don't keep running
@@ -102,6 +107,14 @@ impl<S: h3::quic::RecvStream> http_body::Body for H3RecvBody<S> {
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
+}
+
+/// The www-prefixed variant of a bare domain, or the bare variant of a www-prefixed one.
+fn alt_domain(domain: &str) -> String {
+    domain
+        .strip_prefix("www.")
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("www.{}", domain))
 }
 
 /// Deregister a project (only if it's still the current one for the domain).
@@ -413,6 +426,7 @@ impl Server {
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(CertResolver {
                 cert_manager: cert_manager_clone,
+                server: Arc::downgrade(&self),
             }));
         
         // ALPN protocols for HTTP/2 and HTTP/1.1 negotiation
@@ -477,6 +491,7 @@ impl Server {
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(CertResolver {
                 cert_manager: cert_manager.clone(),
+                server: Arc::downgrade(&self),
             }));
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
         // Disable session tickets and early data for QUIC - they become invalid after server restart.
@@ -753,11 +768,7 @@ impl Server {
             Err(_) => {
                 // Check for www redirect
                 if self.config.redirect_www {
-                    let alt_domain = domain.strip_prefix("www.")
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| format!("www.{}", domain));
-
-                    if let Ok(project) = self.get_project_for_domain(&alt_domain).await {
+                    if let Ok(project) = self.get_project_for_domain(&alt_domain(&domain)).await {
                         let scheme = if from_https { "https" } else { "http" };
                         return Ok(self.make_redirect(scheme, &project, &req));
                     }
@@ -940,6 +951,35 @@ impl Server {
         self.schedule_write_bindings();
     }
 
+    /// Start certificate management for the www/non-www counterpart of a registered domain.
+    ///
+    /// Called from the SNI resolver when a TLS handshake asks for a name we have no certificate
+    /// for. Doing this on demand (rather than up front, or as a SAN on the registered domain's
+    /// certificate) is what tells us the alternative name is actually pointed at this server -
+    /// otherwise every ACME order for it would fail the HTTP-01 challenge.
+    ///
+    /// The task handle lives in the registered domain's `DomainInfo`, so it is deduplicated and
+    /// aborted along with the domain it belongs to.
+    fn ensure_alt_certificate(self: &Arc<Self>, domain: &str) {
+        if self.cert_manager.is_none() || !self.config.redirect_www || DOMAINS.contains_key(domain) {
+            return;
+        }
+        let base = alt_domain(domain);
+        let Some(mut base_info) = DOMAINS.get_mut(&base) else {
+            return; // Not the counterpart of anything we serve
+        };
+        if base_info.alt_cert_task.is_some() {
+            return; // Already being acquired or renewed
+        }
+
+        println!("Requesting certificate for {} on demand (alternative name for {})", domain, base);
+        let server = self.clone();
+        let domain = domain.to_string();
+        base_info.alt_cert_task = Some(tokio::spawn(async move {
+            server.manage_certificate(domain).await;
+        }));
+    }
+
     async fn manage_certificate(&self, domain: String) {
         let cert_manager = self.cert_manager.as_ref().unwrap();
         
@@ -980,22 +1020,10 @@ impl Server {
                 }
             };
 
-            // When redirect_www is enabled, include the www. variant as a SAN in the
-            // same certificate so the TLS handshake succeeds before the redirect fires.
-            let www_domain = if self.config.redirect_www && !domain.starts_with("www.") {
-                Some(format!("www.{}", domain))
-            } else {
-                None
-            };
-
             let mut backoff_time = 15 * 60; // 15 minutes
             loop {
                 CERT_STATUS.insert(domain.clone(), "Acquiring".to_string());
-                let domains: Vec<&str> = match &www_domain {
-                    Some(www) => vec![&domain, www.as_str()],
-                    None => vec![&domain],
-                };
-                match cert_manager.acquire_certificate(&domains).await {
+                match cert_manager.acquire_certificate(&domain).await {
                     Ok(_) => {
                         CERT_STATUS.insert(domain.clone(), "Valid".to_string());
                         println!("Successfully acquired certificate for {}", domain);
@@ -1026,6 +1054,8 @@ impl Server {
 #[derive(Debug)]
 struct CertResolver {
     cert_manager: Arc<CertManager>,
+    /// Weak to avoid a reference cycle: the server owns the TLS config that owns this resolver.
+    server: std::sync::Weak<Server>,
 }
 
 impl rustls::server::ResolvesServerCert for CertResolver {
@@ -1040,6 +1070,9 @@ impl rustls::server::ResolvesServerCert for CertResolver {
         let (certs, key) = match self.cert_manager.get_certificate(domain) {
             Ok(cert) => cert,
             Err(_) => {
+                if let Some(server) = self.server.upgrade() {
+                    server.ensure_alt_certificate(domain);
+                }
                 eprintln!("HTTPS request for {} but no certificate is available yet", domain);
                 return None;
             }
