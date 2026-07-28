@@ -1193,6 +1193,26 @@ def test_config_unknown_key_in_docker(t):
 
 
 @test
+def test_version(t):
+    """--version prints just the version number, and startup logs it"""
+    root = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(root, 'Cargo.toml')) as f:
+        version = re.search(r'^version = "(.*?)"', f.read(), re.M).group(1)
+
+    for flag in ['--version', '-V']:
+        result = subprocess.run(['./webcentral', flag], capture_output=True, text=True,
+                                cwd=root, timeout=5)
+        assert result.returncode == 0, f"{flag} exited with {result.returncode}: {result.stderr}"
+        assert result.stdout.strip() == version, \
+            f"Expected {flag} to print {version!r}, got {result.stdout!r}"
+
+    # The running server logged its version at startup (before this test marked logs read)
+    startup_line = f"Starting webcentral {version}"
+    assert startup_line in t.get_log_content('stdout', 0), \
+        f"Expected {startup_line!r} in stdout log"
+
+
+@test
 def test_http2_support(t):
     """Verify HTTP/2 support using curl"""
     # Check if curl supports HTTP/2

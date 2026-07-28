@@ -353,6 +353,7 @@ bob = $argon2id$v=19$m=19456,t=2,p=1$...
 
 | Option | Description |
 |--------|-------------|
+| `--version` (`-V`) | Print the version number and exit. |
 | `--email=EMAIL` | Email for Let's Encrypt. Required unless `--https=0`. |
 | `--projects=DIR` | Project directory glob. Default: `/home/*/webcentral-projects` (root) or `$HOME/webcentral-projects` (user). |
 | `--config=DIR` | Config storage directory. Default: `/var/lib/webcentral` (root) or `$HOME/.webcentral` (user). |
@@ -416,6 +417,9 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 ---
 
 ## Changelog
+
+2026-07-28 (2.4.20):
+  - Added `--version` (`-V`), printing just the version number, and a `Starting webcentral <version>` line at the top of every run's log, so the running version can be identified from the logs
 
 2026-07-28 (2.4.19):
   - Check that a domain actually resolves to this server (by fetching a token only this process can produce, over port 80) before ordering a certificate for it, instead of retrying ACME orders that can only fail. Reported per domain, and rechecked while a certificate is still valid, so a domain that stops pointing here is flagged long before its renewal fails

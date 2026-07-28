@@ -32,6 +32,9 @@ pub enum Commands {
 
 #[derive(Debug, Clone, Parser)]
 pub struct GlobalConfig {
+    #[arg(long, short = 'V', help = "Print the version number and exit")]
+    pub version: bool,
+
     #[arg(long, help = "Create/update systemd service file and enable the service")]
     pub systemd: bool,
 
@@ -222,17 +225,15 @@ fn raise_fd_limit() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    raise_fd_limit();
-
-    // Install rustls crypto provider (needed when multiple providers available, e.g. with HTTP/3)
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install rustls crypto provider");
-
     #[cfg(feature = "console")]
     console_subscriber::init();
 
     let cli = Cli::parse();
+
+    if cli.config.version {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
     // Handle --systemd flag first
     if cli.config.systemd {
@@ -273,6 +274,15 @@ async fn main() -> Result<()> {
     if config.https > 0 && config.email.is_none() {
         anyhow::bail!("--email is required when HTTPS is enabled");
     }
+
+    println!("Starting webcentral {}", env!("CARGO_PKG_VERSION"));
+
+    raise_fd_limit();
+
+    // Install rustls crypto provider (needed when multiple providers available, e.g. with HTTP/3)
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
 
     // Initialize and start the server
     let server = Arc::new(server::Server::new(config).await?);
