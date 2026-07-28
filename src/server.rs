@@ -37,10 +37,6 @@ struct DomainInfo {
     directory: String,
     project: Option<Arc<Project>>,
     cert_task: Option<tokio::task::JoinHandle<()>>,
-    /// Certificate task for the www/non-www counterpart of this domain, started on demand the
-    /// first time a TLS handshake asks for that name (we can't know up front whether it is
-    /// DNS-pointed at this server, and ACME would keep failing if it isn't).
-    alt_cert_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl DomainInfo {
@@ -49,14 +45,13 @@ impl DomainInfo {
             directory,
             project: None,
             cert_task,
-            alt_cert_task: None,
         }
     }
 }
 
 impl Drop for DomainInfo {
     fn drop(&mut self) {
-        for cert_task in [self.cert_task.take(), self.alt_cert_task.take()].into_iter().flatten() {
+        if let Some(cert_task) = self.cert_task.take() {
             cert_task.abort();
         }
         // Tear down the project so its file watcher and lifecycle task don't keep running
@@ -73,7 +68,13 @@ lazy_static::lazy_static! {
     static ref VALID_DOMAIN: Regex = Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$").unwrap();
     static ref SERVER_START_TIME: std::time::Instant = std::time::Instant::now();
     static ref CERT_STATUS: DashMap<String, String> = DashMap::new();
+    /// Proves to ourselves that a `SELF_CHECK_PATH` response came from this very process.
+    static ref SELF_CHECK_TOKEN: String = format!("{:032x}", rand::random::<u128>());
 }
+
+/// Path serving `SELF_CHECK_TOKEN`, used to verify a domain resolves to this server (see
+/// `Server::points_at_us`).
+const SELF_CHECK_PATH: &str = "/.well-known/webcentral-self-check";
 
 /// Streaming body adapter for HTTP/3 - wraps h3 RecvStream as an http_body::Body.
 #[cfg(feature = "http3")]
@@ -408,7 +409,7 @@ impl Server {
                     )
                     .await
                 {
-                    eprintln!("HTTP connection error: {}", e);
+                    eprintln!("HTTP connection error from {}: {}", addr, e);
                 }
             });
         }
@@ -426,7 +427,7 @@ impl Server {
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(CertResolver {
                 cert_manager: cert_manager_clone,
-                server: Arc::downgrade(&self),
+                redirect_www: self.config.redirect_www,
             }));
         
         // ALPN protocols for HTTP/2 and HTTP/1.1 negotiation
@@ -456,11 +457,15 @@ impl Server {
                         // Only log if it's not a "no certificate" error (unconfigured domain)
                         let err_str = e.to_string();
                         if !err_str.contains("no server certificate chain resolved") {
-                            eprintln!("TLS handshake error: {}", e);
+                            eprintln!("TLS handshake error from {}: {}", addr, e);
                         }
                         return;
                     }
                 };
+
+                // The name the client asked for, which is all the context a failed connection
+                // has: a connection-level error means no request was parsed
+                let sni = tls_stream.get_ref().1.server_name().unwrap_or("no SNI").to_string();
 
                 let io = TokioIo::new(tls_stream);
                 if let Err(e) = auto::Builder::new(SHARED_EXECUTOR.clone())
@@ -473,7 +478,7 @@ impl Server {
                     )
                     .await
                 {
-                    eprintln!("HTTPS connection error: {}", e);
+                    eprintln!("HTTPS connection error from {} for {}: {}", addr, sni, e);
                 }
             });
         }
@@ -491,7 +496,7 @@ impl Server {
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(CertResolver {
                 cert_manager: cert_manager.clone(),
-                server: Arc::downgrade(&self),
+                redirect_www: self.config.redirect_www,
             }));
         tls_config.alpn_protocols = vec![b"h3".to_vec()];
         // Disable session tickets and early data for QUIC - they become invalid after server restart.
@@ -510,12 +515,13 @@ impl Server {
 
         while let Some(incoming) = endpoint.accept().await {
             let server = self.clone();
+            let peer = incoming.remote_address();
             tokio::spawn(async move {
                 if let Err(e) = server.handle_http3_connection(incoming).await {
                     let err_str = e.to_string();
                     // Don't log "no certificate" errors (unconfigured domain) or idle timeouts
                     if !err_str.contains("no server certificate") && !err_str.contains("Timeout") {
-                        eprintln!("HTTP/3 connection error: {}", e);
+                        eprintln!("HTTP/3 connection error from {}: {}", peer, e);
                     }
                 }
             });
@@ -685,8 +691,16 @@ impl Server {
         req: Request<hyper::body::Incoming>,
         addr: std::net::SocketAddr,
     ) -> Result<Response<StreamBody>, hyper::Error> {
-        // Handle ACME HTTP-01 challenges
         let path = req.uri().path();
+        if path == SELF_CHECK_PATH {
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/plain")
+                .body(body_from(SELF_CHECK_TOKEN.clone()))
+                .unwrap());
+        }
+
+        // Handle ACME HTTP-01 challenges
         if path.starts_with("/.well-known/acme-challenge/") {
             let token = &path[28..]; // Skip "/.well-known/acme-challenge/"
             if let Some(cert_manager) = &self.cert_manager {
@@ -904,6 +918,7 @@ impl Server {
                     drop(existing);
                     println!("Domain {} removed ({:?})", domain, directory);
                     DOMAINS.remove(&domain); // Dropping the DomainInfo shuts down its project
+                    CERT_STATUS.remove(&domain);
                     self.schedule_write_bindings();
                 }
             }
@@ -933,112 +948,134 @@ impl Server {
                 }
             );
         }
-        
-        
+
         // Start certificate management task if HTTPS is enabled
-        let cert_task = if self.cert_manager.is_some() {
+        let cert_task = self.cert_manager.is_some().then(|| {
             let server = self.clone();
             let domain = domain.clone();
-            Some(tokio::spawn(async move {
-                server.manage_certificate(domain).await;
-            }))
-        } else {
-            None
-        };
+            tokio::spawn(async move { server.manage_certificate(domain).await })
+        });
 
         println!("Domain {} added ({:?})", &domain, directory);
         DOMAINS.insert(domain, DomainInfo::new(directory, cert_task));
         self.schedule_write_bindings();
     }
 
-    /// Start certificate management for the www/non-www counterpart of a registered domain.
+    /// Whether `domain` resolves to this very process on port 80, verified by fetching a path
+    /// only we can answer with a token that is new for every run. `Err` describes why it doesn't.
     ///
-    /// Called from the SNI resolver when a TLS handshake asks for a name we have no certificate
-    /// for. Doing this on demand (rather than up front, or as a SAN on the registered domain's
-    /// certificate) is what tells us the alternative name is actually pointed at this server -
-    /// otherwise every ACME order for it would fail the HTTP-01 challenge.
-    ///
-    /// The task handle lives in the registered domain's `DomainInfo`, so it is deduplicated and
-    /// aborted along with the domain it belongs to.
-    fn ensure_alt_certificate(self: &Arc<Self>, domain: &str) {
-        if self.cert_manager.is_none() || !self.config.redirect_www || DOMAINS.contains_key(domain) {
-            return;
-        }
-        let base = alt_domain(domain);
-        let Some(mut base_info) = DOMAINS.get_mut(&base) else {
-            return; // Not the counterpart of anything we serve
-        };
-        if base_info.alt_cert_task.is_some() {
-            return; // Already being acquired or renewed
-        }
+    /// This is the same round trip the ACME server makes for an HTTP-01 challenge, so it tells us
+    /// up front whether an order including this name could succeed - without bothering Let's
+    /// Encrypt (and burning its rate limits) for names that aren't pointed here.
+    async fn points_at_us(&self, domain: &str) -> Result<(), String> {
+        let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", SELF_CHECK_PATH, domain);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect((domain, 80)).await?;
+            stream.write_all(request.as_bytes()).await?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await?;
+            Ok::<_, std::io::Error>(response)
+        }).await;
 
-        println!("Requesting certificate for {} on demand (alternative name for {})", domain, base);
-        let server = self.clone();
-        let domain = domain.to_string();
-        base_info.alt_cert_task = Some(tokio::spawn(async move {
-            server.manage_certificate(domain).await;
-        }));
+        match response {
+            // `contains` rather than an exact body match, so an intermediary that reformats or
+            // pads the response doesn't fail a check the ACME server would pass
+            Ok(Ok(response)) if String::from_utf8_lossy(&response).contains(SELF_CHECK_TOKEN.as_str()) => Ok(()),
+            Ok(Ok(_)) => Err("it is served by a different web server".to_string()),
+            Ok(Err(e)) => Err(format!("port 80 is unreachable: {}", e)),
+            Err(_) => Err("port 80 did not respond within 10s".to_string()),
+        }
     }
 
     async fn manage_certificate(&self, domain: String) {
         let cert_manager = self.cert_manager.as_ref().unwrap();
-        
+        const RENEW_BEFORE: i32 = 7 * 24 * 60 * 60;
+        let mut backoff_time = 15 * 60; // 15m, growing to 16h on repeated acquisition failures
+
+        let alt = self.config.redirect_www.then(|| alt_domain(&domain));
+        // What we last successfully ordered, so that a name the CA leaves out of the certificate
+        // can't make us re-order it on every cycle
+        let mut ordered: Option<Vec<String>> = None;
+
         loop {
-            // 1. Check certificate status
-            let now = std::time::SystemTime::now();
-            
-            // Determine if we need to acquire a certificate
-            // If we have a valid certificate, we will sleep and continue the loop
-            // If we need to acquire, we will break out of this match and proceed to acquisition
-            match cert_manager.get_certificate_expiration(&domain) {
-                Ok(expiration) => {
-                    if let Ok(duration_until_expiry) = expiration.duration_since(now) {
-                        // Renew if expires in < 8 days
-                        if duration_until_expiry < std::time::Duration::from_secs(8 * 24 * 60 * 60) {
-                            let days = duration_until_expiry.as_secs() / 86400;
-                            CERT_STATUS.insert(domain.clone(), format!("Renewing ({}d left)", days));
-                            println!("Certificate for {} expires in {:?}, renewing...", domain, duration_until_expiry);
-                            // Acquire!
-                        } else {
-                            // Valid certificate, sleep until renewal time (expiration - 7 days)
-                            let days = duration_until_expiry.as_secs() / 86400;
-                            CERT_STATUS.insert(domain.clone(), format!("Valid ({}d)", days));
-                            let sleep_time = duration_until_expiry - to_jittered_duration(7 * 24 * 60 * 60);
-                            println!("Certificate for {} is valid. Sleeping for {}s", domain, sleep_time.as_secs());
-                            tokio::time::sleep(sleep_time).await;
-                            continue; // Do not acquire
-                        }
-                    } else {
-                        // Already expired - acquire!
-                        CERT_STATUS.insert(domain.clone(), "Expired".to_string());
-                        println!("Certificate for {} has expired", domain);
-                    }
-                }
-                Err(_) => {
-                    // No certificate or invalid - acquire!
-                    CERT_STATUS.insert(domain.clone(), "Acquiring".to_string());
-                }
+            // Names that don't reach us can only fail the HTTP-01 challenge, taking the whole
+            // order (and Let's Encrypt rate limits) down with them. Usually only one of a
+            // www/non-www pair is pointed here, so the counterpart is included only when it is.
+            // Re-checked on every cycle, including while the certificate is still valid, so a
+            // domain that stops pointing here is reported long before its renewal fails.
+            let domain_check = self.points_at_us(&domain).await;
+            let alt_check = match &alt {
+                Some(alt) => Some((alt, self.points_at_us(alt).await)),
+                None => None,
             };
 
-            let mut backoff_time = 15 * 60; // 15 minutes
-            loop {
-                CERT_STATUS.insert(domain.clone(), "Acquiring".to_string());
-                match cert_manager.acquire_certificate(&domain).await {
-                    Ok(_) => {
-                        CERT_STATUS.insert(domain.clone(), "Valid".to_string());
-                        println!("Successfully acquired certificate for {}", domain);
-                        break; // Go back to outer loop to check expiration and sleep
+            let mut names = vec![domain.clone()];
+            // Kept short: appended to whatever single line the cycle ends up logging
+            let alt_note = match &alt_check {
+                Some((alt, Ok(()))) => {
+                    names.push(alt.to_string());
+                    format!(", with {}", alt)
+                }
+                Some((alt, Err(reason))) => format!(", without {} ({})", alt, reason),
+                None => String::new(),
+            };
+
+            if let Err(reason) = &domain_check {
+                eprintln!("ERROR: no certificate for {}{}: it does not point at this server, as {}. \
+                    Check its DNS record, and that this server is reachable on port 80", domain, alt_note, reason);
+                CERT_STATUS.insert(domain.clone(), "Not pointed here".to_string());
+                tokio::time::sleep(to_jittered_duration(60 * 60)).await;
+                continue;
+            }
+
+            // Sleep until renewal time if the certificate is still valid for long enough and
+            // already covers every name we want on it
+            let renewal_reason = match cert_manager.get_certificate_info(&domain) {
+                Err(_) => "none stored yet".to_string(),
+                Ok((expiration, covered)) => match expiration.duration_since(std::time::SystemTime::now()) {
+                    Err(_) => {
+                        CERT_STATUS.insert(domain.clone(), "Expired".to_string());
+                        "expired".to_string()
                     }
-                    Err(e) => {
-                        // Add +/- 10% jitter
-                        let sleep_time = to_jittered_duration(backoff_time);
-                        if backoff_time < 12*60*60 { // 15m, 1h, 4h, 16h
-                            backoff_time *= 4;
+                    Ok(remaining) => {
+                        let days = remaining.as_secs() / 86400;
+                        let complete = names.iter().all(|name| covered.contains(name))
+                            || ordered.as_ref() == Some(&names);
+                        match remaining.checked_sub(to_jittered_duration(RENEW_BEFORE)) {
+                            Some(sleep_time) if complete => {
+                                CERT_STATUS.insert(domain.clone(), format!("Valid ({}d)", days));
+                                println!("Certificate for {}{} is valid for {}d", domain, alt_note, days);
+                                tokio::time::sleep(sleep_time).await;
+                                continue;
+                            }
+                            Some(_) => "names changed".to_string(),
+                            None => {
+                                CERT_STATUS.insert(domain.clone(), format!("Renewing ({}d left)", days));
+                                format!("{}d left", days)
+                            }
                         }
-                        CERT_STATUS.insert(domain.clone(), format!("Error (retry {}m)", sleep_time.as_secs() / 60));
-                        eprintln!("Failed to acquire certificate for {}: {:?} (retrying in {}s)", domain, e, sleep_time.as_secs());
-                        tokio::time::sleep(sleep_time).await;
                     }
+                },
+            };
+
+            // No line on success: the next cycle logs the new certificate as valid
+            println!("Requesting certificate for {}{} ({})", domain, alt_note, renewal_reason);
+            CERT_STATUS.insert(domain.clone(), "Acquiring".to_string());
+            match cert_manager.acquire_certificate(&names).await {
+                Ok(()) => {
+                    ordered = Some(names);
+                    backoff_time = 15 * 60;
+                }
+                Err(e) => {
+                    // Add +/- 10% jitter
+                    let sleep_time = to_jittered_duration(backoff_time);
+                    if backoff_time < 12*60*60 { // 15m, 1h, 4h, 16h
+                        backoff_time *= 4;
+                    }
+                    CERT_STATUS.insert(domain.clone(), format!("Error (retry {}m)", sleep_time.as_secs() / 60));
+                    eprintln!("Failed to acquire certificate for {}: {:?} (retrying in {}s)", names.join(" and "), e, sleep_time.as_secs());
+                    tokio::time::sleep(sleep_time).await;
                 }
             }
         }
@@ -1054,8 +1091,7 @@ impl Server {
 #[derive(Debug)]
 struct CertResolver {
     cert_manager: Arc<CertManager>,
-    /// Weak to avoid a reference cycle: the server owns the TLS config that owns this resolver.
-    server: std::sync::Weak<Server>,
+    redirect_www: bool,
 }
 
 impl rustls::server::ResolvesServerCert for CertResolver {
@@ -1066,13 +1102,14 @@ impl rustls::server::ResolvesServerCert for CertResolver {
         let server_name = client_hello.server_name()?;
         let domain: &str = server_name.as_ref();
 
-        // Load certificate for the requested domain
-        let (certs, key) = match self.cert_manager.get_certificate(domain) {
+        // Load certificate for the requested domain. A www/non-www counterpart shares the
+        // registered domain's certificate, which is stored under that domain's name.
+        let certificate = self.cert_manager.get_certificate(domain).or_else(|e| {
+            if self.redirect_www { self.cert_manager.get_certificate(&alt_domain(domain)) } else { Err(e) }
+        });
+        let (certs, key) = match certificate {
             Ok(cert) => cert,
             Err(_) => {
-                if let Some(server) = self.server.upgrade() {
-                    server.ensure_alt_certificate(domain);
-                }
                 eprintln!("HTTPS request for {} but no certificate is available yet", domain);
                 return None;
             }

@@ -48,14 +48,19 @@ Non-Application types (Static, Proxy, Forward, Redirect) don't have a lifecycle_
 - HTTP listener - Spawns connection handler per TCP connection
 - HTTPS listener - TLS handshake then spawns connection handler
 - Directory watcher - Detects new/removed project directories
-- Certificate acquisition - One task per registered domain (`DomainInfo::cert_task`), plus an
-  on-demand task for that domain's www/non-www counterpart (`DomainInfo::alt_cert_task`); both are
-  aborted when the `DomainInfo` is dropped
+- Certificate acquisition - One task per domain, stored in `DomainInfo::cert_task` and aborted
+  when that is dropped
 
-Each certificate covers exactly one name. The counterpart name (`www.` added or stripped, when
-`redirect_www` is on) gets its own certificate, requested only when the SNI resolver sees a
-handshake for it — that's the first proof the name is DNS-pointed at this server, and ACME orders
-for names that aren't would fail the HTTP-01 challenge forever.
+One certificate per domain, covering the domain and - when `redirect_www` is on - its www/non-www
+counterpart, stored under the registered domain's name (so the SNI resolver falls back to the
+counterpart's file). Before ordering, `points_at_us()` fetches `/.well-known/webcentral-self-check`
+over port 80 for each name and compares the response with a token generated fresh each run. This
+is the same round trip the ACME server makes, so it establishes up front whether an HTTP-01
+challenge would succeed, without burning Let's Encrypt rate limits: a counterpart that doesn't
+resolve here (the common case) is left off the certificate, and a domain that doesn't resolve here
+is an error, retried hourly. Both names are re-checked on every cycle, including while the
+certificate is still valid, so a name that starts or stops pointing here is picked up (comparing
+against the stored certificate's SANs) long before renewal.
 
 Accept loops must never return on an `accept()` error: that drops the `TcpListener` and stops
 listening for the rest of the process lifetime, while the process stays alive so systemd's
@@ -78,7 +83,7 @@ the listener readable). `main` also raises `RLIMIT_NOFILE` to the hard limit at 
 **Server-level:**
 - `DashMap<String, DomainInfo>` - Concurrent domain → project mapping (lock-free reads)
 - `DomainInfo::project: Option<Arc<Project>>` - Per-domain project instance (None after deregister)
-- `deregister_project()` - Called on FileChange/Failed, sets project to None, next request creates new
+- `deregister_project()` - Called from the file watcher callback and on Failed, sets project to None, next request creates new
 
 **Logger:** Internal mutex for concurrent writes, automatic log rotation on date change
 
@@ -112,7 +117,7 @@ the listener readable). `main` also raises `RLIMIT_NOFILE` to the hard limit at 
 
 **Reload triggers:** Configurable includes/excludes, defaults to all files for applications, only config files for static/proxy
 
-**On change:** File watcher sends `StopReason::FileChange` to lifecycle_task/stop_listener. For Applications, deregisters immediately in `run_until_stop` before killing processes so new requests get new project. For non-Applications, `stop_listener` deregisters and exits. New project instance created on next request.
+**On change:** The file watcher callback calls `deregister_project()` itself, then sends `StopReason::FileChange` to lifecycle_task/stop_listener, which tear down the old instance. Deregistering in the callback rather than in the receiving task closes the window in which requests would still be routed to the outgoing project. New project instance created on next request.
 
 **Server-level:** Non-recursive watch on project parent directories for domain additions/removals
 

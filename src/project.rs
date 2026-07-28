@@ -226,17 +226,12 @@ impl Project {
         Ok(project)
     }
 
-    /// Simple stop listener for non-Application projects.
-    /// Deregisters on FileChange so a new project is created with fresh config.
+    /// Simple stop listener for non-Application projects. Deregistration on file change already
+    /// happened in the watcher callback; this only has to tear the project down.
     async fn stop_listener(self: Arc<Self>, mut stop_rx: mpsc::Receiver<StopReason>) {
         while let Some(reason) = stop_rx.recv().await {
             match reason {
-                StopReason::FileChange => {
-                    crate::server::deregister_project(&self.domain, &self);
-                    self.stop_watcher();
-                    return;
-                }
-                StopReason::Shutdown => {
+                StopReason::FileChange | StopReason::Shutdown => {
                     self.stop_watcher();
                     return;
                 }
@@ -910,10 +905,9 @@ tr:hover {{ background: #f5f5f5; }}
                                         return;
                                     }
                                     Some(StopReason::FileChange) => {
-                                        // Config/files changed while idle. Deregister so the next
-                                        // request builds a fresh project with the new config, and
-                                        // stop watching so this (now orphaned) instance goes away.
-                                        crate::server::deregister_project(&self.domain, &self);
+                                        // Config/files changed while idle. The next request builds a
+                                        // fresh project with the new config, so stop watching and let
+                                        // this (now orphaned) instance go away.
                                         self.logger.write("supervisor", "Stopped app (file change while idle)");
                                         self.stop_watcher();
                                         return;
@@ -960,7 +954,6 @@ tr:hover {{ background: #f5f5f5; }}
                                         return;
                                     }
                                     Some(StopReason::FileChange) => {
-                                        crate::server::deregister_project(&self.domain, &self);
                                         self.logger.write("supervisor", "File change during startup");
                                         self.stop_watcher();
                                         return;
@@ -1011,7 +1004,6 @@ tr:hover {{ background: #f5f5f5; }}
                             return;
                         }
                         StopReason::FileChange => {
-                            // Config may have changed. Already deregistered in run_until_stop.
                             self.logger.write("supervisor", "Stopped app (file change)");
                             self.stop_watcher();
                             return;
@@ -1082,12 +1074,7 @@ tr:hover {{ background: #f5f5f5; }}
                 // Stop signal received
                 reason = stop_rx.recv() => {
                     let reason = reason.unwrap_or(StopReason::Shutdown);
-                    
-                    // For FileChange, deregister immediately so new requests create fresh project
-                    if let StopReason::FileChange = reason {
-                        crate::server::deregister_project(&self.domain, &self);
-                    }
-                    
+
                     // Immediately transition to Stopped so new requests wait for restart
                     let _ = self.state_tx.send(AppState::Stopped);
                     self.kill_processes_by_ref(&mut children).await;
@@ -1326,6 +1313,10 @@ tr:hover {{ background: #f5f5f5; }}
             .add_includes(&self.config.reload.include)
             .add_excludes(&self.config.reload.exclude)
             .run_debounced(100, move |path| {
+                // Deregister before signalling the stop: the stop is only picked up asynchronously
+                // by the lifecycle task (or stop listener), and until then this project would keep
+                // serving requests with the old config.
+                crate::server::deregister_project(&proj.domain, &proj);
                 proj.logger.write("supervisor", &format!("Stopping due to file changes: {}", path.display()));
                 proj.request_stop(StopReason::FileChange);
             })

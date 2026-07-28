@@ -2451,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "webcentral"
-version = "2.4.18"
+version = "2.4.19"
 dependencies = [
  "anyhow",
  "argon2",

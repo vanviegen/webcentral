@@ -417,6 +417,13 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-07-28 (2.4.19):
+  - Check that a domain actually resolves to this server (by fetching a token only this process can produce, over port 80) before ordering a certificate for it, instead of retrying ACME orders that can only fail. Reported per domain, and rechecked while a certificate is still valid, so a domain that stops pointing here is flagged long before its renewal fails
+  - The www/non-www counterpart is included in the domain's certificate only when it too points at this server, which is what made 2.4.18 downgrade to separate certificates. It is added (or dropped) on the next check, without waiting for renewal
+  - Fix requests still reaching the outgoing project for a moment after a file change was detected
+  - Connection and TLS handshake errors now name the client address they came from (and, for HTTPS, the requested domain), instead of only the error
+  - One log line per certificate per cycle, instead of one for the check, one for the validity and one for the acquisition
+
 2026-07-28 (2.4.18):
   - Request a separate certificate for the www/non-www counterpart of a domain instead of adding it as a second name on the domain's own certificate, which failed whenever that name wasn't pointed at this server. The counterpart certificate is requested on demand, the first time a TLS handshake asks for that name (so the first such handshake still fails, and the next one succeeds)
   - Updated deps, fixing a remotely triggerable memory exhaustion in `quinn-proto` (RUSTSEC-2026-0185, high) that affects the HTTP/3 listener

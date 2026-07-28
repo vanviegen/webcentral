@@ -5,6 +5,7 @@ import base64
 import glob
 import http.client
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -1964,6 +1965,17 @@ def test_apex_redirect_to_www(t):
 
 
 @test
+def test_self_check_endpoint(t):
+    """The self-check endpoint answers with this run's token, for any domain"""
+    token = t.assert_http('/.well-known/webcentral-self-check', host='not-registered.test')
+    if not re.fullmatch(r'[0-9a-f]{32}', token):
+        raise AssertionError(f"Expected a 32 hex digit token, got: {token!r}")
+
+    # Same process, so the same token regardless of the domain asked for
+    t.assert_http('/.well-known/webcentral-self-check', check_body=token)
+
+
+@test
 def test_static_mime_types(t):
     """Static files are served with correct MIME types"""
     # Create various file types
@@ -2668,6 +2680,19 @@ def test_websocket_inactivity(t):
         raise e
 
     client.close()
+
+
+@test
+def test_connection_error_names_peer(t):
+    """Connection errors identify the client they came from, not just the error"""
+    t.mark_log_read('stderr')
+
+    # A TLS ClientHello sent to the plain HTTP port: hyper can't parse a method from it
+    sock = socket.create_connection(('localhost', t.port))
+    sock.sendall(b'\x16\x03\x01\x00\x2f\x01\x00\x00\x2b\x03\x03')
+    sock.close()
+
+    t.await_log('stderr', 'HTTP connection error from 127.0.0.1:')
 
 
 @test
