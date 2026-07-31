@@ -6,7 +6,7 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 ## Features
 
 ### Per domain request handling
-- Run an executable (that should start serving on $PORT) either from a Docker image or in a Firejail sandbox
+- Run an executable (that should start serving on $PORT) either in a podman container or in a Firejail sandbox
 - Port-forward, HTTP-redirect, HTTP-proxy or static-serve requests
 - Config file not always needed (detects `Procfile`, `package.json`, `public/`)
 
@@ -24,10 +24,10 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 ### Multi-user & isolation
 - When started as root, all local users can host applications (run with their own permissions)
-- Firejail or Docker sandboxing
+- Firejail or podman (container) sandboxing
 - Each application has its own decentralized configuration
 
-**Security Notice:** While Firejail and Docker add sandboxing, the integration hasn't been thoroughly audited. Webcentral may introduce additional attack surface. Use appropriate caution.
+**Security Notice:** While Firejail and podman add sandboxing, the integration hasn't been thoroughly audited. Webcentral may introduce additional attack surface. Use appropriate caution.
 
 ---
 
@@ -39,9 +39,9 @@ curl -LsSf https://github.com/vanviegen/webcentral/releases/latest/download/webc
 # Or build from source (see below)
 
 # Install optional dependencies for sandboxing
-sudo apt install firejail docker.io  # Debian/Ubuntu
+sudo apt install firejail podman  # Debian/Ubuntu
 # Or
-sudo dnf install firejail docker     # Fedora/RHEL
+sudo dnf install firejail podman  # Fedora/RHEL
 
 # Run it (replace email)
 sudo webcentral --email you@example.com
@@ -71,7 +71,7 @@ Point DNS for `someapp.yourdomain.com` at your server. Up and running!
 | Auto-reload on file change | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ (git&nbsp;push) |
 | Idle shutdown | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Multi-user (shared port 80/443) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| Built-in sandboxing | Docker or Firejail | ✗ | Docker | ✗ | Docker | Docker |
+| Built-in sandboxing | Podman or Firejail | ✗ | Docker | ✗ | Docker | Docker |
 | Config complexity | Minimal | Low | Medium | High | Medium | Medium |
 | Container orchestration | ✗ | ✗ | ✓ | ✗ | ✓ | ✓ |
 | HTTP/3 (QUIC) | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
@@ -98,7 +98,7 @@ Projects are automatically detected based on their contents:
 
 ### 1. Firejailed Command
 
-**Trigger:** `webcentral.ini` with `command` property (without `[docker]` section)
+**Trigger:** `webcentral.ini` with `command` property (without `[podman]` section)
 
 Runs a server process in a Firejail sandbox. The process should start an HTTP server on `$PORT`.
 
@@ -124,62 +124,110 @@ worker:email = python email_processor.py
 
 Use `worker` for a single unnamed worker, or `worker:name` for multiple named workers. Workers share the same lifecycle as the main process and have access to the same environment variables.
 
-### 2. Dockerized Command
+### 2. Containerized Command
 
-**Trigger:** `webcentral.ini` with `command` property and `[docker]` section
+**Trigger:** `webcentral.ini` with `command` property and `[podman]` section (`[docker]` is
+accepted as an alias, but the engine is always podman - docker itself is no longer supported)
 
-Runs a server process in a Docker container. The process should start an HTTP server on `$PORT` (defaults to 8000).
+Runs a server process in a podman container. The process should start an HTTP server on `$PORT` (defaults to 8000).
 
-**Docker containerization:**
+**Containerization:**
 - Completely isolated environment
 - Higher memory usage, slower startup
-- Runs as the project owner (uid/gid passed via `--user` flag)
-- Automatically mounts `/etc/passwd` and `/etc/group` for user resolution
+- Whatever user the container runs as inside, files it writes are owned by you (see **Container user** below)
 - More configuration options
 
 **Example:**
 ```ini
 command = php -S 0.0.0.0:$PORT -file test.php
-[docker]
+[podman]
 base = debian
 packages[] = php
 packages[] = composer
 commands[] = composer install
 ```
 
-**Docker Configuration Options:**
-- `base` - Base Docker image (default: `alpine`)
-- `commands` - Build commands (strings or arrays) - run during image build
+**Podman Configuration Options:**
+- `base` - Base image (default: `alpine`)
+- `commands` - Build commands - run during image build
 - `packages` - Packages to install (auto-detects `apk`, `apt-get`, `dnf`, or `yum`)
-- `mounts` - Persistent directories (stored in `_webcentral_data/mounts/<path>`, owned by project user)
+- `mounts` - Persistent directories, stored in `_webcentral_data/mounts/<path>`
   - Relative paths (e.g., `data`) are mounted relative to `app_dir`
   - Absolute paths (e.g., `/var/lib/data`) are mounted at that exact location in container
 - `http_port` - Container HTTP port (default: 8000)
 - `app_dir` - Mount point for project directory (default: `/app`)
-- `mount_app_dir` - Set to `false` to skip mounting project directory and to run as root instead of your user (default: `true`)
+- `mount_app_dir` - Set to `false` to skip mounting the project directory (default: `true`)
+- `user` - Who the container runs as inside (see below)
+
+**Container user:**
+
+`user` decides who the container runs as *inside* the container:
+
+- `project` - run as the project owner. Under a root webcentral they are added to the image as a
+  real user (named `webcentral`, with `$HOME` at `_webcentral_data/home`, or at `/tmp` when the
+  project directory isn't mounted); under a non-root webcentral the container runs as root inside,
+  because that is simply what rootless podman calls the invoking user
+- `image` - keep whatever user the image declares
+- a numeric `uid:gid` pair, or a user name defined in the image - run as exactly that (a bare
+  `uid` is rejected: the gid it would pair with depends on the image)
+
+It defaults to `project` when `mount_app_dir` is `true` and to `image` when it is `false`, which is
+almost always what you want: mounting the project directory means webcentral builds the image and
+the application works in your own files, while a complete third-party image knows which user it
+needs and forcing another one tends to make image-baked directories unwritable.
+
+**Host-side, the container user makes no difference: everything the application writes - in your
+project directory or in `mounts` - ends up owned by you, the project directory's owner.** Podman
+maps the container's user onto yours, whoever the image wants to be inside. Directories in
+`mounts` are created owned by you too (directories that already exist are never touched).
+
+The mapping covers the user the container *runs as*; all other ids pass through unchanged, since
+images need them intact for their internal permission juggling. So an image that switches at
+runtime to a uid it never declares - a root entrypoint dropping to an app user, as the official
+postgres image does - writes as that uid rather than as you. Naming the uid explicitly (e.g.
+`user = 999:999`) brings it under the mapping; such images generally support being started as
+their app user directly.
+
+Two more caveats, both for a *non-root* webcentral only. It can deliver the ownership promise solely
+for projects owned by its own user - for a project owned by anyone else it logs a warning, and
+container-written files may end up owned by a meaningless subuid. And a container user other than
+`project` or root relies on podman's `keep-id` mapping (podman >= 4.3; broken on some recent
+podman/kernel combinations - [containers/podman#27785](https://github.com/containers/podman/issues/27785) -
+where such containers fail to start with a `crun: readlink` error rather than leaking ownership).
 
 **Volume mounts:**
 - Project directory is mounted at `app_dir` (if `mount_app_dir` is not `false`)
-- Home directory is mounted at `_webcentral_data/home` (if `mount_app_dir` is `true`)
-- Custom mounts are created in `_webcentral_data/mounts/` with correct ownership
+- Custom mounts are created in `_webcentral_data/mounts/`
 
 **Real-world example (Trilium Notes):**
 ```ini
 command = node /usr/src/app/src/www
-[docker]
+[podman]
 base = zadam/trilium:0.47.6
 http_port = 8080
+mount_app_dir = false
 ```
+
+A complete third-party image like this one brings its own application and its own user, so there is
+nothing to mount the project directory for. Leaving `mount_app_dir` at its default would default
+`user` to `project`, making webcentral add your user to the image and run as it, which such images
+generally don't expect.
 
 **Example with persistent data:**
 ```ini
 command = ./server
-[docker]
+[podman]
 base = alpine
-packages = nodejs npm
-mounts[] = data              ; Mounted at /app/data
-mounts[] = /var/cache/app    ; Mounted at /var/cache/app
+packages[] = nodejs
+packages[] = npm
+; mounted at /app/data
+mounts[] = data
+; mounted at /var/cache/app
+mounts[] = /var/cache/app
 ```
+
+Note that `;` only starts a comment at the beginning of a line - anywhere else it is part of the
+value.
 
 ### 3. Forward
 
@@ -242,7 +290,7 @@ worker: python email_processor.py
 - All processes share the same environment variables
 - Workers start after the web process is ready
 - Workers are stopped when the application stops
-- All processes run in the same sandbox (Firejail or Docker)
+- All processes run in the same sandbox (Firejail or podman)
 
 ### 7. Node.js Application
 
@@ -304,7 +352,7 @@ Rules are applied in order. First match wins. Use `$1`, `$2`, etc. for captures.
 Set environment variables for your application:
 
 ```ini
-[docker]
+[podman]
 base = bitwardenrs/server:alpine
 mounts[] = data
 mounts[] = web-vault
@@ -417,6 +465,15 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 ---
 
 ## Changelog
+
+2026-07-31 (2.6.0):
+  - Containers are now always run with podman; docker support is dropped. The config section is renamed to `[podman]`, with `[docker]` still accepted as an alias
+  - Host-side file ownership is now a promise instead of an accident: whatever user the container runs as inside, everything it writes into the project directory or `mounts[]` lands owned by the project owner. A root webcentral gives the container a per-container uid/gid mapping between its user and the owner; a non-root webcentral (rootless podman) represents the owner as container root and maps explicitly requested other users onto them via `keep-id` (projects owned by anyone else are warned about, being the one thing rootless podman cannot express)
+  - New `[podman] user`, deciding who the container runs as *inside*: `project` (default when the project directory is mounted) runs as the project owner - added to the image as a real user named `webcentral` (with `$HOME` in `_webcentral_data/home`) under a root webcentral, or as rootless podman's container root under a non-root one; `image` (default otherwise) keeps whatever the image declares; or give a numeric `uid:gid` or an image-defined user name. A bare uid is rejected as ambiguous. This replaces the `--user` flag plus a bind-mount of the host's `/etc/passwd` over the image's, which broke images defining their own users
+  - Fix `EACCES` in `mounts[]`: those host directories were created owned by webcentral (often root) rather than by the project owner the container writes as
+  - Fix `[podman] packages` being silently ignored since 2.1.0, installing nothing
+  - Skip the image build entirely when the configuration and the base image are unchanged, instead of paying for a cached build on every on-demand start; a pulled base update still triggers a rebuild, and images left behind by older configurations are cleaned up
+  - Fix a container outliving its webcentral wedging the project for good, as `run` then hit a name conflict on every restart
 
 2026-07-28 (2.4.20):
   - Added `--version` (`-V`), printing just the version number, and a `Starting webcentral <version>` line at the top of every run's log, so the running version can be identified from the logs

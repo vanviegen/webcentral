@@ -162,6 +162,16 @@ impl IniMap {
 
 // Build ProjectConfig directly from IniMap
 fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
+    // [docker] is accepted as an alias for [podman], from before docker support was dropped.
+    let docker_keys: Vec<String> = ini_map.map.keys()
+        .filter(|k| k.starts_with("docker."))
+        .cloned()
+        .collect();
+    for key in docker_keys {
+        let values = ini_map.map.remove(&key).unwrap();
+        ini_map.map.entry(format!("podman.{}", &key[7..])).or_insert_with(Vec::new).extend(values);
+    }
+
     // Determine project type by checking for type-specific keys
     // Priority: type=dashboard > redirect > proxy > forward (socket/port) > application > static
     let project_type = if ini_map.fetch("type").as_deref() == Some("dashboard") {
@@ -178,7 +188,7 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
     } else if let Some(host) = ini_map.fetch("host") {
         let port = ini_map.fetch_parse_default("port", 80);
         ProjectType::TcpForward { address: format!("{}:{}", host, port) }
-    } else if ini_map.map.contains_key("command") || ini_map.map.keys().any(|k| k.starts_with("docker.")) {
+    } else if ini_map.map.contains_key("command") || ini_map.map.keys().any(|k| k.starts_with("podman.")) {
         let command = ini_map.fetch("command").unwrap_or_default();
 
         let mut workers = HashMap::new();
@@ -191,21 +201,45 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
             }
         }
 
-        let docker = if ini_map.map.keys().any(|k| k.starts_with("docker.")) {
-            Some(DockerConfig {
-                base: ini_map.fetch("docker.base").unwrap_or_else(|| "alpine".to_string()),
-                packages: ini_map.fetch_array("docker.packages"),
-                commands: ini_map.fetch_array("docker.commands"),
-                http_port: ini_map.fetch_parse_default("docker.http_port", 8000),
-                app_dir: ini_map.fetch("docker.app_dir").unwrap_or_else(|| "/app".to_string()),
-                mount_app_dir: ini_map.fetch_bool("docker.mount_app_dir").unwrap_or(true),
-                mounts: ini_map.fetch_array("docker.mounts"),
+        let podman = if ini_map.map.keys().any(|k| k.starts_with("podman.")) {
+            let mount_app_dir = ini_map.fetch_bool("podman.mount_app_dir").unwrap_or(true);
+            // Mounting the project directory means webcentral owns the image, and an application
+            // writing into the user's own directory has to write as them. A complete third-party
+            // image instead knows which user it needs.
+            let mut user = ini_map.fetch("podman.user").unwrap_or_else(|| {
+                if mount_app_dir { "project" } else { "image" }.to_string()
+            });
+            // Only uid:gid pairs, keywords and image-defined names are meaningful. A bare numeric
+            // uid is rejected rather than guessed at: the gid it pairs with depends on the image's
+            // /etc/passwd, and everything downstream needs to know both ids exactly.
+            let valid = match user.as_str() {
+                "project" | "image" => true,
+                spec => match spec.split_once(':') {
+                    Some((uid, gid)) => uid.parse::<u32>().is_ok() && gid.parse::<u32>().is_ok(),
+                    None => !spec.is_empty() && !spec.chars().all(|c| c.is_ascii_digit()),
+                },
+            };
+            if !valid {
+                ini_map.errors.push(format!(
+                    "Invalid 'podman.user' value '{}': use 'project', 'image', a numeric \
+                     'uid:gid' pair, or a user name defined in the image", user));
+                user = if mount_app_dir { "project" } else { "image" }.to_string();
+            }
+            Some(PodmanConfig {
+                base: ini_map.fetch("podman.base").unwrap_or_else(|| "alpine".to_string()),
+                packages: ini_map.fetch_array("podman.packages"),
+                commands: ini_map.fetch_array("podman.commands"),
+                http_port: ini_map.fetch_parse_default("podman.http_port", 8000),
+                app_dir: ini_map.fetch("podman.app_dir").unwrap_or_else(|| "/app".to_string()),
+                mount_app_dir,
+                mounts: ini_map.fetch_array("podman.mounts"),
+                user,
             })
         } else {
             None
         };
 
-        ProjectType::Application { command, docker, workers }
+        ProjectType::Application { command, podman, workers }
     } else {
         ProjectType::Static
     };
@@ -301,10 +335,10 @@ impl Procfile {
 
 #[derive(Debug, Clone)]
 pub enum ProjectType {
-    // Application that needs to be started (command or docker)
+    // Application that needs to be started (command or podman container)
     Application {
         command: String,
-        docker: Option<DockerConfig>,
+        podman: Option<PodmanConfig>,
         workers: HashMap<String, String>,
     },
     // Static file server (serves from public/ directory)
@@ -337,7 +371,7 @@ pub struct ProjectConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct DockerConfig {
+pub struct PodmanConfig {
     pub base: String,
     pub packages: Vec<String>,
     pub commands: Vec<String>,
@@ -345,6 +379,12 @@ pub struct DockerConfig {
     pub app_dir: String,
     pub mount_app_dir: bool,
     pub mounts: Vec<String>,
+    /// Who the container runs as *inside*. Either `project` (add the project owner to the image
+    /// and run as them), `image` (keep whatever the image declares), an explicit numeric `uid:gid`
+    /// pair, or a name defined in the image. Defaults to `project` when the project directory is
+    /// mounted and `image` when it isn't. Host-side, files the container writes always land owned
+    /// by the project owner - see `Project::add_userns_args`.
+    pub user: String,
 }
 
 /// Default file patterns to exclude from file watching.

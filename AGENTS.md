@@ -11,7 +11,7 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 `src/server.rs` - HTTP/HTTPS/HTTP3 listeners, ACME certificate management, domain routing, www/HTTPS redirects, directory watching
 
-`src/project.rs` - Per-domain lifecycle manager supporting: applications (Firejail/Docker), static files, redirects, proxies, forwards. Handles file watching, auto-reload, inactivity timeouts, URL rewrites
+`src/project.rs` - Per-domain lifecycle manager supporting: applications (Firejail/podman), static files, redirects, proxies, forwards. Handles file watching, auto-reload, inactivity timeouts, URL rewrites
 
 `src/logger.rs` - Daily-rotated logs with configurable retention
 
@@ -95,17 +95,46 @@ the listener readable). `main` also raises `RLIMIT_NOFILE` to the hard limit at 
 
 **Process exit detection:** `wait_for_port_ready` polls `try_wait()` to detect early process exit during startup.
 
-**Firejail sandboxing** (when enabled, non-Docker):
+**Firejail sandboxing** (when enabled, non-container):
 - Private /tmp and /dev
 - Read-only root, read-write project dir
 - Whitelist project directory only
 
-**Docker** (when configured):
-- Custom Dockerfile generation
+**Podman** (when `[podman]` is configured; `[docker]` is a config alias, docker itself is no longer
+supported), via `get_podman_path()`:
+- Custom Dockerfile generation: packages, build commands, and - for `user = project` - the project
+  owner appended to `/etc/passwd`+`/etc/group` followed by a `USER` directive
+- Image tagged `webcentral-<dir hash>:<hash of Dockerfile + base image ID>`, so an unchanged config
+  skips the build while a pulled base update still triggers one; after each build the project's
+  stale sibling tags are removed (they are named, so `image prune` would never reclaim them)
+- Stale container of the same name force-removed before `run` (a container outliving its webcentral
+  otherwise wedges the project with a name conflict)
 - Port mapping from internal to host
 - Volume mounts for app dir and additional paths
-- User/group mapping from host
-- Dynamic image naming based on project dir hash
+
+**Container user:** `[podman] user` only decides who the container runs as *inside*, defaulting
+(resolved at parse time) to `project` when `mount_app_dir` is on and `image` when it isn't.
+Under a root webcentral, `project` bakes the project owner into the image as a real user; under a
+non-root one it forces `--user 0:0`, since rootless podman's container root *is* the invoking
+user (and a base image's own USER must not sneak in an unmapped uid). `image` keeps what the
+image declares (forcing a user breaks image-baked directories). Bare numeric uids are rejected at
+parse - the gid they pair with depends on the image's passwd. Unknown ids are resolved by
+`container_user_ids()` (runs `id` in the image, cached per image+user, assumes root on failure).
+
+**Host-side ownership is a single invariant:** whatever the container runs as, everything it
+writes into the project dir or `mounts[]` lands owned by the project owner. `add_userns_args` is
+the one place implementing it: a root webcentral (rootful podman) passes an identity
+`--uidmap`/`--gidmap` with the container ids and owner swapped (no namespace when they already
+match); a non-root webcentral (rootless podman) can only map onto its own user, which is the owner
+exactly when the project is its own - container root needs no flags, only explicitly requested
+other uids get `--userns=keep-id:uid=,gid=` (podman >= 4.3, and broken on some podman/kernel
+combos - containers/podman#27785 - where such containers fail at start rather than leak) - and
+any other owner is warned about. `mounts[]`/home directories are created owned by the project
+owner accordingly; existing directories are never touched. The mapping only covers the *resolved*
+user - other ids stay identity, since uid maps are injective and images need setuid/chown to
+other ids to keep working - so an image that switches at runtime to a uid it doesn't declare
+(postgres-style root→999 entrypoints) writes as that uid; an explicit `user =` brings it under
+the invariant.
 
 **Workers:** Additional processes spawned alongside main application, share PORT env var
 

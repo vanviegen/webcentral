@@ -1,6 +1,6 @@
 use include_exclude_watcher as file_watcher;
 use crate::logger::Logger;
-use crate::project_config::{DockerConfig, ProjectConfig, ProjectType};
+use crate::project_config::{PodmanConfig, ProjectConfig, ProjectType};
 use crate::server::SHARED_EXECUTOR;
 use crate::streams::AnyConnector;
 use tower::Service;
@@ -753,18 +753,18 @@ tr:hover {{ background: #f5f5f5; }}
 
         self.logger.write("supervisor", &format!("Starting on port {}", port));
 
-        let (command, docker, workers) = match &self.config.project_type {
+        let (command, podman, workers) = match &self.config.project_type {
             ProjectType::Application {
                 command,
-                docker,
+                podman,
                 workers,
                 ..
-            } => (command.clone(), docker.clone(), workers.clone()),
+            } => (command.clone(), podman.clone(), workers.clone()),
             _ => unreachable!("spawn_processes called for non-Application project"),
         };
 
-        let mut process = if let Some(docker_config) = &docker {
-            self.build_docker_command(port, docker_config, &command)
+        let mut process = if let Some(podman_config) = &podman {
+            self.build_podman_command(port, podman_config, &command)
                 .await?
         } else {
             self.build_shell_command(&command)?
@@ -1164,15 +1164,15 @@ tr:hover {{ background: #f5f5f5; }}
     }
 
     fn build_shell_command(&self, command: &str) -> Result<Command> {
-        let has_docker = matches!(
+        let has_podman = matches!(
             self.config.project_type,
             ProjectType::Application {
-                docker: Some(_),
+                podman: Some(_),
                 ..
             }
         );
 
-        let mut cmd = if self.use_firejail && !has_docker {
+        let mut cmd = if self.use_firejail && !has_podman {
             let mut c = Command::new("firejail");
             // Wrap command with cd to set working directory inside sandbox
             let wrapped_command = format!("cd {} && {}", self.dir.display(), command);
@@ -1208,85 +1208,366 @@ tr:hover {{ background: #f5f5f5; }}
         Ok(cmd)
     }
 
-    async fn build_docker_command(
-        &self,
-        port: u16,
-        dc: &DockerConfig,
-        command: &str,
-    ) -> Result<Command> {
-        // Generate container name using a hash of the directory path
+    /// Create a directory for the container to write in, owned by the project owner - which is
+    /// where the container's writes land on every supported path, since `add_userns_args` maps
+    /// whatever user the container runs as onto the owner. Directories that already exist are
+    /// left alone. Chown failure only means webcentral runs as neither root nor the owner, the
+    /// same unsupported case `add_userns_args` warns about - so a warning, not an error.
+    fn create_dir_for_container(&self, path: &Path) -> Result<()> {
+        if path.exists() {
+            return Ok(());
+        }
+        fs::create_dir_all(path)?;
+        if get_ownership(path) != (self.uid, self.gid) {
+            if let Err(e) = std::os::unix::fs::chown(path, Some(self.uid), Some(self.gid)) {
+                self.logger.write("podman", &format!(
+                    "Could not give {} to {}:{} ({}); the container may not be able to write there.",
+                    path.display(), self.uid, self.gid, e));
+            }
+        }
+        Ok(())
+    }
+
+    /// The uid/gid a container started from `image` actually runs as. This needs podman's help:
+    /// `USER` may name a user that only exists inside the image, and an image declaring no user
+    /// at all runs as root. Cached per image+user, as it costs a container round trip.
+    async fn container_user_ids(&self, image: &str, user_arg: Option<&str>) -> Option<(u32, u32)> {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<HashMap<String, (u32, u32)>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+        let key = format!("{}\0{}", image, user_arg.unwrap_or(""));
+        if let Some(ids) = cache.lock().unwrap().get(&key) {
+            return Some(*ids);
+        }
+
+        // Asking `id` inside the container resolves names and an absent USER uniformly, and pulls
+        // the image if it isn't local yet - which `run` would do moments later anyway.
+        let mut probe = Command::new(get_podman_path());
+        probe.args(&["run", "--rm", "--entrypoint", "/bin/sh"]);
+        if let Some(user) = user_arg {
+            probe.args(&["--user", user]);
+        }
+        probe.args(&[image, "-c", "id -u; id -g"]);
+
+        let ids = match probe.output().await {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let mut fields = stdout.split_whitespace();
+                match (fields.next().and_then(|v| v.parse().ok()),
+                       fields.next().and_then(|v| v.parse().ok())) {
+                    (Some(uid), Some(gid)) => Some((uid, gid)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        // Images without a shell (distroless and friends) can't be probed, so fall back to the
+        // declared USER. Only a numeric uid:gid pair is usable - anything else would need the
+        // image's passwd to resolve.
+        let ids = match (ids, user_arg) {
+            (None, None) => {
+                let out = Command::new(get_podman_path())
+                    .args(&["image", "inspect", "--format", "{{.Config.User}}", image])
+                    .output().await;
+                match out {
+                    Ok(out) if out.status.success() => {
+                        let declared = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if declared.is_empty() || declared == "root" {
+                            Some((0, 0))
+                        } else {
+                            parse_numeric_user(&declared)
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            (ids, _) => ids,
+        };
+
+        if let Some(ids) = ids {
+            cache.lock().unwrap().insert(key, ids);
+        }
+        ids
+    }
+
+    fn dir_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.dir.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Build (or reuse) an image derived from the configured base, optionally with `uid:gid` added
+    /// as a real user that the image then runs as.
+    async fn build_image(&self, pc: &PodmanConfig, build_user: Option<(u32, u32)>) -> Result<String> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
+        let mut dockerfile = format!("FROM {}\n", pc.base);
+
+        if !pc.packages.is_empty() {
+            let packages = pc.packages.join(" ");
+            dockerfile.push_str(&format!(
+                "RUN if command -v apk > /dev/null ; then apk update && apk add --no-cache {} ; \
+                elif command -v apt-get > /dev/null ; then apt-get update && apt-get install --no-install-recommends --yes {} ; \
+                elif command -v dnf > /dev/null ; then dnf install -y {} ; \
+                elif command -v yum > /dev/null ; then yum install -y {} ; \
+                else echo 'No supported package manager found' && exit 1 ; fi\n",
+                packages, packages, packages, packages
+            ));
+        }
+
+        for cmd in &pc.commands {
+            dockerfile.push_str(&format!("RUN {}\n", cmd));
+        }
+
+        // Added last, so the build itself still runs as root. Appending to passwd/group only when
+        // the ids are absent keeps this additive: unlike bind-mounting the host's passwd over the
+        // image's at runtime, it can't break users the image defines for itself. A real entry
+        // matters because a uid without one has no name and no home, which trips up git, npm and
+        // anything else calling getpwuid().
+        if let Some((uid, gid)) = build_user {
+            dockerfile.push_str(&format!(
+                "RUN grep -q \"^[^:]*:[^:]*:{gid}:\" /etc/group || echo \"webcentral:x:{gid}:\" >> /etc/group ; \
+                grep -q \"^[^:]*:[^:]*:{uid}:\" /etc/passwd || echo \"webcentral:x:{uid}:{gid}::{home}:/bin/sh\" >> /etc/passwd\n\
+                USER {uid}:{gid}\n",
+                uid = uid, gid = gid, home = self.container_home(pc)
+            ));
+        }
+
+        // Tag by what goes into the image rather than by project directory alone, so an unchanged
+        // configuration can skip the build entirely. Even a fully cached build costs about a
+        // second, and projects are started on demand while a request is waiting. The base image's
+        // local ID is part of the hash, so a pulled base update triggers one (cached) rebuild -
+        // exactly what building every time used to do. A base that isn't local yet hashes as
+        // empty and self-corrects once the first build pulls it.
+        let base_id = Command::new(get_podman_path())
+            .args(&["image", "inspect", "--format", "{{.Id}}", &pc.base])
+            .output()
+            .await
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
         let mut hasher = DefaultHasher::new();
-        self.dir.hash(&mut hasher);
-        let hash = hasher.finish();
-        let container_name = format!("webcentral-{:x}", hash);
+        dockerfile.hash(&mut hasher);
+        base_id.hash(&mut hasher);
+        let repo = format!("webcentral-{:x}", self.dir_hash());
+        let image_name = format!("{}:{:x}", repo, hasher.finish());
 
-        let image_name = if dc.packages.is_empty() && dc.commands.is_empty() {
-            // Just use the base image
-            dc.base.clone()
+        let exists = Command::new(get_podman_path())
+            .args(&["image", "inspect", &image_name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if exists {
+            return Ok(image_name);
+        }
+
+        let dockerfile_path = self.dir.join("_webcentral_data/Dockerfile");
+        fs::create_dir_all(dockerfile_path.parent().unwrap())?;
+        fs::write(&dockerfile_path, &dockerfile)?;
+
+        let output = Command::new(get_podman_path())
+            .args(&["build", "-t", &image_name, "-f"])
+            .arg(&dockerfile_path)
+            .arg(&self.dir)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            self.logger.write("podman", &stderr);
+            anyhow::bail!("Image build failed");
+        }
+
+        // Remove this project's images for older configs. They are named tags, which
+        // `podman image prune` never touches, so they would otherwise pile up forever.
+        if let Ok(out) = Command::new(get_podman_path())
+            .args(&["images", &repo, "--format", "{{.Tag}}"])
+            .output()
+            .await
+        {
+            for tag in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                let stale = format!("{}:{}", repo, tag);
+                if stale != image_name {
+                    let _ = Command::new(get_podman_path())
+                        .args(&["rmi", &stale])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await;
+                }
+            }
+        }
+
+        Ok(image_name)
+    }
+
+    /// Home directory for the baked-in user. It lives in the project directory when that is mounted,
+    /// so it persists; otherwise there is nowhere to put it that outlives the container.
+    fn container_home(&self, pc: &PodmanConfig) -> String {
+        if pc.mount_app_dir {
+            format!("{}/_webcentral_data/home", pc.app_dir)
         } else {
-            // Create our own Dockerfile, as we need some RUN commands
-            let image_name = format!("{}:latest", container_name);
+            "/tmp".to_string()
+        }
+    }
 
-            // Build Dockerfile
-            let mut dockerfile = format!("FROM {}\n", dc.base);
-
-            for cmd in &dc.commands {
-                dockerfile.push_str(&format!("RUN {}\n", cmd));
+    /// The one place uid policy lives: whatever user the container runs as inside, everything it
+    /// writes into the project directory or `mounts[]` must land on the host owned by the project
+    /// owner. Rootful podman maps host ids straight through, so when the container user differs
+    /// from the owner, an identity mapping with the two swapped puts the container's writes on
+    /// the owner - and shows it the owner's files as its own. A non-root webcentral means
+    /// rootless podman, where the only host user a container can write as is webcentral's own:
+    /// that's the owner precisely when the project is ours, and unsupported otherwise. Container
+    /// root already is us under rootless podman (`user = project` resolves to it for that
+    /// reason), so only an explicitly requested other uid needs keep-id - which fails at start,
+    /// loudly rather than by leaking ownership, on setups where custom rootless mappings are
+    /// broken (e.g. containers/podman#27785).
+    fn add_userns_args(&self, cmd: &mut Command, run_uid: u32, run_gid: u32) {
+        let euid = nix::unistd::geteuid().as_raw();
+        if euid == 0 {
+            if (run_uid, run_gid) != (self.uid, self.gid) {
+                cmd.args(swap_map_args("--uidmap", run_uid, self.uid));
+                cmd.args(swap_map_args("--gidmap", run_gid, self.gid));
             }
+        } else if self.uid != euid {
+            self.logger.write("podman", &format!(
+                "This project is owned by uid {} but webcentral runs as uid {}; a non-root \
+                 webcentral can only keep container-written files owned by its own user. Files \
+                 this container writes may end up owned by a meaningless subuid.",
+                self.uid, euid));
+        } else if run_uid == 0 {
+            // Rootless podman maps container root to us all by itself.
+        } else if (run_uid, run_gid) == (euid, nix::unistd::getegid().as_raw()) {
+            // The plain form works on any podman version, unlike the uid=/gid= form below.
+            cmd.args(&["--userns", "keep-id"]);
+        } else {
+            // Map us to whatever the container runs as (needs podman >= 4.3).
+            cmd.args(&["--userns", &format!("keep-id:uid={},gid={}", run_uid, run_gid)]);
+        }
+    }
 
-            // Write Dockerfile
-            let dockerfile_path = self.dir.join("_webcentral_data/Dockerfile");
-            fs::create_dir_all(dockerfile_path.parent().unwrap())?;
-            fs::write(&dockerfile_path, dockerfile)?;
+    async fn build_podman_command(
+        &self,
+        port: u16,
+        pc: &PodmanConfig,
+        command: &str,
+    ) -> Result<Command> {
+        let container_name = format!("webcentral-{:x}", self.dir_hash());
 
-            // Build image
-            let output = Command::new(get_docker_path())
-                .args(&["build", "-t", &image_name, "-f"])
-                .arg(&dockerfile_path)
-                .arg(&self.dir)
-                .output()
-                .await?;
+        // `user` only decides who the container runs as *inside* - host-side, add_userns_args
+        // makes its writes land owned by the project owner regardless. Under a root webcentral,
+        // `project` bakes the owner into the image as a real user and lets the image declare it,
+        // so it works exactly like a third-party image declaring its own. Under a non-root
+        // webcentral (rootless podman) the owner is container root - that is how rootless podman
+        // represents the invoking user - so there is nothing to bake and nothing to map, which
+        // also keeps the common case off keep-id (see add_userns_args). `known_ids` skips asking
+        // podman when the config already tells us, and must always agree with what podman would
+        // report.
+        let rootful = nix::unistd::geteuid().is_root();
+        let build_user = match pc.user.as_str() {
+            "project" if rootful => Some((self.uid, self.gid)),
+            _ => None,
+        };
+        let (user_arg, known_ids): (Option<&str>, Option<(u32, u32)>) = match pc.user.as_str() {
+            // Rootful bakes a USER directive; rootless forces root explicitly, so a base image
+            // declaring its own USER can't sneak in a different (unmapped) uid.
+            "project" if rootful => (None, build_user),
+            "project" => (Some("0:0"), Some((0, 0))),
+            "image" => (None, None),
+            // Names resolve inside the image, so their ids have to come from the probe.
+            spec => (Some(spec), parse_numeric_user(spec)),
+        };
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                self.logger.write("docker", &stderr);
-                anyhow::bail!("Docker build failed");
-            }
-            image_name
+        let image_name = if build_user.is_none() && pc.packages.is_empty() && pc.commands.is_empty() {
+            // Nothing to add to the base image
+            pc.base.clone()
+        } else {
+            self.build_image(pc, build_user).await?
+        };
+
+        // A container that outlived its webcentral (killed rather than shut down) keeps holding the
+        // name, and `run` then fails with a name conflict on every subsequent attempt - wedging the
+        // project for good. The name is derived from the project directory, so anything still
+        // answering to it is a leftover of ours.
+        let _ = Command::new(get_podman_path())
+            .args(&["rm", "--force", &container_name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+
+        // Resolve who the container will run as; the entire host-side policy derives from this.
+        let (run_uid, run_gid) = match known_ids {
+            Some(ids) => ids,
+            None => match self.container_user_ids(&image_name, user_arg).await {
+                Some(ids) => ids,
+                None => {
+                    self.logger.write("podman", &format!(
+                        "Could not determine which user image {} runs as; assuming root. If \
+                         that's wrong, files the container writes may not end up owned by the \
+                         project owner, and it may not be able to write in its mounts.",
+                        image_name));
+                    (0, 0)
+                }
+            },
         };
 
         // Prepare run command
-        let mut cmd = Command::new(get_docker_path());
+        let mut cmd = Command::new(get_podman_path());
         cmd.args(&["run", "--rm", "--name", &container_name]);
 
-        // Port mapping
-        cmd.args(&["-p", &format!("{}:{}", port, dc.http_port)]);
+        self.add_userns_args(&mut cmd, run_uid, run_gid);
 
-        // App directory mount
-        if dc.mount_app_dir {
-            cmd.args(&["-v", &format!("{}:{}", self.dir.display(), dc.app_dir)]);
-            cmd.args(&["-w", &dc.app_dir]);
+        // Port mapping
+        cmd.args(&["-p", &format!("{}:{}", port, pc.http_port)]);
+
+        if let Some(user) = user_arg {
+            cmd.args(&["--user", user]);
         }
 
-        // Additional mounts
-        for mount in &dc.mounts {
+        // App directory mount
+        if pc.mount_app_dir {
+            cmd.args(&["-v", &format!("{}:{}", self.dir.display(), pc.app_dir)]);
+            cmd.args(&["-w", &pc.app_dir]);
+        }
+
+        // A persistent home for `project` containers, whether the owner is baked in (rootful,
+        // where the passwd entry also points here) or is container root (rootless). Set the
+        // environment variable explicitly rather than trusting podman to resolve it from passwd.
+        if pc.user == "project" {
+            if pc.mount_app_dir {
+                self.create_dir_for_container(&self.dir.join("_webcentral_data/home"))?;
+            }
+            cmd.args(&["-e", &format!("HOME={}", self.container_home(pc))]);
+        }
+
+        // Additional mounts. These live on the host but are written by the container; owner
+        // ownership is exactly where the container's writes land through the userns mapping.
+        for mount in &pc.mounts {
             let container_path = if mount.starts_with('/') {
                 mount.clone()
             } else {
-                format!("{}/{}", dc.app_dir, mount)
+                format!("{}/{}", pc.app_dir, mount)
             };
             let host_path = self.dir
                 .join("_webcentral_data/mounts")
                 .join(&container_path.trim_start_matches('/'));
-            fs::create_dir_all(&host_path)?;
+            self.create_dir_for_container(&host_path)?;
             cmd.args(&["-v", &format!("{}:{}", host_path.display(), container_path)]);
         }
 
         // Environment variables
-        cmd.args(&["-e", &format!("PORT={}", dc.http_port)]);
+        cmd.args(&["-e", &format!("PORT={}", pc.http_port)]);
         for (key, val) in &self.config.environment {
             cmd.args(&["-e", &format!("{}={}", key, val)]);
         }
@@ -1351,7 +1632,7 @@ tr:hover {{ background: #f5f5f5; }}
     /// Get the project type name for dashboard display
     pub fn get_type_name(&self) -> String {
         match &self.config.project_type {
-            ProjectType::Application { docker: Some(_), .. } => "Docker",
+            ProjectType::Application { podman: Some(_), .. } => "Podman",
             ProjectType::Application { .. } => "Application",
             ProjectType::Static => "Static",
             ProjectType::Redirect { .. } => "Redirect",
@@ -1597,28 +1878,57 @@ fn get_user_home(uid: u32) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-/// Returns the path to podman or docker, checking PATH on first call.
-/// Prefers podman if available, falls back to docker, warns if neither found.
-fn get_docker_path() -> &'static str {
+/// Returns the podman installation to use, checking PATH on first call.
+fn get_podman_path() -> &'static str {
     use std::sync::OnceLock;
     use std::os::unix::fs::PermissionsExt;
-    static DOCKER_PATH: OnceLock<String> = OnceLock::new();
+    static PODMAN_PATH: OnceLock<String> = OnceLock::new();
 
-    DOCKER_PATH.get_or_init(|| {
+    PODMAN_PATH.get_or_init(|| {
         let path_var = std::env::var("PATH").unwrap_or_default();
-        // Check for podman first (preferred), then docker
-        for cmd in &["podman", "docker"] {
-            for dir in path_var.split(':') {
-                let full_path = PathBuf::from(dir).join(cmd);
-                if let Ok(meta) = fs::metadata(&full_path) {
-                    if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 {
-                        return full_path.to_string_lossy().to_string();
-                    }
+        for dir in path_var.split(':') {
+            let full_path = PathBuf::from(dir).join("podman");
+            if let Ok(meta) = fs::metadata(&full_path) {
+                if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 {
+                    return full_path.to_string_lossy().to_string();
                 }
             }
         }
-        // Neither found, warn and fall back to "docker"
-        println!("Warning: neither podman nor docker found in PATH, using 'docker'");
-        "docker".to_string()
+        println!("Warning: podman not found in PATH");
+        "podman".to_string()
     })
 }
+
+/// Parse a numeric `uid:gid` pair. Anything else - including a bare uid, whose gid would depend
+/// on the image's /etc/passwd - returns None.
+fn parse_numeric_user(spec: &str) -> Option<(u32, u32)> {
+    let (uid, gid) = spec.split_once(':')?;
+    Some((uid.parse().ok()?, gid.parse().ok()?))
+}
+
+/// Podman `--uidmap`/`--gidmap` arguments for an identity mapping over 0..max(65536, ids+1) with
+/// `container_id` and `host_id` swapped (a mapping must be a bijection, so the displaced id has
+/// to land somewhere). Under rootful podman host ids map directly, so this makes everything the
+/// container writes as `container_id` land on the host as `host_id` and vice versa, while every
+/// other id stays put, keeping the rest of the image's ownership intact. Equal ids degenerate to
+/// a plain identity map.
+fn swap_map_args(flag: &str, container_id: u32, host_id: u32) -> Vec<String> {
+    let (lo, hi) = (container_id.min(host_id), container_id.max(host_id));
+    let top = 65536.max(hi.saturating_add(1));
+    let mut args = Vec::new();
+    let mut push = |from: u32, to: u32, amount: u32| {
+        if amount > 0 {
+            args.push(flag.to_string());
+            args.push(format!("{}:{}:{}", from, to, amount));
+        }
+    };
+    push(0, 0, lo);
+    push(lo, hi, 1);
+    push(lo + 1, lo + 1, hi.saturating_sub(lo + 1));
+    if hi != lo {
+        push(hi, lo, 1);
+    }
+    push(hi.saturating_add(1), hi.saturating_add(1), top.saturating_sub(hi.saturating_add(1)));
+    args
+}
+

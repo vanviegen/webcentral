@@ -26,6 +26,21 @@ CROSSMARK = '✗'
 CLEAR_LINE = '\033[2K\r'
 
 
+class SkipTest(Exception):
+    """Raised by a test to report it cannot run in this environment"""
+
+
+def require_podman():
+    """Skip the calling test unless podman is installed and usable"""
+    path = shutil.which('podman')
+    if not path:
+        raise SkipTest("podman is not installed")
+    if subprocess.run([path, 'info'], stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode != 0:
+        raise SkipTest("podman is installed but not usable by this user")
+    return path
+
+
 class TestRunner:
     def __init__(self):
         self.tests = []
@@ -364,6 +379,7 @@ class TestRunner:
         self.setup()
 
         failed = False
+        skipped = 0
         try:
             for test_func in tests_to_run:
                 test_name = test_func.__name__
@@ -383,6 +399,9 @@ class TestRunner:
 
                     test_func(self)
                     print(f"{CLEAR_LINE}{GREEN}{CHECKMARK}{RESET} {test_name}")
+                except SkipTest as e:
+                    skipped += 1
+                    print(f"{CLEAR_LINE}{YELLOW}-{RESET} {test_name} {GRAY}(skipped: {e}){RESET}")
                 except Exception as e:
                     print(f"{CLEAR_LINE}{RED}{CROSSMARK}{RESET} {test_name}")
                     print(f"{RED}Error:{RESET} {e}")
@@ -404,7 +423,8 @@ class TestRunner:
                     break
 
             if not failed:
-                print(f"\n{GREEN}All {len(tests_to_run)} tests passed!{RESET}")
+                suffix = f" ({skipped} skipped)" if skipped else ""
+                print(f"\n{GREEN}All {len(tests_to_run) - skipped} tests passed!{RESET}{suffix}")
         finally:
             if self.webcentral_proc:
                 self.webcentral_proc.terminate()
@@ -1174,22 +1194,23 @@ def test_config_unknown_section(t):
 
 
 @test
-def test_config_unknown_key_in_docker(t):
-    """Unknown keys in docker section are logged as errors"""
-    # Just serve static files - docker section is present but not used
-    t.write_file('webcentral.ini', '[docker]\nbase=alpine\ninvalid_docker_key=value')
+def test_config_unknown_key_in_podman_section(t):
+    """Unknown keys in the [podman] section ([docker] alias here) are logged as errors"""
+    # Just serve static files - podman section is present but not used
+    t.write_file('webcentral.ini', '[docker]\nbase=alpine\ninvalid_podman_key=value')
     t.write_file('public/index.html', '<h1>Test</h1>')
 
     # First make a request to create the project and load config - this may fail
-    # because docker is configured but we'll check the logs were written
+    # because a container is configured but we'll check the logs were written
     try:
         t.assert_http('/', check_body='Test')
     except:
         # Even if request fails, the config should have been loaded and error logged
         pass
 
+    # The [docker] alias normalizes to podman.*, so the error names the podman key.
     # Verify the config error was logged at least once (may appear multiple times due to restarts)
-    t.await_log("Unexpected key 'docker.invalid_docker_key'", timeout=2)
+    t.await_log("Unexpected key 'podman.invalid_podman_key'", timeout=2)
 
 
 @test
@@ -2813,6 +2834,188 @@ def test_listener_survives_accept_error(t):
             proc.wait()
         log_f.close()
         shutil.rmtree(root, ignore_errors=True)
+
+
+# Alpine's own busybox is built without httpd, so it comes from busybox-extras. Serving from /tmp
+# keeps this independent of whether the project directory is mounted.
+PODMAN_PACKAGES = 'packages[] = busybox-extras\n'
+PODMAN_SERVE = ('mkdir -p /tmp/srv && echo podman ok > /tmp/srv/index.html '
+                '&& exec /usr/sbin/httpd -f -p $PORT -h /tmp/srv')
+
+
+def _podman_setup(t, ini):
+    """Pull alpine up front (so the per-request timeouts stay sane) and write a podman project"""
+    podman = require_podman()
+    subprocess.run([podman, 'pull', 'alpine'], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=300)
+    t.write_file('webcentral.ini', ini)
+    return podman
+
+
+def _read_mount(t, rel):
+    """Read a file the container wrote into one of its mounts, returning (lines, uid, gid)"""
+    path = os.path.join(t.tmpdir, t.current_test_domain, '_webcentral_data/mounts', rel)
+    assert os.path.exists(path), f"container did not create {rel} (looked in {path})"
+    st = os.stat(path)
+    with open(path) as f:
+        return f.read().split(), st.st_uid, st.st_gid
+
+
+def _assert_owned_by_us(rel_desc, uid, gid):
+    """Host-side, container-written files must always be owned by the project owner (us)"""
+    assert (uid, gid) == (os.getuid(), os.getgid()), \
+        f"{rel_desc} is owned by {uid}:{gid} on the host, expected {os.getuid()}:{os.getgid()}"
+
+
+def require_working_keepid(podman):
+    """Skip when rootless podman can't map the invoking user to a non-root container uid.
+    Broken on some podman/crun/kernel combos: containers/podman#27785."""
+    if os.geteuid() == 0:
+        return  # rootful podman doesn't use keep-id
+    r = subprocess.run([podman, 'run', '--rm', '--userns=keep-id', 'alpine', 'true'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+    if r.returncode != 0:
+        raise SkipTest("rootless podman keep-id is broken on this host (containers/podman#27785)")
+
+
+@test
+def test_podman_runs_as_project_user(t):
+    """With the project dir mounted, the container runs as the project owner and writes as them.
+    Rootless podman represents the owner as container root; a root-owned project under a root
+    webcentral bakes uid 0, so both report root inside."""
+    _podman_setup(t,
+        f'command = {{ id -u; id -g; whoami; printenv HOME; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
+        '[podman]\n'
+        'base = alpine\n'
+        + PODMAN_PACKAGES +
+        'mounts[] = data\n')
+
+    t.assert_http('/', check_body='podman ok', timeout=300)
+
+    fields, uid, gid = _read_mount(t, 'app/data/id.txt')
+    assert fields == ['0', '0', 'root', '/app/_webcentral_data/home'], \
+        f"container reported {fields}, expected to run as (mapped) root with the persistent HOME"
+    _assert_owned_by_us('mounted file', uid, gid)
+
+
+@test
+def test_podman_bakes_owner_into_image(t):
+    """A root webcentral bakes a non-root project owner into the image as user 'webcentral'"""
+    if os.geteuid() != 0:
+        raise SkipTest("needs root to give the project dir to another user")
+
+    _podman_setup(t,
+        f'command = {{ id -u; id -g; whoami; printenv HOME; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
+        '[podman]\n'
+        'base = alpine\n'
+        + PODMAN_PACKAGES +
+        'mounts[] = data\n')
+    project_dir = os.path.join(t.tmpdir, t.current_test_domain)
+    for root, dirs, files in os.walk(project_dir):
+        for p in dirs + files:
+            os.chown(os.path.join(root, p), 4321, 4321)
+    os.chown(project_dir, 4321, 4321)
+
+    t.assert_http('/', check_body='podman ok', timeout=300)
+
+    fields, uid, gid = _read_mount(t, 'app/data/id.txt')
+    assert fields == ['4321', '4321', 'webcentral', '/app/_webcentral_data/home'], \
+        f"container reported {fields}, expected 4321/4321 as 'webcentral'"
+    assert (uid, gid) == (4321, 4321), \
+        f"mounted file is owned by {uid}:{gid} on the host, expected the project owner 4321:4321"
+
+
+@test
+def test_podman_user_override(t):
+    """An explicit [podman] user runs the container as exactly that user inside"""
+    podman = _podman_setup(t,
+        f'command = {{ id -u; id -g; }} > /data/id.txt && {PODMAN_SERVE}\n'
+        '[podman]\n'
+        'base = alpine\n'
+        'mount_app_dir = false\n'
+        + PODMAN_PACKAGES +
+        f'user = {os.getuid()}:{os.getgid()}\n'
+        'mounts[] = /data\n')
+    require_working_keepid(podman)
+
+    t.assert_http('/', check_body='podman ok', timeout=300)
+
+    fields, uid, gid = _read_mount(t, 'data/id.txt')
+    assert fields == [str(os.getuid()), str(os.getgid())], f"container reported {fields}"
+    _assert_owned_by_us('mounted file', uid, gid)
+
+
+@test
+def test_podman_foreign_user_mapped_to_owner(t):
+    """A container user unrelated to the owner still writes owner-owned files on the host"""
+    podman = _podman_setup(t,
+        f'command = mkdir -p /data/sub && {{ id -u; id -g; }} > /data/sub/id.txt && {PODMAN_SERVE}\n'
+        '[podman]\n'
+        'base = alpine\n'
+        'mount_app_dir = false\n'
+        + PODMAN_PACKAGES +
+        'user = 4242:4242\n'
+        'mounts[] = /data\n')
+    require_working_keepid(podman)
+
+    t.assert_http('/', check_body='podman ok', timeout=300)
+
+    fields, uid, gid = _read_mount(t, 'data/sub/id.txt')
+    assert fields == ['4242', '4242'], f"container reported {fields}, expected 4242/4242"
+    _assert_owned_by_us('mounted file', uid, gid)
+
+
+@test
+def test_podman_user_image_keeps_image_user(t):
+    """user = image keeps the image's own user inside, while host files stay ours.
+    Also covers [docker] as a section alias."""
+    _podman_setup(t,
+        f'command = {{ id -u; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
+        '[docker]\n'
+        'base = alpine\n'
+        + PODMAN_PACKAGES +
+        'user = image\n'
+        'mounts[] = data\n')
+
+    t.assert_http('/', check_body='podman ok', timeout=300)
+
+    fields, uid, gid = _read_mount(t, 'app/data/id.txt')
+    assert fields == ['0'], f"container reported uid {fields}, expected 0 (alpine's own user)"
+    _assert_owned_by_us('mounted file', uid, gid)
+
+
+@test
+def test_podman_packages_are_installed(t):
+    """[podman] packages are installed into the generated image"""
+    _podman_setup(t,
+        f'command = {{ command -v httpd; }} > /app/data/found.txt && {PODMAN_SERVE}\n'
+        '[podman]\n'
+        'base = alpine\n'
+        + PODMAN_PACKAGES +
+        'mounts[] = data\n')
+
+    t.assert_http('/', check_body='podman ok', timeout=300)
+
+    fields, _, _ = _read_mount(t, 'app/data/found.txt')
+    assert fields and fields[0].endswith('/httpd'), f"busybox-extras was not installed: {fields}"
+
+
+@test
+def test_podman_bare_uid_rejected(t):
+    """A bare numeric [podman] user is rejected as ambiguous at config parse"""
+    t.write_file('webcentral.ini',
+        'command = true\n'
+        '[podman]\n'
+        'base = alpine\n'
+        'user = 1000\n')
+
+    # The error is logged when the project is first loaded, triggered by any request;
+    # the request itself may fail (podman may not even be installed), which is fine.
+    try:
+        t.assert_http('/', timeout=10)
+    except Exception:
+        pass
+    t.await_log("Invalid 'podman.user' value '1000'", timeout=5)
 
 
 if __name__ == '__main__':
