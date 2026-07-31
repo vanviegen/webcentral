@@ -1208,55 +1208,231 @@ tr:hover {{ background: #f5f5f5; }}
         Ok(cmd)
     }
 
+    /// Make sure `path` is owned by uid/gid, so a container running as that user can write there.
+    /// Only recurses when the top-level ownership is already wrong, so the steady state costs a
+    /// single stat while directories created before webcentral knew the right user still get
+    /// repaired. Failure is logged rather than fatal: it only means webcentral isn't running as
+    /// root, which is fine as long as the container user matches the existing owner.
+    fn ensure_owned_by(&self, path: &Path, uid: u32, gid: u32) {
+        if get_ownership(path) == (uid, gid) {
+            return;
+        }
+        if let Err(e) = chown_recursive(path, uid, gid) {
+            self.logger.write("docker", &format!(
+                "Could not change ownership of {} to {}:{} ({}). A container running as that user \
+                 may not be able to write there.",
+                path.display(), uid, gid, e));
+        }
+    }
+
+    /// The uid/gid a container started from `image` actually runs as. This needs the engine's help:
+    /// `USER` may name a user that only exists inside the image, a bare uid says nothing about the
+    /// gid it pairs with, and an image declaring no user at all runs as root. Cached per
+    /// image+user, as it costs a container round trip.
+    async fn container_user_ids(&self, image: &str, user_arg: Option<&str>) -> Option<(u32, u32)> {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<HashMap<String, (u32, u32)>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+        let key = format!("{}\0{}", image, user_arg.unwrap_or(""));
+        if let Some(ids) = cache.lock().unwrap().get(&key) {
+            return Some(*ids);
+        }
+
+        // Asking `id` inside the container resolves names, bare uids and an absent USER uniformly,
+        // and pulls the image if it isn't local yet - which `run` would do moments later anyway.
+        let mut probe = Command::new(get_docker_path());
+        probe.args(&["run", "--rm", "--entrypoint", "/bin/sh"]);
+        if let Some(user) = user_arg {
+            probe.args(&["--user", user]);
+        }
+        probe.args(&[image, "-c", "id -u; id -g"]);
+
+        let ids = match probe.output().await {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let mut fields = stdout.split_whitespace();
+                match (fields.next().and_then(|v| v.parse().ok()),
+                       fields.next().and_then(|v| v.parse().ok())) {
+                    (Some(uid), Some(gid)) => Some((uid, gid)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        // Images without a shell (distroless and friends) can't be probed, so fall back to the
+        // declared USER. Only a fully numeric one is usable - a name would need the image's passwd.
+        let ids = match (ids, user_arg) {
+            (None, None) => {
+                let out = Command::new(get_docker_path())
+                    .args(&["image", "inspect", "--format", "{{.Config.User}}", image])
+                    .output().await;
+                match out {
+                    Ok(out) if out.status.success() => {
+                        let declared = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        if declared.is_empty() || declared == "root" {
+                            Some((0, 0))
+                        } else {
+                            parse_numeric_user(&declared)
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            (ids, _) => ids,
+        };
+
+        match ids {
+            Some(ids) => {
+                cache.lock().unwrap().insert(key, ids);
+                Some(ids)
+            }
+            None => {
+                self.logger.write("docker", &format!(
+                    "Could not determine which user image {} runs as; mount directories will be \
+                     owned by the project owner, which may not be writable by the container.",
+                    image));
+                None
+            }
+        }
+    }
+
+    fn dir_hash(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        self.dir.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Build (or reuse) an image derived from the configured base, optionally with `uid:gid` added
+    /// as a real user that the image then runs as.
+    async fn build_image(&self, dc: &DockerConfig, build_user: Option<(u32, u32)>) -> Result<String> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut dockerfile = format!("FROM {}\n", dc.base);
+
+        if !dc.packages.is_empty() {
+            let packages = dc.packages.join(" ");
+            dockerfile.push_str(&format!(
+                "RUN if command -v apk > /dev/null ; then apk update && apk add --no-cache {} ; \
+                elif command -v apt-get > /dev/null ; then apt-get update && apt-get install --no-install-recommends --yes {} ; \
+                elif command -v dnf > /dev/null ; then dnf install -y {} ; \
+                elif command -v yum > /dev/null ; then yum install -y {} ; \
+                else echo 'No supported package manager found' && exit 1 ; fi\n",
+                packages, packages, packages, packages
+            ));
+        }
+
+        for cmd in &dc.commands {
+            dockerfile.push_str(&format!("RUN {}\n", cmd));
+        }
+
+        // Added last, so the build itself still runs as root. Appending to passwd/group only when
+        // the ids are absent keeps this additive: unlike bind-mounting the host's passwd over the
+        // image's at runtime, it can't break users the image defines for itself. A real entry
+        // matters because a uid without one has no name and no home, which trips up git, npm and
+        // anything else calling getpwuid().
+        if let Some((uid, gid)) = build_user {
+            dockerfile.push_str(&format!(
+                "RUN grep -q \"^[^:]*:[^:]*:{gid}:\" /etc/group || echo \"webcentral:x:{gid}:\" >> /etc/group ; \
+                grep -q \"^[^:]*:[^:]*:{uid}:\" /etc/passwd || echo \"webcentral:x:{uid}:{gid}::{home}:/bin/sh\" >> /etc/passwd\n\
+                USER {uid}:{gid}\n",
+                uid = uid, gid = gid, home = self.container_home(dc)
+            ));
+        }
+
+        // Tag by what goes into the image rather than by project directory alone, so an unchanged
+        // configuration can skip the build entirely. Even a fully cached `docker build` costs about
+        // a second, and projects are started on demand while a request is waiting.
+        let mut hasher = DefaultHasher::new();
+        dockerfile.hash(&mut hasher);
+        let image_name = format!("webcentral-{:x}:{:x}", self.dir_hash(), hasher.finish());
+
+        let exists = Command::new(get_docker_path())
+            .args(&["image", "inspect", &image_name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if exists {
+            return Ok(image_name);
+        }
+
+        let dockerfile_path = self.dir.join("_webcentral_data/Dockerfile");
+        fs::create_dir_all(dockerfile_path.parent().unwrap())?;
+        fs::write(&dockerfile_path, &dockerfile)?;
+
+        let output = Command::new(get_docker_path())
+            .args(&["build", "-t", &image_name, "-f"])
+            .arg(&dockerfile_path)
+            .arg(&self.dir)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            self.logger.write("docker", &stderr);
+            anyhow::bail!("Docker build failed");
+        }
+        Ok(image_name)
+    }
+
+    /// Home directory for the baked-in user, inside the mounted project directory.
+    fn container_home(&self, dc: &DockerConfig) -> String {
+        format!("{}/_webcentral_data/home", dc.app_dir)
+    }
+
     async fn build_docker_command(
         &self,
         port: u16,
         dc: &DockerConfig,
         command: &str,
     ) -> Result<Command> {
-        // Generate container name using a hash of the directory path
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        let container_name = format!("webcentral-{:x}", self.dir_hash());
 
-        let mut hasher = DefaultHasher::new();
-        self.dir.hash(&mut hasher);
-        let hash = hasher.finish();
-        let container_name = format!("webcentral-{:x}", hash);
+        // When the project directory is mounted, webcentral owns the image, so it bakes the project
+        // owner into it as a real user and lets the image declare it - the same way a third-party
+        // image declares its own. Both cases then follow one path: the image decides who it runs
+        // as, and mount ownership follows from that. Without this, files the application writes
+        // into the user's own project directory would end up owned by root.
+        let build_user = match dc.user {
+            None if dc.mount_app_dir => Some((self.uid, self.gid)),
+            _ => None,
+        };
 
-        let image_name = if dc.packages.is_empty() && dc.commands.is_empty() {
-            // Just use the base image
+        let image_name = if build_user.is_none() && dc.packages.is_empty() && dc.commands.is_empty() {
+            // Nothing to add to the base image
             dc.base.clone()
         } else {
-            // Create our own Dockerfile, as we need some RUN commands
-            let image_name = format!("{}:latest", container_name);
-
-            // Build Dockerfile
-            let mut dockerfile = format!("FROM {}\n", dc.base);
-
-            for cmd in &dc.commands {
-                dockerfile.push_str(&format!("RUN {}\n", cmd));
-            }
-
-            // Write Dockerfile
-            let dockerfile_path = self.dir.join("_webcentral_data/Dockerfile");
-            fs::create_dir_all(dockerfile_path.parent().unwrap())?;
-            fs::write(&dockerfile_path, dockerfile)?;
-
-            // Build image
-            let output = Command::new(get_docker_path())
-                .args(&["build", "-t", &image_name, "-f"])
-                .arg(&dockerfile_path)
-                .arg(&self.dir)
-                .output()
-                .await?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                self.logger.write("docker", &stderr);
-                anyhow::bail!("Docker build failed");
-            }
-            image_name
+            self.build_image(dc, build_user).await?
         };
+
+        // An explicit `user` setting overrides whatever the image declares; otherwise the image
+        // decides. `known_ids` is purely an optimization: it skips asking the engine when we can
+        // already tell, and must always agree with what the engine would report.
+        let (user_arg, known_ids): (Option<String>, Option<(u32, u32)>) = match dc.user.as_deref() {
+            Some("image") => (None, None),
+            // A bare uid deliberately fails to parse: only the image can say which gid it pairs with.
+            Some(spec) => (Some(spec.to_string()), parse_numeric_user(spec)),
+            None => (None, build_user),
+        };
+
+        // A container that outlived its webcentral (killed rather than shut down) keeps holding the
+        // name, and `run` then fails with a name conflict on every subsequent attempt - wedging the
+        // project for good. The name is derived from the project directory, so anything still
+        // answering to it is a leftover of ours.
+        let _ = Command::new(get_docker_path())
+            .args(&["rm", "--force", &container_name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
 
         // Prepare run command
         let mut cmd = Command::new(get_docker_path());
@@ -1265,24 +1441,77 @@ tr:hover {{ background: #f5f5f5; }}
         // Port mapping
         cmd.args(&["-p", &format!("{}:{}", port, dc.http_port)]);
 
+        if let Some(user) = &user_arg {
+            cmd.args(&["--user", user]);
+        }
+
         // App directory mount
         if dc.mount_app_dir {
             cmd.args(&["-v", &format!("{}:{}", self.dir.display(), dc.app_dir)]);
             cmd.args(&["-w", &dc.app_dir]);
         }
 
-        // Additional mounts
-        for mount in &dc.mounts {
-            let container_path = if mount.starts_with('/') {
-                mount.clone()
-            } else {
-                format!("{}/{}", dc.app_dir, mount)
+        // The home directory the baked-in user's passwd entry points at. It lives inside the
+        // project directory, which is mounted anyway, so it survives restarts.
+        if let Some((uid, gid)) = build_user {
+            let home = self.dir.join("_webcentral_data/home");
+            fs::create_dir_all(&home)?;
+            self.ensure_owned_by(&home, uid, gid);
+            cmd.args(&["-e", &format!("HOME={}", self.container_home(dc))]);
+        }
+
+        // Additional mounts. These live on the host but are written by the container, so they have
+        // to be owned by whichever user the container runs as - otherwise the application gets
+        // EACCES the first time it tries to create something.
+        if !dc.mounts.is_empty() {
+            let mount_ids = match known_ids {
+                Some(ids) => Some(ids),
+                None => self.container_user_ids(&image_name, user_arg.as_deref()).await,
             };
-            let host_path = self.dir
-                .join("_webcentral_data/mounts")
-                .join(&container_path.trim_start_matches('/'));
-            fs::create_dir_all(&host_path)?;
-            cmd.args(&["-v", &format!("{}:{}", host_path.display(), container_path)]);
+
+            // Podman can shift uids per mount, so the container writes as its own user while the
+            // files land on the host owned by the project owner. Docker has no per-container
+            // equivalent, so there the files are owned by the container's user. No point mapping a
+            // user onto itself, which is what happens when we baked the project owner in ourselves.
+            let idmap = dc.idmap && get_engine().is_podman
+                && mount_ids.map_or(false, |ids| ids != (self.uid, self.gid));
+            if dc.idmap && !idmap && !get_engine().is_podman {
+                self.logger.write("docker", "docker.idmap is only supported by podman; \
+                    mount directories will be owned by the container's user instead");
+            }
+            let (owner_uid, owner_gid) = if idmap {
+                (self.uid, self.gid)
+            } else {
+                mount_ids.unwrap_or((self.uid, self.gid))
+            };
+
+            for mount in &dc.mounts {
+                let container_path = if mount.starts_with('/') {
+                    mount.clone()
+                } else {
+                    format!("{}/{}", dc.app_dir, mount)
+                };
+                let host_path = self.dir
+                    .join("_webcentral_data/mounts")
+                    .join(&container_path.trim_start_matches('/'));
+                fs::create_dir_all(&host_path)?;
+                // A container running as root can write regardless of ownership, so leave the
+                // directory alone rather than needlessly requiring webcentral itself to be root.
+                if owner_uid != 0 {
+                    self.ensure_owned_by(&host_path, owner_uid, owner_gid);
+                }
+
+                let mut spec = format!("{}:{}", host_path.display(), container_path);
+                if let (true, Some((ctr_uid, ctr_gid))) = (idmap, mount_ids) {
+                    // Each triplet is <backing-filesystem-id>-<mapped-id>-<count>: files stored as
+                    // the project owner are presented to the container as its own user.
+                    spec.push_str(&format!(
+                        ":idmap=uids={}-{}-1;gids={}-{}-1",
+                        owner_uid, ctr_uid, owner_gid, ctr_gid
+                    ));
+                }
+                cmd.args(&["-v", &spec]);
+            }
         }
 
         // Environment variables
@@ -1597,14 +1826,21 @@ fn get_user_home(uid: u32) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-/// Returns the path to podman or docker, checking PATH on first call.
+/// The container engine we drive. Which one it is matters beyond the binary name: only Podman can
+/// remap uids per mount (`:idmap`), Docker's only equivalent is daemon-wide `userns-remap`.
+struct ContainerEngine {
+    path: String,
+    is_podman: bool,
+}
+
+/// Returns the podman or docker installation to use, checking PATH on first call.
 /// Prefers podman if available, falls back to docker, warns if neither found.
-fn get_docker_path() -> &'static str {
+fn get_engine() -> &'static ContainerEngine {
     use std::sync::OnceLock;
     use std::os::unix::fs::PermissionsExt;
-    static DOCKER_PATH: OnceLock<String> = OnceLock::new();
+    static ENGINE: OnceLock<ContainerEngine> = OnceLock::new();
 
-    DOCKER_PATH.get_or_init(|| {
+    ENGINE.get_or_init(|| {
         let path_var = std::env::var("PATH").unwrap_or_default();
         // Check for podman first (preferred), then docker
         for cmd in &["podman", "docker"] {
@@ -1612,13 +1848,40 @@ fn get_docker_path() -> &'static str {
                 let full_path = PathBuf::from(dir).join(cmd);
                 if let Ok(meta) = fs::metadata(&full_path) {
                     if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 {
-                        return full_path.to_string_lossy().to_string();
+                        return ContainerEngine {
+                            path: full_path.to_string_lossy().to_string(),
+                            is_podman: *cmd == "podman",
+                        };
                     }
                 }
             }
         }
         // Neither found, warn and fall back to "docker"
         println!("Warning: neither podman nor docker found in PATH, using 'docker'");
-        "docker".to_string()
+        ContainerEngine { path: "docker".to_string(), is_podman: false }
     })
+}
+
+fn get_docker_path() -> &'static str {
+    &get_engine().path
+}
+
+/// Parse a `uid[:gid]` string, if it's fully numeric. Names (resolved inside the image) return None.
+fn parse_numeric_user(spec: &str) -> Option<(u32, u32)> {
+    let (uid, gid) = spec.split_once(':').unwrap_or((spec, spec));
+    Some((uid.parse().ok()?, gid.parse().ok()?))
+}
+
+/// Recursively change ownership, without following symlinks (a symlink in a container-writable
+/// mount must not become a way to chown arbitrary files outside it).
+fn chown_recursive(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::lchown;
+    lchown(path, Some(uid), Some(gid))?;
+    // symlink_metadata: don't descend into symlinked directories
+    if fs::symlink_metadata(path)?.is_dir() {
+        for entry in fs::read_dir(path)? {
+            chown_recursive(&entry?.path(), uid, gid)?;
+        }
+    }
+    Ok(())
 }

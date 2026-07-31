@@ -100,12 +100,27 @@ the listener readable). `main` also raises `RLIMIT_NOFILE` to the hard limit at 
 - Read-only root, read-write project dir
 - Whitelist project directory only
 
-**Docker** (when configured):
-- Custom Dockerfile generation
+**Docker/Podman** (when configured), driven by `get_engine()`, which prefers podman and records
+which engine it found (only podman can remap uids per mount):
+- Custom Dockerfile generation: packages, build commands, and - when the project dir is mounted -
+  the project owner appended to `/etc/passwd`+`/etc/group` followed by a `USER` directive
+- Image tagged `webcentral-<dir hash>:<Dockerfile hash>`, so an unchanged config skips the build
+- Stale container of the same name force-removed before `run` (a container outliving its webcentral
+  otherwise wedges the project with a name conflict)
 - Port mapping from internal to host
 - Volume mounts for app dir and additional paths
-- User/group mapping from host
-- Dynamic image naming based on project dir hash
+
+**Container user:** whoever the *image* declares, rather than a runtime `--user`, so both cases work
+the same way. With `mount_app_dir = true` webcentral owns the image and bakes the project owner into
+it (otherwise the app writes root-owned files into the user's project dir); with `mount_app_dir =
+false` the image is a third-party application that keeps its own user (forcing one breaks
+image-baked directories). `[docker] user` overrides either. `mounts[]` directories are chowned to
+the uid/gid the container actually runs as - found via `container_user_ids()`, which runs `id` in
+the image and caches per image+user - since otherwise a non-root container gets EACCES. Skipped
+when that's root, which can write regardless. `[docker] idmap` (rootful podman only - the kernel
+forbids idmapped mounts for unprivileged users, and docker has no per-container equivalent) shifts
+uids per mount instead, so files land owned by the project user. Podman's triplets are
+`<backing-fs-id>-<mapped-id>-<count>`, `;` between uids and gids.
 
 **Workers:** Additional processes spawned alongside main application, share PORT env var
 

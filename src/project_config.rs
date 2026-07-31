@@ -200,6 +200,8 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
                 app_dir: ini_map.fetch("docker.app_dir").unwrap_or_else(|| "/app".to_string()),
                 mount_app_dir: ini_map.fetch_bool("docker.mount_app_dir").unwrap_or(true),
                 mounts: ini_map.fetch_array("docker.mounts"),
+                user: ini_map.fetch("docker.user"),
+                idmap: ini_map.fetch_bool("docker.idmap").unwrap_or(false),
             })
         } else {
             None
@@ -345,6 +347,13 @@ pub struct DockerConfig {
     pub app_dir: String,
     pub mount_app_dir: bool,
     pub mounts: Vec<String>,
+    /// Container user: `uid[:gid]`, a name defined in the image, or `image` to keep whatever the
+    /// image declares. `None` means "project owner when the project dir is mounted, image user
+    /// otherwise" - see `Project::resolve_container_user`.
+    pub user: Option<String>,
+    /// Map container uids onto the project owner's uid for `mounts`, so persistent data ends up
+    /// owned by the user rather than by the image's user. Podman only.
+    pub idmap: bool,
 }
 
 /// Default file patterns to exclude from file watching.

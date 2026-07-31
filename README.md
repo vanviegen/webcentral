@@ -133,8 +133,7 @@ Runs a server process in a Docker container. The process should start an HTTP se
 **Docker containerization:**
 - Completely isolated environment
 - Higher memory usage, slower startup
-- Runs as the project owner (uid/gid passed via `--user` flag)
-- Automatically mounts `/etc/passwd` and `/etc/group` for user resolution
+- Runs as the project owner, so files the application writes are owned by you (see **Container user** below)
 - More configuration options
 
 **Example:**
@@ -149,19 +148,43 @@ commands[] = composer install
 
 **Docker Configuration Options:**
 - `base` - Base Docker image (default: `alpine`)
-- `commands` - Build commands (strings or arrays) - run during image build
+- `commands` - Build commands - run during image build
 - `packages` - Packages to install (auto-detects `apk`, `apt-get`, `dnf`, or `yum`)
-- `mounts` - Persistent directories (stored in `_webcentral_data/mounts/<path>`, owned by project user)
+- `mounts` - Persistent directories, stored in `_webcentral_data/mounts/<path>`
   - Relative paths (e.g., `data`) are mounted relative to `app_dir`
   - Absolute paths (e.g., `/var/lib/data`) are mounted at that exact location in container
 - `http_port` - Container HTTP port (default: 8000)
 - `app_dir` - Mount point for project directory (default: `/app`)
-- `mount_app_dir` - Set to `false` to skip mounting project directory and to run as root instead of your user (default: `true`)
+- `mount_app_dir` - Set to `false` to skip mounting the project directory (default: `true`)
+- `user` - Override the container user: `uid:gid`, a name defined in the image, or `image` to use
+  whatever the image declares
+- `idmap` - Map the container's user onto yours for `mounts` (default: `false`, rootful podman only,
+  experimental)
+
+**Container user:**
+
+Which user the container runs as depends on whether the project directory is mounted:
+
+- `mount_app_dir = true` (the default) - webcentral builds the image, so it adds your uid/gid to
+  it as a real user (named `webcentral`, with `$HOME` at `_webcentral_data/home`) and the image runs
+  as that user. Everything the application writes into your project directory stays owned by you.
+- `mount_app_dir = false` - the image is a complete third-party application that knows which user it
+  needs, so it keeps its own. Forcing another one tends to make image-baked directories unwritable.
+
+`mounts` are owned by whichever user the container ends up running as, so the application can always
+write in them. With a third-party image that means they are owned by the image's user rather than by
+you. Changing ownership requires webcentral to run as root, which it normally does; when it doesn't,
+and the directory is owned by someone else, it logs a warning instead of failing.
+
+`idmap = true` instead keeps `mounts` owned by you and shifts uids per mount, so the container still
+sees its own user. This needs podman running as root - the kernel doesn't allow idmapped mounts for
+unprivileged users, and docker has no per-container equivalent at all. Treat it as experimental:
+podman's custom mappings are reported not to take effect in some configurations, in which case the
+files simply stay owned by you and the container may not be able to write in them.
 
 **Volume mounts:**
 - Project directory is mounted at `app_dir` (if `mount_app_dir` is not `false`)
-- Home directory is mounted at `_webcentral_data/home` (if `mount_app_dir` is `true`)
-- Custom mounts are created in `_webcentral_data/mounts/` with correct ownership
+- Custom mounts are created in `_webcentral_data/mounts/`
 
 **Real-world example (Trilium Notes):**
 ```ini
@@ -169,17 +192,28 @@ command = node /usr/src/app/src/www
 [docker]
 base = zadam/trilium:0.47.6
 http_port = 8080
+mount_app_dir = false
 ```
+
+A complete third-party image like this one brings its own application and its own user, so there is
+nothing to mount the project directory for. Leaving `mount_app_dir` at its default would make
+webcentral add your user to the image and run as it, which such images generally don't expect.
 
 **Example with persistent data:**
 ```ini
 command = ./server
 [docker]
 base = alpine
-packages = nodejs npm
-mounts[] = data              ; Mounted at /app/data
-mounts[] = /var/cache/app    ; Mounted at /var/cache/app
+packages[] = nodejs
+packages[] = npm
+; mounted at /app/data
+mounts[] = data
+; mounted at /var/cache/app
+mounts[] = /var/cache/app
 ```
+
+Note that `;` only starts a comment at the beginning of a line - anywhere else it is part of the
+value.
 
 ### 3. Forward
 
@@ -417,6 +451,14 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 ---
 
 ## Changelog
+
+2026-07-31 (2.5.0):
+  - Docker containers run as the project owner again, so applications no longer fill the user's own project directory with root-owned files. The uid/gid is added to the generated image as a real user named `webcentral` (with `$HOME` in `_webcentral_data/home`), instead of the `--user` flag plus a bind-mount of the host's `/etc/passwd` that broke images defining their own users. A complete third-party image (`mount_app_dir = false`) keeps its own user
+  - Fix `EACCES` in `mounts[]` for any container not running as root: those host directories were created root-owned and never chowned. They are now owned by whichever user the container actually runs as
+  - New `[docker] user` to override the container user, and `[docker] idmap` to keep `mounts[]` owned by you regardless (rootful podman only, experimental)
+  - Fix `[docker] packages` being silently ignored since 2.1.0, installing nothing
+  - Skip the image build entirely when the configuration is unchanged, instead of paying for a cached `docker build` on every on-demand start
+  - Fix a container outliving its webcentral wedging the project for good, as `run` then hit a name conflict on every restart
 
 2026-07-28 (2.4.20):
   - Added `--version` (`-V`), printing just the version number, and a `Starting webcentral <version>` line at the top of every run's log, so the running version can be identified from the logs

@@ -26,6 +26,23 @@ CROSSMARK = '✗'
 CLEAR_LINE = '\033[2K\r'
 
 
+class SkipTest(Exception):
+    """Raised by a test to report it cannot run in this environment"""
+
+
+def require_container_engine():
+    """Skip the calling test unless podman or docker is installed and usable"""
+    for engine in ('podman', 'docker'):
+        path = shutil.which(engine)
+        if not path:
+            continue
+        if subprocess.run([path, 'info'], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0:
+            return path
+        raise SkipTest(f"{engine} is installed but not usable by this user")
+    raise SkipTest("neither podman nor docker is installed")
+
+
 class TestRunner:
     def __init__(self):
         self.tests = []
@@ -364,6 +381,7 @@ class TestRunner:
         self.setup()
 
         failed = False
+        skipped = 0
         try:
             for test_func in tests_to_run:
                 test_name = test_func.__name__
@@ -383,6 +401,9 @@ class TestRunner:
 
                     test_func(self)
                     print(f"{CLEAR_LINE}{GREEN}{CHECKMARK}{RESET} {test_name}")
+                except SkipTest as e:
+                    skipped += 1
+                    print(f"{CLEAR_LINE}{YELLOW}-{RESET} {test_name} {GRAY}(skipped: {e}){RESET}")
                 except Exception as e:
                     print(f"{CLEAR_LINE}{RED}{CROSSMARK}{RESET} {test_name}")
                     print(f"{RED}Error:{RESET} {e}")
@@ -404,7 +425,8 @@ class TestRunner:
                     break
 
             if not failed:
-                print(f"\n{GREEN}All {len(tests_to_run)} tests passed!{RESET}")
+                suffix = f" ({skipped} skipped)" if skipped else ""
+                print(f"\n{GREEN}All {len(tests_to_run) - skipped} tests passed!{RESET}{suffix}")
         finally:
             if self.webcentral_proc:
                 self.webcentral_proc.terminate()
@@ -2813,6 +2835,108 @@ def test_listener_survives_accept_error(t):
             proc.wait()
         log_f.close()
         shutil.rmtree(root, ignore_errors=True)
+
+
+# Alpine's own busybox is built without httpd, so it comes from busybox-extras. Serving from /tmp
+# keeps this independent of whether the project directory is mounted.
+DOCKER_PACKAGES = 'packages[] = busybox-extras\n'
+DOCKER_SERVE = ('mkdir -p /tmp/srv && echo docker ok > /tmp/srv/index.html '
+                '&& exec /usr/sbin/httpd -f -p $PORT -h /tmp/srv')
+
+
+def _docker_setup(t, ini):
+    """Pull alpine up front (so the per-request timeouts stay sane) and write a docker project"""
+    engine = require_container_engine()
+    subprocess.run([engine, 'pull', 'alpine'], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=300)
+    t.write_file('webcentral.ini', ini)
+    return engine
+
+
+def _read_mount(t, rel):
+    """Read a file the container wrote into one of its mounts, returning (lines, uid, gid)"""
+    path = os.path.join(t.tmpdir, t.current_test_domain, '_webcentral_data/mounts', rel)
+    assert os.path.exists(path), f"container did not create {rel} (looked in {path})"
+    st = os.stat(path)
+    with open(path) as f:
+        return f.read().split(), st.st_uid, st.st_gid
+
+
+@test
+def test_docker_runs_as_project_user(t):
+    """With the project dir mounted, the container runs as the project owner and writes as them"""
+    _docker_setup(t,
+        f'command = {{ id -u; id -g; whoami; printenv HOME; }} > /app/data/id.txt && {DOCKER_SERVE}\n'
+        '[docker]\n'
+        'base = alpine\n'
+        + DOCKER_PACKAGES +
+        'mounts[] = data\n')
+
+    t.assert_http('/', check_body='docker ok', timeout=300)
+
+    fields, uid, gid = _read_mount(t, 'app/data/id.txt')
+    assert fields == [str(os.getuid()), str(os.getgid()), 'webcentral', '/app/_webcentral_data/home'], \
+        f"container reported {fields}, expected uid/gid {os.getuid()}/{os.getgid()} as 'webcentral'"
+    assert (uid, gid) == (os.getuid(), os.getgid()), \
+        f"mounted file is owned by {uid}:{gid}, expected {os.getuid()}:{os.getgid()}"
+
+
+@test
+def test_docker_user_override(t):
+    """An explicit [docker] user is applied and its mounts are owned by that user"""
+    _docker_setup(t,
+        f'command = {{ id -u; id -g; }} > /data/id.txt && {DOCKER_SERVE}\n'
+        '[docker]\n'
+        'base = alpine\n'
+        'mount_app_dir = false\n'
+        + DOCKER_PACKAGES +
+        f'user = {os.getuid()}:{os.getgid()}\n'
+        'mounts[] = /data\n')
+
+    t.assert_http('/', check_body='docker ok', timeout=300)
+
+    fields, uid, gid = _read_mount(t, 'data/id.txt')
+    assert fields == [str(os.getuid()), str(os.getgid())], f"container reported {fields}"
+    assert (uid, gid) == (os.getuid(), os.getgid()), \
+        f"mounted file is owned by {uid}:{gid}, expected {os.getuid()}:{os.getgid()}"
+
+
+@test
+def test_docker_mount_chowned_to_image_user(t):
+    """A mount is chowned to a non-root container user, so the app can create files in it"""
+    if os.geteuid() != 0:
+        raise SkipTest("needs root to chown a mount to another user")
+
+    _docker_setup(t,
+        f'command = mkdir -p /data/sub && {{ id -u; id -g; }} > /data/sub/id.txt && {DOCKER_SERVE}\n'
+        '[docker]\n'
+        'base = alpine\n'
+        'mount_app_dir = false\n'
+        + DOCKER_PACKAGES +
+        'user = 4242:4242\n'
+        'mounts[] = /data\n')
+
+    t.assert_http('/', check_body='docker ok', timeout=300)
+
+    fields, uid, gid = _read_mount(t, 'data/sub/id.txt')
+    assert fields == ['4242', '4242'], f"container reported {fields}, expected 4242/4242"
+    assert (uid, gid) == (4242, 4242), f"mounted file is owned by {uid}:{gid}, expected 4242:4242"
+
+
+@test
+def test_docker_packages_are_installed(t):
+    """[docker] packages are installed into the generated image"""
+    _docker_setup(t,
+        f'command = {{ command -v httpd; }} > /app/data/found.txt && {DOCKER_SERVE}\n'
+        '[docker]\n'
+        'base = alpine\n'
+        + DOCKER_PACKAGES +
+        'mounts[] = data\n')
+
+    t.assert_http('/', check_body='docker ok', timeout=300)
+
+    fields, _, _ = _read_mount(t, 'app/data/found.txt')
+    assert fields and fields[0].endswith('/httpd'), f"busybox-extras was not installed: {fields}"
 
 
 if __name__ == '__main__':
