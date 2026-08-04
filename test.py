@@ -467,6 +467,40 @@ def test_pre_existing_project(t):
     t.assert_http('/', check_body='I was already here', host='pre-existing-directory.test')
 
 @test
+def test_static_path_traversal(t):
+    """Static serving stays inside public/, however the path is spelled"""
+    t.write_file('public/index.html', '<h1>Shell</h1>')
+    t.write_file('secret.txt', 'TOP SECRET')
+
+    for path in ['/../secret.txt',
+                 '/%2e%2e/secret.txt',
+                 '/sub/../../secret.txt',
+                 '/./../secret.txt',
+                 '/..%2fsecret.txt',
+                 '/../../../../../../etc/passwd']:
+        body = t.assert_http(path, check_code=404)
+        if 'SECRET' in body or 'root:' in body:
+            raise AssertionError(f"Path traversal via {path}: {body[:60]}")
+
+    # Normalization that stays inside public/ still resolves
+    t.write_file('public/sub/page.html', 'nested page')
+    t.assert_http('/sub/../sub/page.html', check_body='nested page')
+    t.assert_http('/./sub/page.html', check_body='nested page')
+
+
+@test
+def test_static_percent_encoded_path(t):
+    """Percent-encoded paths resolve to the file they name"""
+    t.write_file('public/my file.txt', 'spaced content')
+    t.write_file('public/café.txt', 'unicode content')
+    t.assert_http('/my%20file.txt', check_body='spaced content')
+    t.assert_http('/caf%C3%A9.txt', check_body='unicode content')
+    # A literal separator smuggled in as %2f is not a separator
+    t.write_file('public/sub/page.html', 'nested page')
+    t.assert_http('/sub%2fpage.html', check_code=404)
+
+
+@test
 def test_static_file_serving(t):
     """Serve a static HTML file"""
     t.write_file('public/index.html', '<h1>Hello World</h1>')
@@ -480,6 +514,93 @@ def test_static_file_nested(t):
     t.assert_http('/css/style.css', check_body='color: red', check_header=('Content-Type', 'text/css'))
     t.write_file('public/app.js', 'console.log("hello");')
     t.assert_http('/app.js', check_body='hello', check_header=('Content-Type', 'text/javascript'))
+
+
+@test
+def test_rewrite_static(t):
+    """Rewrites change which static file is served"""
+    t.write_file('public/index.html', '<h1>App Shell</h1>')
+    t.write_file('public/articles/hello.html', '<h1>Hello Article</h1>')
+    t.write_file('webcentral.ini', '''
+[rewrite]
+/blog/(.*) = /articles/$1.html
+/deep/link = /index.html
+''')
+
+    t.assert_http('/blog/hello', check_body='Hello Article')
+    t.assert_http('/deep/link', check_body='App Shell')
+    # Unmatched paths are untouched
+    t.assert_http('/articles/hello.html', check_body='Hello Article')
+    t.assert_http('/nope', check_code=404)
+
+
+@test
+def test_rewrite_order(t):
+    """Rewrite rules are applied in file order, first match wins"""
+    t.write_file('public/index.html', '<h1>Shell</h1>')
+    t.write_file('public/favicon.ico', 'icon')
+    t.write_file('public/app.js', 'script')
+    t.write_file('public/style.css', 'styles')
+    t.write_file('public/robots.txt', 'robots')
+    # The catch-all is last, so the passthroughs above it must win. With an unordered
+    # config this only holds when the catch-all happens to be iterated last.
+    t.write_file('webcentral.ini', '''
+[rewrite]
+/favicon.ico = /favicon.ico
+/app.js = /app.js
+/style.css = /style.css
+/robots.txt = /robots.txt
+/.* = /index.html
+''')
+
+    t.assert_http('/favicon.ico', check_body='icon')
+    t.assert_http('/app.js', check_body='script')
+    t.assert_http('/style.css', check_body='styles')
+    t.assert_http('/robots.txt', check_body='robots')
+    t.assert_http('/anything/else', check_body='Shell')
+
+
+@test
+def test_rewrite_redirect(t):
+    """A rewrite target that isn't an absolute path redirects instead"""
+    t.write_file('public/index.html', '<h1>Shell</h1>')
+    t.write_file('webcentral.ini', '''
+[rewrite]
+/old/(.*) = https://example.com/new/$1
+''')
+
+    t.assert_http('/old/page', check_code=301, check_header=('Location', 'https://example.com/new/page'))
+
+
+@test
+def test_rewrite_application(t):
+    """Rewrites apply to applications, preserving the query string"""
+    t.write_file('webcentral.ini', '''
+command=python3 -u -m http.server $PORT
+
+[rewrite]
+/pretty/(.*) = /$1.txt
+''')
+    t.write_file('real.txt', 'the real file')
+
+    t.assert_http('/pretty/real', check_body='the real file')
+    # The rewritten path reaches the app with the original query string attached
+    t.assert_http('/pretty/real?x=1', check_body='the real file')
+    t.await_log('"GET /real.txt?x=1 HTTP/1.1"')
+
+
+@test
+def test_rewrite_invalid_pattern(t):
+    """An unparsable rewrite pattern is reported and skipped, not silently ignored"""
+    t.write_file('public/index.html', '<h1>Shell</h1>')
+    t.write_file('webcentral.ini', '''
+[rewrite]
+/broken( = /index.html
+/deep/link = /index.html
+''')
+
+    t.assert_http('/deep/link', check_body='Shell')
+    t.assert_log('Invalid rewrite pattern', count=1)
 
 
 @test

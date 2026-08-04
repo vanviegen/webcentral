@@ -2451,7 +2451,7 @@ dependencies = [
 
 [[package]]
 name = "webcentral"
-version = "2.6.0"
+version = "2.6.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2474,6 +2474,7 @@ dependencies = [
  "libc",
  "mime_guess",
  "nix",
+ "percent-encoding",
  "quinn",
  "rand 0.9.5",
  "rcgen",

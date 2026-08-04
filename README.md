@@ -347,6 +347,15 @@ Note: `webcentral.ini` is always watched, and `_webcentral_data` is always exclu
 
 Rules are applied in order. First match wins. Use `$1`, `$2`, etc. for captures.
 
+Patterns are anchored: they must match the entire path (without the query string, which is carried
+over to the rewritten path unless the target specifies its own). The rewrite happens before the
+request is handled, so it works for every project type - static files, applications, proxies and
+forwards all see the rewritten path. A target that isn't an absolute path (`https://example.com/x`)
+produces a 301 redirect instead.
+
+Write `${1}` rather than `$1` when the capture is followed by a letter, digit or underscore:
+`/$1_v2` means "the capture named `1_v2`", which doesn't exist, and expands to nothing.
+
 ### Environment Variables
 
 Set environment variables for your application:
@@ -465,6 +474,15 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 ---
 
 ## Changelog
+
+2026-08-05 (2.6.1):
+  - **Security:** fix a path traversal in static file serving. `GET /../../etc/passwd` escaped the project's `public/` directory and served any file readable by webcentral (root, in the usual setup). The containment check compared path components without resolving `..`, which the kernel then resolved on open. Request paths are now percent-decoded and normalized before the filesystem is touched. Only projects serving static files were affected
+  - Static files whose names need percent-encoding (`/my%20file.txt`) are served instead of 404'd, as the path was previously used raw
+  - Fix `[rewrite]` rules never rewriting anything: the rewritten path was computed and then thrown away, so only the redirect form (a target that isn't a path) had any effect. The rewritten path now replaces the request's, for every project type, carrying the query string over
+  - `[rewrite]` rules are now really applied in the documented file order, instead of the arbitrary order of a hash map, so a catch-all as the last rule no longer sometimes swallows the rules above it
+  - Rewrite patterns are compiled once at load instead of on every request, and an unparsable one is now reported in the project log instead of silently skipped
+
+That's a lot of nastiness that needed to be cleaned up. I guess that's what you get for having an agent port your code to a new language and not thoroughly studying every single line it outputs. :-(
 
 2026-07-31 (2.6.0):
   - Containers are now always run with podman; docker support is dropped. The config section is renamed to `[podman]`, with `[docker]` still accepted as an alias

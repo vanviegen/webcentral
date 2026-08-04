@@ -8,6 +8,9 @@ use std::path::Path;
 // Helper struct for parsing INI files into a flat HashMap
 struct IniMap {
     map: HashMap<String, Vec<String>>,
+    /// Keys in the order they first appear in the file. Needed because `[rewrite]` rules are
+    /// applied first-match-wins, which a HashMap's arbitrary iteration order would randomize.
+    order: Vec<String>,
     errors: Vec<String>,
 }
 
@@ -15,6 +18,7 @@ impl IniMap {
     fn new() -> Self {
         Self {
             map: HashMap::new(),
+            order: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -63,6 +67,9 @@ impl IniMap {
                 };
 
                 // Store in map
+                if !ini_map.map.contains_key(&full_key) {
+                    ini_map.order.push(full_key.clone());
+                }
                 ini_map
                     .map
                     .entry(full_key)
@@ -124,14 +131,14 @@ impl IniMap {
         self.map.remove(key).unwrap_or_default()
     }
 
-    // Fetch all keys with a given prefix, returning a HashMap
-    fn fetch_prefix(&mut self, prefix: &str) -> HashMap<String, String> {
+    // Fetch all keys with a given prefix, removing them from the map, in file order
+    fn fetch_prefix(&mut self, prefix: &str) -> Vec<(String, String)> {
         let prefix_with_dot = format!("{}.", prefix);
-        let mut result = HashMap::new();
+        let mut result = Vec::new();
 
         let keys: Vec<String> = self
-            .map
-            .keys()
+            .order
+            .iter()
             .filter(|k| k.starts_with(&prefix_with_dot))
             .cloned()
             .collect();
@@ -144,7 +151,7 @@ impl IniMap {
                         .push(format!("Key '{}' has multiple values, using last one", key));
                 }
                 if let Some(value) = values.into_iter().last() {
-                    result.insert(suffix.to_string(), value);
+                    result.push((suffix.to_string(), value));
                 }
             }
         }
@@ -259,7 +266,19 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
     exclude.extend(DEFAULT_EXCLUDES.iter().map(|s| s.to_string()));
 
     // Parse [auth] section - users are specified as auth.<username> = <password_hash>
-    let auth = ini_map.fetch_prefix("auth");
+    let auth = ini_map.fetch_prefix("auth").into_iter().collect();
+
+    // Parse [rewrite] section - patterns are anchored and compiled once here, keeping the file's
+    // order so the documented first-match-wins semantics hold
+    let mut rewrites = Vec::new();
+    for (pattern, target) in ini_map.fetch_prefix("rewrite") {
+        match Regex::new(&format!("^{}$", pattern)) {
+            Ok(regex) => rewrites.push((regex, target)),
+            Err(err) => ini_map
+                .errors
+                .push(format!("Invalid rewrite pattern '{}': {}", pattern, err)),
+        }
+    }
 
     // Read common configuration
     let mut config = ProjectConfig {
@@ -268,14 +287,14 @@ fn build_project_config(dir: String, ini_map: &mut IniMap) -> ProjectConfig {
         log_requests: ini_map.fetch_bool("log_requests").unwrap_or(false),
         redirect_http: ini_map.fetch_bool("redirect_http"),
         redirect_https: ini_map.fetch_bool("redirect_https"),
-        environment: ini_map.fetch_prefix("environment"),
+        environment: ini_map.fetch_prefix("environment").into_iter().collect(),
         reload: ReloadConfig {
             timeout: ini_map.fetch_parse_default("reload.timeout", 300),
             startup_deadline: ini_map.fetch_parse_default("startup_deadline", 60),
             include,
             exclude,
         },
-        rewrites: ini_map.fetch_prefix("rewrite"),
+        rewrites,
         auth,
         config_errors: ini_map.errors.clone(),
     };
@@ -364,7 +383,8 @@ pub struct ProjectConfig {
     pub redirect_https: Option<bool>,
     pub environment: HashMap<String, String>,
     pub reload: ReloadConfig,
-    pub rewrites: HashMap<String, String>,
+    /// Anchored regex + replacement pairs, in the order they appear in webcentral.ini
+    pub rewrites: Vec<(Regex, String)>,
     /// Map of username to password hash (argon2) for basic auth
     pub auth: HashMap<String, String>,
     pub config_errors: Vec<String>,

@@ -32,7 +32,6 @@ use hyper_util::{
     client::legacy::Client,
     rt::{TokioIo},
 };
-use regex::Regex;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -252,7 +251,7 @@ impl Project {
         self.state_changed.notify_one();
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<StreamBody>> {
+    pub async fn handle(self: Arc<Self>, mut req: Request<Incoming>) -> Result<Response<StreamBody>> {
         // Check for WebSocket upgrade before generic handling (requires Incoming body)
         if is_upgrade_request(&req) {
             // Log upgrade requests (handle_inner does logging for non-upgrades)
@@ -266,6 +265,10 @@ impl Project {
                     AuthResult::Failed(response) => return Ok(response),
                     _ => {} // Passed or PassedSetCookie - both mean auth ok
                 }
+            }
+
+            if let Some(response) = self.apply_rewrites(&mut req)? {
+                return Ok(response);
             }
 
             // Upgrades only work for forward/proxy/application types
@@ -289,7 +292,7 @@ impl Project {
 
     /// Internal handler that works with any body type (no upgrade support).
     /// Used by HTTP/3 which doesn't support WebSocket upgrades.
-    pub async fn handle_inner<B>(self: Arc<Self>, req: Request<B>) -> Result<Response<StreamBody>>
+    pub async fn handle_inner<B>(self: Arc<Self>, mut req: Request<B>) -> Result<Response<StreamBody>>
     where
         B: http_body::Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -321,13 +324,8 @@ impl Project {
         }
 
         // Apply URL rewrites
-        let (_path, redirect) = self.apply_rewrites(req.uri().path());
-
-        if !redirect.is_empty() {
-            return Ok(Response::builder()
-                .status(301)
-                .header("Location", redirect)
-                .body(empty_body())?);
+        if let Some(response) = self.apply_rewrites(&mut req)? {
+            return Ok(response);
         }
 
         // Determine handler based on configuration
@@ -363,22 +361,41 @@ impl Project {
         }
     }
 
-    fn apply_rewrites(&self, path: &str) -> (String, String) {
-        for (pattern, target) in &self.config.rewrites {
-            if let Ok(re) = Regex::new(&format!("^{}$", pattern)) {
-                if re.is_match(path) {
-                    let result = re.replace(path, target).to_string();
-                    if result.starts_with("http://")
-                        || result.starts_with("https://")
-                        || result.starts_with("webcentral://")
-                    {
-                        return (path.to_string(), result);
-                    }
-                    return (result, String::new());
-                }
-            }
+    /// Apply the first matching `[rewrite]` rule to the request. A target that isn't an absolute
+    /// path (`https://elsewhere/x`) produces a redirect; an absolute path rewrites the request URI
+    /// in place, so every handler (static, application, proxy, forward, redirect) sees the new path.
+    fn apply_rewrites<B>(&self, req: &mut Request<B>) -> Result<Option<Response<StreamBody>>> {
+        let path = req.uri().path();
+        let Some((regex, target)) = self
+            .config
+            .rewrites
+            .iter()
+            .find(|(regex, _)| regex.is_match(path))
+        else {
+            return Ok(None);
+        };
+
+        let result = regex.replace(path, target).to_string();
+        if !result.starts_with('/') {
+            return Ok(Some(
+                Response::builder()
+                    .status(301)
+                    .header("Location", result)
+                    .body(empty_body())?,
+            ));
         }
-        (path.to_string(), String::new())
+
+        // A target may carry its own query string, in which case it replaces the request's
+        let path_and_query = match (result.contains('?'), req.uri().query()) {
+            (false, Some(query)) => format!("{}?{}", result, query),
+            _ => result,
+        };
+        let mut parts = req.uri().clone().into_parts();
+        parts.path_and_query = Some(path_and_query.parse().map_err(|err| {
+            anyhow::anyhow!("Rewrite of '{}' to '{}' is not a valid URL: {}", path, path_and_query, err)
+        })?);
+        *req.uri_mut() = http::Uri::from_parts(parts)?;
+        Ok(None)
     }
 
     /// Check authentication. Returns Some(response) if auth failed/logout, None if auth passed.
@@ -468,15 +485,11 @@ impl Project {
                 .body(body_from("Not Found"))?);
         }
 
-        // Simple static file serving
-        let mut path = req.uri().path().trim_start_matches('/').to_string();
-
-        // If path is empty or ends with /, append index.html
-        if path.is_empty() || path.ends_with('/') {
-            path.push_str("index.html");
-        }
-
-        let file_path = public_dir.join(&path);
+        let Some(file_path) = resolve_static_path(&public_dir, req.uri().path()) else {
+            return Ok(Response::builder()
+                .status(404)
+                .body(body_from("Not Found"))?);
+        };
 
         if file_path.starts_with(&public_dir) && file_path.exists() && file_path.is_file() {
             let content = tokio::fs::read(&file_path).await?;
@@ -1840,6 +1853,39 @@ tr:hover {{ background: #f5f5f5; }}
 
         Ok(response_builder.body(empty_body())?)
     }
+}
+
+/// Resolve a request path to a file below `public_dir`, or `None` when it escapes (404).
+///
+/// The path is percent-decoded and `.`/`..` are resolved here, before the filesystem is touched:
+/// `Path::join` doesn't normalize and `Path::starts_with` compares whole components, so
+/// `public/../../etc/passwd` passes a containment check while the kernel happily resolves it on
+/// open. Decoding first and normalizing after is what makes `%2e%2e` equivalent to `..`; a segment
+/// that decodes to something containing a separator or a NUL is rejected rather than resolved,
+/// since it can only have been an attempt to smuggle one past this function.
+fn resolve_static_path(public_dir: &Path, path: &str) -> Option<PathBuf> {
+    let mut segments: Vec<String> = Vec::new();
+    for segment in path.split('/') {
+        let segment = percent_encoding::percent_decode_str(segment)
+            .decode_utf8()
+            .ok()?;
+        match segment.as_ref() {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            segment if segment.contains('/') || segment.contains('\0') => return None,
+            segment => segments.push(segment.to_string()),
+        }
+    }
+
+    let mut file_path = public_dir.to_path_buf();
+    file_path.extend(&segments);
+    // A directory request (empty path, or a trailing slash) serves its index.html
+    if segments.is_empty() || path.ends_with('/') {
+        file_path.push("index.html");
+    }
+    Some(file_path)
 }
 
 // Helper function to detect WebSocket upgrade requests
