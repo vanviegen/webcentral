@@ -4309,10 +4309,14 @@ def _assert_owned_by_us(rel_desc, uid, gid):
 
 
 def require_working_keepid(podman):
-    """Skip when rootless podman can't map the invoking user to a non-root container uid.
-    Broken on some podman/crun/kernel combos: containers/podman#27785."""
+    """Skip when the invoking user cannot be mapped to a non-root container uid.
+
+    `keep-id` is a rootless feature, so a root-owned project - which is what a suite run under
+    sudo creates - has no way to do this at all. Beyond that it is broken on some
+    podman/crun/kernel combinations: containers/podman#27785.
+    """
     if os.geteuid() == 0:
-        return  # rootful podman doesn't use keep-id
+        raise SkipTest("a root-owned project uses root's own podman, which has no keep-id")
     r = subprocess.run([podman, 'run', '--rm', '--userns=keep-id', 'alpine', 'true'],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
     if r.returncode != 0:

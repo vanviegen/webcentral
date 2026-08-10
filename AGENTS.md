@@ -267,7 +267,9 @@ parse - the gid they pair with depends on the image's passwd. Unknown ids are re
 
 **Host-side ownership is structural, not maintained:** podman runs as the owner, so container
 root - which is what `user = project` resolves to - is that owner, and what it writes is theirs
-without any mapping. Only an explicitly requested *other* uid needs `--userns=keep-id` (podman >=
+without any mapping. The one case where podman is *not* rootless is a root-owned project on a root
+webcentral (`Owner::runs_rootless`), where a container's uid is already a host uid; an explicit
+non-root `user =` there is warned about rather than silently mapped. Only an explicitly requested *other* uid needs `--userns=keep-id` (podman >=
 4.3, and broken on some podman/kernel combinations, containers/podman#27785), which is why the
 mapping only covers the resolved user: an image that switches at runtime to a uid it does not
 declare writes as that uid.

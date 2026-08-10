@@ -52,10 +52,12 @@ jobs:
           set -o pipefail
           # --require turns a skip into a failure, so a green run is proof the mode covered what
           # it exists to cover rather than quietly skipping it as the developer machine does.
+          # keep-id is a rootless feature, so only that job can require it; the root job exists
+          # to prove the other half - podman spawned as a project's owner rather than as root.
           keepid=test_podman_user_override,test_podman_foreign_user_mapped_to_owner
           if [ "${{ matrix.mode }}" = root ]; then
             sudo --preserve-env=PATH ./test.py \
-              --require "test_podman_runs_as_the_project_owner,$keepid" 2>&1 | tee test-output.log
+              --require "test_podman_runs_as_the_project_owner" 2>&1 | tee test-output.log
           else
             ./test.py --require "$keepid" 2>&1 | tee test-output.log
           fi

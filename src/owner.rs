@@ -161,6 +161,16 @@ impl Owner {
     }
 }
 
+impl Owner {
+    /// Whether podman will be rootless for this owner. It is whenever webcentral is not root, and
+    /// whenever it is root but becomes somebody else first - which leaves one case where it is
+    /// not: a project owned by root on a root webcentral, where podman is root's own and rootless
+    /// features like `keep-id` do not exist.
+    pub fn runs_rootless(&self) -> bool {
+        self.identity.is_some() || !nix::unistd::geteuid().is_root()
+    }
+}
+
 /// The uid and gid a path belongs to, defaulting to root when it cannot be read.
 pub fn ownership(path: &Path) -> (u32, u32) {
     use std::os::unix::fs::MetadataExt;

@@ -1077,6 +1077,18 @@ impl AppServer {
         if run_uid == 0 && run_gid == 0 {
             return;
         }
+        if !self.owner.runs_rootless() {
+            // A root-owned project on a root webcentral: podman is root's own, where there is no
+            // `keep-id` to map with and a container's uid is already a host uid. Everything this
+            // container writes as that id therefore belongs to it rather than to the owner.
+            self.log(&format!(
+                "This project belongs to root, so podman runs as root, where a container asking \
+                 to be {}:{} simply is that user on the host - what it writes will not belong to \
+                 root. Give the project to an ordinary user to keep that guarantee.",
+                run_uid, run_gid
+            ));
+            return;
+        }
         let (euid, egid) = (nix::unistd::geteuid().as_raw(), nix::unistd::getegid().as_raw());
         if (run_uid, run_gid) == (euid, egid) {
             // The plain form works on any podman version, unlike the uid=/gid= form below.

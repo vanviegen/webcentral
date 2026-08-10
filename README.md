@@ -899,7 +899,10 @@ serve app
 (also 999) and Redis need the same treatment; an image that runs as the user it declares does not.
 
 Whatever it runs as, **everything the container writes into the project directory or its `mounts`
-lands on the host owned by the project owner** - because podman itself runs as that owner.
+lands on the host owned by the project owner** - because podman itself runs as that owner. (One
+exception, which webcentral says out loud: a project owned by *root* on a root webcentral uses
+root's own podman, where a container's uid is already a host uid and there is nothing to remap.
+Give projects to ordinary users.)
 Webcentral never runs a container as root: when it runs as root it becomes the project's owner
 before calling podman, and rootless podman maps container root onto whoever invoked it. An image
 that switches at runtime to a uid it doesn't declare writes as that uid instead; naming it in
