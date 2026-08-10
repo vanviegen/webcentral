@@ -248,7 +248,10 @@ setgid, setuid in that order, because `Command::uid` would apply too late to she
 supplementary groups - and passes `--root`/`--runroot` for a store of webcentral's own under that
 user's home. That store cannot be the user's own: podman records the run root in the store's
 database, so a second one fails with a configuration mismatch, and webcentral claiming theirs first
-would break their `podman`. When webcentral already *is* the owner, podman's defaults are right and
+would break their `podman`. It also passes `--cgroup-manager=cgroupfs`, because an owner who has
+never logged in has no systemd user session: crun would ask the session bus for a scope, be told
+"interactive authentication required", and the container would not start. Podman's own fallback
+warns and then lets the runtime reach for sd-bus anyway. When webcentral already *is* the owner, podman's defaults are right and
 nothing is set. Owners are resolved once and cached per uid, with subuid/subgid and
 `newuidmap`/`newgidmap` checked then - reported to both webcentral's output and the project's log.
 

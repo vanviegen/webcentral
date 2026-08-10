@@ -149,6 +149,13 @@ impl Owner {
             cmd.env("XDG_RUNTIME_DIR", &identity.runroot);
             cmd.arg("--root").arg(&identity.store);
             cmd.arg("--runroot").arg(&identity.runroot);
+            // Someone who has never logged in has no systemd user session, and so no session bus
+            // for the runtime to ask for a scope on. crun tries anyway and is told "interactive
+            // authentication required", which surfaces as a container that will not start - so
+            // say up front that cgroups are managed directly. Podman's own fallback is not
+            // enough: it warns that it is using cgroupfs and still lets the runtime reach for
+            // sd-bus. Nothing is lost by it, since webcentral sets no resource limits.
+            cmd.args(["--cgroup-manager", "cgroupfs"]);
         }
         cmd
     }
