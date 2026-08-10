@@ -2549,6 +2549,43 @@ def test_procfile_multiple_workers(t):
 
 
 @test
+def test_procfile_runtime_is_detected(t):
+    """A Procfile says how to start an app, not what to start it with: the manifest beside it does
+
+    Heroku picks the runtime from these files through a buildpack. Webcentral has none, so it
+    reads the same ones - and gets the binary names right, which `packages = python3` on alpine
+    would not: a Procfile says `python`.
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    checks = [
+        ('requirements.txt', 'flask\n', 'python:3-alpine'),
+        ('Gemfile', "source 'https://rubygems.org'\n", 'ruby:3-alpine'),
+        ('go.mod', 'module example\n', 'golang:alpine'),
+        ('package.json', '{"name":"x"}', 'node:22-alpine'),
+    ]
+    for i, (manifest, content, expected) in enumerate(checks):
+        d = os.path.join(t.tmpdir, f'runtime-{i}')
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, 'Procfile'), 'w') as f:
+            f.write('web: start-my-app\n')
+        with open(os.path.join(d, manifest), 'w') as f:
+            f.write(content)
+        result = subprocess.run(['./webcentral', 'check', d], capture_output=True, text=True,
+                                cwd=root, timeout=10)
+        assert expected in result.stdout, f"{manifest}: expected {expected}, got {result.stdout}"
+
+    # With nothing to go on it stays alpine, and says so rather than failing later
+    d = os.path.join(t.tmpdir, 'runtime-bare')
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, 'Procfile'), 'w') as f:
+        f.write('web: sh -c true\n')
+    result = subprocess.run(['./webcentral', 'check', d], capture_output=True, text=True,
+                            cwd=root, timeout=10)
+    assert 'bare alpine image' in result.stdout, result.stdout
+    assert result.returncode == 0, "a warning must not fail the check"
+
+
+@test
 def test_procfile_merges_into_declared_service(t):
     """A command-less service is completed by auto-detection, so a Procfile project can be tuned"""
     t.write_file('Procfile',

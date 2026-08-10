@@ -217,6 +217,7 @@ impl ProjectConfig {
         let source = if config_path.exists() { fs::read_to_string(&config_path)? } else { String::new() };
 
         let mut config = parse(&source, Some(dir));
+        let mut detected = false;
 
         // A configuration that declares no server and never says how to answer a request leaves
         // room for the directory to speak for itself, whether or not a webcentral.conf exists.
@@ -224,11 +225,12 @@ impl ProjectConfig {
         if config.servers.is_empty() && !serves_anything(&config.script) {
             config.config_files.extend(AUTO_DETECT_FILES.iter().map(|f| f.to_string()));
             if let Some((snippet, warnings)) = auto_detect(dir) {
-                let detected = parse(&snippet, Some(dir));
-                config.servers = detected.servers;
-                config.errors.extend(detected.errors);
-                config.warnings.extend(detected.warnings);
+                let parsed = parse(&snippet, Some(dir));
+                config.servers = parsed.servers;
+                config.errors.extend(parsed.errors);
+                config.warnings.extend(parsed.warnings);
                 config.warnings.extend(warnings);
+                detected = true;
             }
         } else if config.servers.iter().any(|s| s.command.is_empty() && s.app_dir.is_some()) {
             // A declared service with no command and the project directory mounted runs the
@@ -236,6 +238,7 @@ impl ProjectConfig {
             // project adds `packages` or reload rules without giving up detection. Without the
             // mount there is nothing of the project to run, so the image's entrypoint stands.
             config.config_files.extend(AUTO_DETECT_FILES.iter().map(|f| f.to_string()));
+            detected = true;
             let donor = auto_detect(dir).map(|(snippet, warnings)| {
                 let detected = parse(&snippet, Some(dir));
                 config.errors.extend(detected.errors.iter().cloned());
@@ -251,14 +254,10 @@ impl ProjectConfig {
                     Some(donor) => {
                         server.command = donor.command.clone();
                         server.sidecars.extend(donor.sidecars.iter().cloned());
-                        // Detected packages (nodejs for a package.json) belong to the default
-                        // base; a hand-picked image is trusted to bring its own runtime.
-                        if server.base.as_deref().unwrap_or(DEFAULT_BASE_IMAGE) == DEFAULT_BASE_IMAGE {
-                            for package in &donor.packages {
-                                if !server.packages.contains(package) {
-                                    server.packages.push(package.clone());
-                                }
-                            }
+                        // The detected runtime, unless the service named an image of its own -
+                        // which is then trusted to carry one.
+                        if server.base.is_none() {
+                            server.base = donor.base.clone();
                         }
                     }
                     None => errors.push(format!(
@@ -270,6 +269,17 @@ impl ProjectConfig {
                 }
             }
             config.errors.extend(errors);
+        }
+
+        // Said once the image is actually settled: a service declared in the file may have
+        // supplied the base that detection could not find.
+        if detected && config.servers.iter().any(|server| server.base.is_none()) {
+            config.warnings.push(
+                "No requirements.txt, Gemfile, go.mod or package.json next to the Procfile, so \
+                 its commands run on a bare alpine image - name a 'base' or 'packages' if they \
+                 need a runtime"
+                    .to_string(),
+            );
         }
 
         add_implicit_tail(&mut config, dir);
@@ -345,6 +355,34 @@ fn add_implicit_tail(config: &mut ProjectConfig, dir: &Path) {
 
 /// Synthesise a server declaration for a project that doesn't configure one, from Procfile or
 /// package.json. The generated source is what gets parsed, so there is one code path for both.
+/// The image a `Procfile` project needs, guessed from the manifest files beside it.
+///
+/// A Procfile says how to *start* an application but never what to start it with: on Heroku a
+/// buildpack decides that from exactly these files. Webcentral has no buildpacks, so it reads the
+/// same ones and picks an official image, which also gets the binary names right - a Procfile
+/// says `python`, and alpine's python3 package provides only `python3`.
+///
+/// The runtime, not the dependencies: nothing here runs `pip install`, because what that takes
+/// varies too much to guess. `copy` plus `build` is how a project says it (see the README).
+fn detected_base(dir: &Path) -> Option<&'static str> {
+    // package.json is last: plenty of Python and Ruby projects carry one for their front-end
+    // tooling, while the reverse is rare.
+    for (marker, image) in [
+        ("requirements.txt", "python:3-alpine"),
+        ("Pipfile", "python:3-alpine"),
+        ("pyproject.toml", "python:3-alpine"),
+        ("Gemfile", "ruby:3-alpine"),
+        ("go.mod", "golang:alpine"),
+        ("composer.json", "php:8-cli-alpine"),
+        ("package.json", "node:22-alpine"),
+    ] {
+        if dir.join(marker).exists() {
+            return Some(image);
+        }
+    }
+    None
+}
+
 fn auto_detect(dir: &Path) -> Option<(String, Vec<String>)> {
     let procfile = dir.join("Procfile");
     if procfile.exists() {
@@ -378,7 +416,11 @@ fn auto_detect(dir: &Path) -> Option<(String, Vec<String>)> {
                 }
             }
             if !command.is_empty() {
-                let mut source = format!("service {{\n  command = {}\n", command);
+                let mut source = String::from("service {\n");
+                if let Some(base) = detected_base(dir) {
+                    source.push_str(&format!("  base = {}\n", base));
+                }
+                source.push_str(&format!("  command = {}\n", command));
                 source.push_str(&workers);
                 source.push_str("}\n");
                 return Some((source, warnings));
@@ -393,7 +435,7 @@ fn auto_detect(dir: &Path) -> Option<(String, Vec<String>)> {
                 let start = value.get("scripts").and_then(|s| s.get("start")).and_then(|s| s.as_str());
                 if start.map(|s| !s.is_empty()).unwrap_or(false) {
                     return Some((
-                        "service {\n  packages = nodejs npm\n  command = npm start\n}\n"
+                        "service {\n  base = node:22-alpine\n  command = npm start\n}\n"
                             .to_string(),
                         Vec::new(),
                     ));

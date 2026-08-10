@@ -22,7 +22,9 @@ interpreter. Also static-file resolution (streamed, with `Range`/`If-Range` supp
 `check_auth` secret comparison
 
 `src/config.rs` - The configuration model and the parser for `webcentral.conf`; auto-detection
-from `Procfile`/`package.json` synthesises the same language rather than a separate code path
+from `Procfile`/`package.json` synthesises the same language rather than a separate code path,
+picking a runtime image from the manifests beside a `Procfile` the way a buildpack would (the
+runtime only - installing dependencies is left to `copy`/`build`)
 
 `src/parser.rs` - Scanner for the configuration language: words, quoting, blocks, diagnostics
 

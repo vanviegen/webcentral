@@ -94,6 +94,26 @@ If you want to run WebCentral as a regular user while still being able to bind t
 
 ---
 
+## Upgrading from 2.x
+
+`webcentral.ini` is not read any more. Rename it to `webcentral.conf`, rewrite it in the language
+below, and run `webcentral check` - it names every line it doesn't understand. What catches people:
+
+- **Everything runs in a container**, so a project that used the host's `python`, `node` or `ruby`
+  has to say which image has it: `base = python:3-alpine`, or `packages = ...` on top of alpine.
+  Projects detected from a `Procfile` or `package.json` pick a matching image themselves.
+- **Dependencies are not installed for you.** Heroku's buildpacks do that; webcentral does not.
+  Use `copy` and `build` (see **Services**), or install them in the `command`.
+- **There are no accounts or passwords.** `[auth]` and its hashes are gone. `check_auth <secret>`
+  guards a dashboard with one shared secret; real logins belong to the application.
+- `[rewrite] /a = /b` becomes `match /a set path /b`, and a rewrite target that was a URL becomes
+  `redirect`. `type = dashboard` becomes `project_dashboard` or `admin_dashboard`.
+- A bare `port`/`host` with no command becomes `forward host:port`.
+- `mount_app_dir = false` becomes `app_dir = none`, `startup_deadline` becomes `startup_time`, and
+  `[environment]` becomes an `env { }` block - with secrets better kept in `env_file`.
+
+---
+
 ## Configuration
 
 A project is a directory named after the domain it serves. Drop files in it and it works; add a
@@ -104,8 +124,8 @@ With **no configuration file at all**, webcentral looks at what the directory ho
 | The directory contains | What happens |
 |------------------------|--------------|
 | `public/` | its files are served |
-| `Procfile` with a `web:` line | that command is run as a service, with its `worker:` lines alongside |
-| `package.json` with a `start` script | `npm start` is run as a service, on an image with node |
+| `Procfile` with a `web:` line | that command is run as a service, with its `worker:` lines alongside, on an image chosen from the manifest beside it (`requirements.txt` → python, `Gemfile` → ruby, `go.mod` → go, ...) |
+| `package.json` with a `start` script | `npm start` is run as a service, on a node image |
 
 That still applies when a `webcentral.conf` is present but never says how to answer a request - so
 a file that only sets `log_requests` doesn't stop a `Procfile` from being picked up.
