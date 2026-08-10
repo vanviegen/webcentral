@@ -1,88 +1,50 @@
-use include_exclude_watcher as file_watcher;
+//! A project: one domain directory, its declared servers, and the routing script run for every
+//! request.
+//!
+//! The project itself has no lifecycle state any more - that lives per server in `AppServer`.
+//! What the project owns is the configuration, the shared logger, and the single file watcher its
+//! servers share: a change to the config replaces the project wholesale, any other watched change
+//! stops the servers so they restart from the new files on the next request.
+
+use crate::app_server::{get_ownership, AppServer, AppState, StopReason};
+use crate::config::ProjectConfig;
+use crate::dashboard::ServerStatus;
 use crate::logger::Logger;
-use crate::project_config::{PodmanConfig, ProjectConfig, ProjectType};
+use crate::script::{self, Terminal};
 use crate::server::SHARED_EXECUTOR;
 use crate::streams::AnyConnector;
-use tower::Service;
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
-use base64::Engine;
-
 use anyhow::Result;
 use bytes::Bytes;
-use http::HeaderValue;
-use http_body_util::{BodyExt, Full, combinators::BoxBody};
+use http::{HeaderValue, Request, Response};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use hyper::body::Incoming;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioIo;
 use std::error::Error as StdError;
-use hyper::{body::Incoming, Request, Response};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower::Service;
 
 /// Streaming response body type used throughout the proxy.
-/// Wraps BoxBody to allow streaming responses from upstream to clients.
 pub type StreamBody = BoxBody<Bytes, anyhow::Error>;
 
-/// Create an empty StreamBody (for redirects, upgrade responses, etc.)
 pub fn empty_body() -> StreamBody {
     BoxBody::new(Full::new(Bytes::new()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e)))
 }
 
-/// Create a StreamBody from any data that can be converted to Bytes
 pub fn body_from<T: Into<Bytes>>(data: T) -> StreamBody {
     BoxBody::new(Full::new(data.into()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e)))
 }
-use hyper_util::client::legacy::connect::{HttpConnector};
-use hyper_util::{
-    client::legacy::Client,
-    rt::{TokioIo},
-};
-use std::fs;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex, Notify, watch};
-use tokio::time::sleep;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Application lifecycle state for Application-type projects
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppState {
-    Stopped,   // No process running, will start on demand
-    Starting,  // Process spawning, waiting for port
-    Running,   // Process running and accepting requests
-    Failed,    // Startup failed twice, project should be deregistered
-}
-
-/// Reasons for stopping the application
-#[derive(Debug, Clone, Copy)]
-pub enum StopReason {
-    FileChange,
-    Inactivity,
-    ProcessExit,
-    Shutdown,  // Server shutdown
-}
-
-/// Result of authentication check
-enum AuthResult {
-    Passed,                     // Auth passed (via cookie)
-    PassedSetCookie(String),    // Auth passed via basic auth, set cookie for username
-    Failed(Response<StreamBody>), // Auth failed, return this response
-}
 
 lazy_static::lazy_static! {
-     static ref DEFAULT_HTTP_CLIENT: Client<AnyConnector, Full<Bytes>> = Client::builder(SHARED_EXECUTOR.clone()).build(AnyConnector::Http(HttpConnector::new()));
-     static ref DEFAULT_CONNECTOR: AnyConnector = AnyConnector::Http(HttpConnector::new());
-}
-
-
-// --- Project ---
-
-/// Connection info for Application projects - updated on each restart with new port
-#[derive(Debug)]
-struct AppConnection {
-    port: u16,
-    http_client: Client<AnyConnector, Full<Bytes>>,
-    connector: AnyConnector,
+    static ref DEFAULT_HTTP_CLIENT: Client<AnyConnector, StreamBody> =
+        Client::builder(SHARED_EXECUTOR.clone())
+            .retry_canceled_requests(false)
+            .build(AnyConnector::Http(HttpConnector::new()));
+    static ref DEFAULT_CONNECTOR: AnyConnector = AnyConnector::Http(HttpConnector::new());
 }
 
 #[derive(Debug)]
@@ -91,1654 +53,439 @@ pub struct Project {
     pub logger: Arc<Logger>,
     pub domain: String,
     dir: PathBuf,
-    uid: u32,
-    gid: u32,
-    use_firejail: bool,
-    // For non-Application projects: static connection info
-    // For Application projects: None (uses app_connection instead)
-    static_http_client: Option<Client<AnyConnector, Full<Bytes>>>,
-    static_connector: Option<AnyConnector>,
-    // For Application projects: connection info updated on each restart
-    app_connection: Mutex<Option<AppConnection>>,
-    // Application state (only meaningful for Application type projects)
-    state_tx: watch::Sender<AppState>,
-    state_rx: watch::Receiver<AppState>,
-    stop_tx: mpsc::Sender<StopReason>,  // Send to request stop
-    pending_requests: AtomicU64,        // Requests currently being handled (for startup trigger)
-    active_upgrades: AtomicU64,         // Active WebSocket/upgraded connections
-    total_requests: AtomicU64,          // Total requests served
-    last_activity: Mutex<Instant>,
-    watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    state_changed: Notify,              // Notified when pending_requests changes
+    servers: Vec<Arc<AppServer>>,
+    /// Clients for `forward`/`proxy` targets, built on first use and reused after that.
+    targets: dashmap::DashMap<String, (AnyConnector, Client<AnyConnector, StreamBody>)>,
+    total_requests: AtomicU64,
+    /// The project files' mtimes from just before the configuration was read, so an event that
+    /// merely reports the write this project was built from can be told from a real change.
+    project_file_mtimes: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    /// The configuration's constants plus `$domain`, copied into every request.
+    vars: script::Vars,
+    /// Whether `admin_dashboard` may be served: only for projects owned by the user webcentral
+    /// runs as, since that page shows every user's domains.
+    admin_allowed: bool,
+    changes: tokio::sync::mpsc::UnboundedSender<PathBuf>,
 }
 
 impl Project {
-    pub fn new(
-        dir: &Path,
-        domain: String,
-        use_firejail: bool,
-        prune_logs: i64,
-    ) -> Result<Arc<Project>> {
-        // Load configuration
+    pub fn new(dir: &Path, domain: String, prune_logs: i64) -> Result<Arc<Project>> {
+        // Snapshotted *before* the configuration is read: a write landing during the read makes
+        // the later event differ from the snapshot, which errs towards one redundant reload
+        // rather than a missed one.
+        let project_file_mtimes = crate::config::PROJECT_FILES
+            .iter()
+            .map(|f| {
+                let path = dir.join(f);
+                let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                (path, mtime)
+            })
+            .collect();
         let config = ProjectConfig::load(dir)?;
         let (uid, gid) = get_ownership(dir);
 
-        // Create logger
         let log_dir = dir.join("_webcentral_data/log");
         let logger = Arc::new(Logger::new(log_dir, uid, gid, prune_logs)?);
 
-        // Create connector based on project type
-        // For Application types, connector is created dynamically on each start
-        let is_application = matches!(config.project_type, ProjectType::Application { .. });
-        let (static_connector, static_http_client) = if is_application {
-            logger.write("supervisor", "Application server (port assigned on start)");
-            (None, None)
-        } else {
-            let (connector, descr) = match &config.project_type {
-                ProjectType::Redirect { target } => {
-                    (None, format!("Redirect to {}", target))
-                }
-                ProjectType::Proxy { target } => {
-                    (None, format!("Proxy to {}", target))
-                }
-                ProjectType::TcpForward { address } => {
-                    (Some(AnyConnector::FixedTcp(address.clone())), format!("Forward to port {}", address))
-                }
-                ProjectType::UnixForward { socket_path } => {
-                    (Some(AnyConnector::FixedUnix(socket_path.clone())), format!("Forward to unix socket {}", socket_path))
-                }
-                ProjectType::Static => {
-                    (None, "Static file server".to_string())
-                }
-                ProjectType::Dashboard => {
-                    (None, "Dashboard".to_string())
-                }
-                ProjectType::Application { .. } => unreachable!(),
-            };
-            logger.write("supervisor", &descr);
-
-            if let Some(c) = connector {
-                (Some(c.clone()), Some(Client::builder(SHARED_EXECUTOR.clone()).build(c)))
-            } else {
-                (Some(DEFAULT_CONNECTOR.clone()), Some(DEFAULT_HTTP_CLIENT.clone()))
-            }
-        };
-
-        // Log configuration errors
-        for err in &config.config_errors {
-            logger.write("supervisor", err);
+        logger.write("supervisor", &config.summary());
+        for error in &config.errors {
+            logger.write("supervisor", error);
         }
 
-        let (state_tx, state_rx) = watch::channel(AppState::Stopped);
-        let (stop_tx, stop_rx) = mpsc::channel(8);
-        
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Servers never watch files themselves; changes are dispatched to them below.
+        let servers = config
+            .servers
+            .iter()
+            .map(|server| {
+                AppServer::new(server.clone(), dir, uid, gid, logger.clone())
+            })
+            .collect();
+
+        // The project's own domain, as opposed to `$host` - which is whatever the client asked for.
+        let mut vars = config.vars.clone();
+        vars.set("domain", &domain);
+
         let project = Arc::new(Project {
-            domain: domain.clone(),
+            domain,
             dir: dir.to_path_buf(),
-            config: Arc::new(config.clone()),
-            logger,
-            uid,
-            gid,
-            use_firejail,
-            static_http_client,
-            static_connector,
-            app_connection: Mutex::new(None),
-            state_tx,
-            state_rx,
-            stop_tx,
-            pending_requests: 0.into(),
-            active_upgrades: 0.into(),
+            config: Arc::new(config),
+            logger: logger.clone(),
+            servers,
+            targets: dashmap::DashMap::new(),
             total_requests: 0.into(),
-            last_activity: Mutex::new(Instant::now()),
-            watcher_task: Mutex::new(None),
-            state_changed: Notify::new(),
+            project_file_mtimes,
+            vars,
+            admin_allowed: uid == nix::unistd::geteuid().as_raw(),
+            changes: tx,
         });
 
-        // Start file watcher
-        let proj = project.clone();
-        let proj_for_watcher = project.clone();
-        let watcher_handle = tokio::spawn(async move {
-            if let Err(e) = proj.clone().watch_files().await {
-                let _ = proj.logger.write("supervisor", &format!("File watcher error: {}", e));
-            }
-        });
-        
-        // Store the watcher handle (spawn a task to do it since we're not async)
-        tokio::spawn(async move {
-            *proj_for_watcher.watcher_task.lock().await = Some(watcher_handle);
-        });
-
-        // Start lifecycle task for Application type projects
-        if let ProjectType::Application { .. } = project.config.project_type {
-            let proj = project.clone();
-            tokio::spawn(async move {
-                proj.lifecycle_task(stop_rx).await;
-            });
-        } else {
-            // For non-Application types, just listen for FileChange to deregister
-            let proj = project.clone();
-            tokio::spawn(async move {
-                proj.stop_listener(stop_rx).await;
-            });
-        }
+        // Changes arrive from the one process-wide watcher and are debounced here, per project.
+        let weak = Arc::downgrade(&project);
+        tokio::spawn(async move { apply_file_changes(weak, rx).await });
 
         Ok(project)
     }
 
-    /// Simple stop listener for non-Application projects. Deregistration on file change already
-    /// happened in the watcher callback; this only has to tear the project down.
-    async fn stop_listener(self: Arc<Self>, mut stop_rx: mpsc::Receiver<StopReason>) {
-        while let Some(reason) = stop_rx.recv().await {
-            match reason {
-                StopReason::FileChange | StopReason::Shutdown => {
-                    self.stop_watcher();
-                    return;
-                }
-                _ => {}
-            }
-        }
+    fn server(&self, name: &str) -> Option<&Arc<AppServer>> {
+        self.servers.iter().find(|s| s.name() == name)
     }
 
-    /// RAII guard to track pending requests - decrements count on drop
-    fn track_request(&self) {
-        self.pending_requests.fetch_add(1, Ordering::SeqCst);
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-        self.state_changed.notify_one();
+    /// Queue a changed file, given relative to the project directory. The one process-wide
+    /// watcher calls this; what the change means is worked out once the dust settles.
+    pub fn file_changed(&self, relative: PathBuf) {
+        let _ = self.changes.send(relative);
     }
 
-    fn untrack_request(&self) {
-        self.pending_requests.fetch_sub(1, Ordering::SeqCst);
-        self.state_changed.notify_one();
-    }
-
-    pub async fn handle(self: Arc<Self>, mut req: Request<Incoming>) -> Result<Response<StreamBody>> {
-        // Check for WebSocket upgrade before generic handling (requires Incoming body)
-        if is_upgrade_request(&req) {
-            // Log upgrade requests (handle_inner does logging for non-upgrades)
-            *self.last_activity.lock().await = Instant::now();
-            
-            self.log_request(&req);
-
-            // Check auth if configured (no cookie setting for upgrades)
-            if !self.config.auth.is_empty() {
-                match self.check_auth(&req) {
-                    AuthResult::Failed(response) => return Ok(response),
-                    _ => {} // Passed or PassedSetCookie - both mean auth ok
-                }
-            }
-
-            if let Some(response) = self.apply_rewrites(&mut req)? {
-                return Ok(response);
-            }
-
-            // Upgrades only work for forward/proxy/application types
-            match &self.config.project_type {
-                ProjectType::Application { .. } => {
-                    self.wait_for_app_ready().await?;
-                    let result = self.clone().proxy_upgrade(req).await;
-                    self.untrack_request();
-                    return result;
-                }
-                ProjectType::Proxy { .. } | ProjectType::TcpForward { .. } | 
-                ProjectType::UnixForward { .. } => {
-                    return self.clone().proxy_upgrade(req).await;
-                }
-                _ => {} // Fall through to normal handling
+    /// Tear the project down so the next request rebuilds it from the changed configuration.
+    /// Returns whether it did; an event this project already reflects is not acted on.
+    fn reload(&self, changed: &Path) -> bool {
+        // A change this project already read is not a reason to throw it away. Files are watched
+        // from before any project exists, so an event for the write that *created* this project's
+        // configuration can easily arrive just after it was loaded. The test is whether the mtime
+        // *differs* from the loaded snapshot, not whether it is newer: deploy tools like
+        // `rsync -a` preserve mtimes, so a change may well look older than this project.
+        let current = std::fs::metadata(changed).and_then(|m| m.modified()).ok();
+        if let Some((_, recorded)) = self.project_file_mtimes.iter().find(|(p, _)| p == changed) {
+            if *recorded == current {
+                return false;
             }
         }
 
-        self.handle_inner(req).await
-    }
-
-    /// Internal handler that works with any body type (no upgrade support).
-    /// Used by HTTP/3 which doesn't support WebSocket upgrades.
-    pub async fn handle_inner<B>(self: Arc<Self>, mut req: Request<B>) -> Result<Response<StreamBody>>
-    where
-        B: http_body::Body<Data = Bytes> + Send + 'static,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        // Update activity timestamp
-        *self.last_activity.lock().await = Instant::now();
-
-        self.log_request(&req);
-
-        // Track if we need to set auth cookie on successful response
-        let mut set_auth_cookie: Option<String> = None;
-
-        // Check auth if configured
-        if !self.config.auth.is_empty() {
-            // Handle /webcentral/logout - clear cookie and redirect to /
-            if req.uri().path() == "/webcentral/logout" {
-                return Ok(Response::builder()
-                    .status(302)
-                    .header("Location", "/")
-                    .header("Set-Cookie", "webcentral_auth=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
-                    .body(empty_body())?);
-            }
-
-            match self.check_auth(&req) {
-                AuthResult::Failed(response) => return Ok(response),
-                AuthResult::PassedSetCookie(username) => set_auth_cookie = Some(username),
-                AuthResult::Passed => {}
-            }
-        }
-
-        // Apply URL rewrites
-        if let Some(response) = self.apply_rewrites(&mut req)? {
-            return Ok(response);
-        }
-
-        // Determine handler based on configuration
-        // Clone self upfront since some handlers take ownership
-        let self_clone = self.clone();
-        let mut response = match &self.config.project_type {
-            ProjectType::Redirect { target } => self.handle_redirect(&req, target).await,
-            ProjectType::Proxy { target } => self_clone.proxy_request(req, target).await,
-            ProjectType::TcpForward { .. } => self.forward_request(req).await,
-            ProjectType::UnixForward { .. } => self.forward_request(req).await,
-            ProjectType::Application { .. } => self_clone.handle_application(req).await,
-            ProjectType::Static => self.handle_static(&req).await,
-            ProjectType::Dashboard => self.handle_dashboard(&req).await,
-        }?;
-
-        // Add auth cookie if authentication just succeeded via basic auth
-        if let Some(username) = set_auth_cookie {
-            let password_hash = self.config.auth.get(&username).unwrap();
-            let cookie = format!("webcentral_auth={}:{}; Path=/; HttpOnly; SameSite=Strict; Max-Age=315360000", username, password_hash);
-            response.headers_mut().insert(
-                http::header::SET_COOKIE,
-                HeaderValue::from_str(&cookie).unwrap()
-            );
-        }
-
-        Ok(response)
-    }
-
-    fn log_request<B>(&self, req: &Request<B>) {
-        if self.config.log_requests {
-            let addr = req.headers().get("X-Forwarded-For").and_then(|h| h.to_str().ok()).unwrap_or("-");
-            let _ = self.logger.write("request", &format!("{} {} {}", addr, req.method(), req.uri().path()));
-        }
-    }
-
-    /// Apply the first matching `[rewrite]` rule to the request. A target that isn't an absolute
-    /// path (`https://elsewhere/x`) produces a redirect; an absolute path rewrites the request URI
-    /// in place, so every handler (static, application, proxy, forward, redirect) sees the new path.
-    fn apply_rewrites<B>(&self, req: &mut Request<B>) -> Result<Option<Response<StreamBody>>> {
-        let path = req.uri().path();
-        let Some((regex, target)) = self
-            .config
-            .rewrites
-            .iter()
-            .find(|(regex, _)| regex.is_match(path))
-        else {
-            return Ok(None);
-        };
-
-        let result = regex.replace(path, target).to_string();
-        if !result.starts_with('/') {
-            return Ok(Some(
-                Response::builder()
-                    .status(301)
-                    .header("Location", result)
-                    .body(empty_body())?,
-            ));
-        }
-
-        // A target may carry its own query string, in which case it replaces the request's
-        let path_and_query = match (result.contains('?'), req.uri().query()) {
-            (false, Some(query)) => format!("{}?{}", result, query),
-            _ => result,
-        };
-        let mut parts = req.uri().clone().into_parts();
-        parts.path_and_query = Some(path_and_query.parse().map_err(|err| {
-            anyhow::anyhow!("Rewrite of '{}' to '{}' is not a valid URL: {}", path, path_and_query, err)
-        })?);
-        *req.uri_mut() = http::Uri::from_parts(parts)?;
-        Ok(None)
-    }
-
-    /// Check authentication. Returns Some(response) if auth failed/logout, None if auth passed.
-    /// When basic auth succeeds, the returned None indicates the handler should set an auth cookie.
-    fn check_auth<B>(&self, req: &Request<B>) -> AuthResult {
-        // Check for valid auth cookie first
-        if let Some(cookie_header) = req.headers().get(http::header::COOKIE) {
-            if let Ok(cookies) = cookie_header.to_str() {
-                for cookie in cookies.split(';') {
-                    let cookie = cookie.trim();
-                    if let Some(value) = cookie.strip_prefix("webcentral_auth=") {
-                        // Cookie format: username:password_hash
-                        if let Some((username, cookie_hash)) = value.split_once(':') {
-                            if let Some(password_hash) = self.config.auth.get(username) {
-                                if cookie_hash == password_hash {
-                                    return AuthResult::Passed;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        // No valid cookie, check for basic auth header
-        let Some(auth_header) = req.headers().get(http::header::AUTHORIZATION) else {
-            return AuthResult::Failed(self.auth_required_response());
-        };
-        let Some(auth_str) = auth_header.to_str().ok() else {
-            return AuthResult::Failed(self.auth_required_response());
-        };
-        
-        if !auth_str.starts_with("Basic ") {
-            return AuthResult::Failed(self.auth_required_response());
-        }
-        
-        let encoded = &auth_str[6..];
-        let Some(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded).ok() else {
-            return AuthResult::Failed(self.auth_required_response());
-        };
-        let Some(credentials) = String::from_utf8(decoded).ok() else {
-            return AuthResult::Failed(self.auth_required_response());
-        };
-        
-        let Some((username, password)) = credentials.split_once(':') else {
-            return AuthResult::Failed(self.auth_required_response());
-        };
-        
-        // Look up password hash for username
-        let Some(password_hash) = self.config.auth.get(username) else {
-            return AuthResult::Failed(self.auth_required_response());
-        };
-        
-        // Verify password using argon2
-        let Ok(parsed_hash) = PasswordHash::new(password_hash) else {
-            return AuthResult::Failed(self.auth_required_response());
-        };
-        if Argon2::default().verify_password(password.as_bytes(), &parsed_hash).is_ok() {
-            // Auth passed via basic auth - signal that cookie should be set
-            AuthResult::PassedSetCookie(username.to_string())
-        } else {
-            AuthResult::Failed(self.auth_required_response())
-        }
-    }
-
-    /// Generate a 401 Unauthorized response with WWW-Authenticate header
-    fn auth_required_response(&self) -> Response<StreamBody> {
-        Response::builder()
-            .status(401)
-            .header("WWW-Authenticate", "Basic realm=\"Authentication Required\"")
-            .body(body_from("Unauthorized"))
-            .unwrap()
-    }
-
-    async fn handle_redirect<B>(&self, req: &Request<B>, target: &str) -> Result<Response<StreamBody>> {
-        Ok(Response::builder()
-            .status(301)
-            .header("Location", &format!("{}{}", target, req.uri().path()))
-            .body(empty_body())?)
-    }
-
-    async fn handle_static<B>(&self, req: &Request<B>) -> Result<Response<StreamBody>> {
-        let public_dir = self.dir.join("public");
-        if !public_dir.exists() {
-            return Ok(Response::builder()
-                .status(404)
-                .body(body_from("Not Found"))?);
-        }
-
-        let Some(file_path) = resolve_static_path(&public_dir, req.uri().path()) else {
-            return Ok(Response::builder()
-                .status(404)
-                .body(body_from("Not Found"))?);
-        };
-
-        if file_path.starts_with(&public_dir) && file_path.exists() && file_path.is_file() {
-            let content = tokio::fs::read(&file_path).await?;
-            let mime = mime_guess::from_path(&file_path)
-                .first_or_octet_stream()
-                .to_string();
-            Ok(Response::builder()
-                .status(200)
-                .header("Content-Type", mime)
-                .body(body_from(content))?)
-        } else {
-            Ok(Response::builder()
-                .status(404)
-                .body(body_from("Not Found"))?)
-        }
-    }
-
-    async fn handle_dashboard<B>(&self, _req: &Request<B>) -> Result<Response<StreamBody>> {
-        let domains = crate::server::get_domain_status();
-        let server_info = crate::server::get_server_info();
-        
-        // Format uptime nicely
-        let uptime_secs = server_info.uptime_seconds;
-        let uptime_str = if uptime_secs < 60 {
-            format!("{}s", uptime_secs)
-        } else if uptime_secs < 3600 {
-            format!("{}m {}s", uptime_secs / 60, uptime_secs % 60)
-        } else if uptime_secs < 86400 {
-            format!("{}h {}m", uptime_secs / 3600, (uptime_secs % 3600) / 60)
-        } else {
-            format!("{}d {}h", uptime_secs / 86400, (uptime_secs % 86400) / 3600)
-        };
-        
-        let mut html = format!(r#"<!DOCTYPE html>
-<html>
-<head>
-<title>Webcentral Dashboard</title>
-<style>
-body {{ font-family: system-ui, sans-serif; margin: 2em; background: #f5f5f5; }}
-h1 {{ color: #333; }}
-h2 {{ color: #555; margin-top: 2em; }}
-table {{ border-collapse: collapse; width: 100%; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 1em; }}
-th, td {{ border: 1px solid #ddd; padding: 0.75em 1em; text-align: left; }}
-th {{ background: #f8f8f8; }}
-tr:hover {{ background: #f5f5f5; }}
-.status-running {{ color: #2a2; }}
-.status-stopped {{ color: #888; }}
-.status-starting {{ color: #f90; }}
-.status-failed {{ color: #c22; }}
-.status-active {{ color: #2a2; }}
-.cert-valid {{ color: #2a2; }}
-.cert-error {{ color: #c22; }}
-.cert-acquiring {{ color: #f90; }}
-.server-info {{ display: flex; gap: 2em; margin-bottom: 2em; flex-wrap: wrap; }}
-.info-card {{ background: white; padding: 1em 1.5em; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-.info-card h3 {{ margin: 0 0 0.5em 0; color: #666; font-size: 0.9em; }}
-.info-card .value {{ font-size: 1.5em; color: #333; }}
-.num {{ text-align: right; }}
-.dir {{ font-size: 0.85em; color: #666; max-width: 300px; overflow: hidden; text-overflow: ellipsis; }}
-</style>
-</head>
-<body>
-<h1>Webcentral Dashboard</h1>
-
-<div class="server-info">
-<div class="info-card"><h3>Uptime</h3><div class="value">{}</div></div>
-<div class="info-card"><h3>Domains</h3><div class="value">{}</div></div>
-</div>
-
-<h2>Projects</h2>
-<table>
-<tr><th>Domain</th><th>Type</th><th>Status</th><th>TLS</th><th>Requests</th><th>Pending</th><th>Idle</th><th>Directory</th></tr>
-"#, uptime_str, server_info.domain_count);
-
-        for d in domains {
-            let status_class = match d.status.as_str() {
-                "Running" => "status-running",
-                "Stopped" => "status-stopped",
-                "Starting" => "status-starting",
-                "Failed" => "status-failed",
-                "Active" => "status-active",
-                _ => "",
-            };
-            let idle_str = if d.active_upgrades > 0 {
-                format!("{} websocket{}", d.active_upgrades, if d.active_upgrades == 1 { "" } else { "s" })
-            } else {
-                d.idle_seconds.map(|s| {
-                    if s < 60 { format!("{}s", s) }
-                    else if s < 3600 { format!("{}m", s / 60) }
-                    else { format!("{}h", s / 3600) }
-                }).unwrap_or_else(|| "-".to_string())
-            };
-            
-            let (cert_class, cert_str) = match d.cert_status.as_deref() {
-                Some(s) if s.starts_with("Valid") => ("cert-valid", s),
-                Some(s) if s.starts_with("Error") => ("cert-error", s),
-                Some(s) if s == "Expired" => ("cert-error", s),
-                Some(s) => ("cert-acquiring", s),
-                None => ("", "-"),
-            };
-            
-            html.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td class=\"{}\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"dir\" title=\"{}\">{}</td></tr>\n",
-                d.domain, d.project_type, status_class, d.status, cert_class, cert_str, d.total_requests, d.pending_requests, idle_str, d.directory, d.directory
-            ));
-        }
-
-        html.push_str("</table>\n</body>\n</html>");
-
-        Ok(Response::builder()
-            .status(200)
-            .header("Content-Type", "text/html; charset=utf-8")
-            .body(body_from(html))?)
-    }
-
-    async fn proxy_request<B>(
-        self: Arc<Self>,
-        req: Request<B>,
-        target: &str,
-    ) -> Result<Response<StreamBody>>
-    where
-        B: http_body::Body<Data = Bytes> + Send + 'static,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        let (parts, body) = req.into_parts();
-        let uri_str = format!("{}{}", target, parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/"));
-
-        let mut new_parts = parts.clone();
-        let new_uri: http::Uri = uri_str.parse()?;
-        new_parts.uri = new_uri.clone();
-
-        let original_host = parts
-            .headers
-            .get("host")
-            .or_else(|| parts.headers.get(":authority"))
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("");
-
-        // Set X-Forwarded headers to preserve original request info
-        new_parts.headers.insert("X-Forwarded-Host", HeaderValue::from_str(original_host)?);
-
-        // Rewrite Host header to match the backend (extracted from target URI)
-        if let Some(authority) = new_uri.authority() {
-            new_parts.headers.insert("host", HeaderValue::from_str(authority.as_str())?);
-        }
-
-        self.forward_request_parts(new_parts, body).await
-    }
-
-    async fn forward_request<B>(
-        self: &Arc<Self>,
-        req: Request<B>,
-    ) -> Result<Response<StreamBody>>
-    where
-        B: http_body::Body<Data = Bytes> + Send + 'static,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        // Note: WebSocket upgrades are handled separately in handle_upgrade
-        // because they require the hyper::body::Incoming type specifically.
-        let (parts, body) = req.into_parts();
-        self.forward_request_parts(parts, body).await
-    }
-
-    async fn forward_request_parts<B>(
-        self: &Arc<Self>,
-        mut parts: http::request::Parts,
-        body: B,
-    ) -> Result<Response<StreamBody>>
-    where
-        B: http_body::Body<Data = Bytes> + Send + 'static,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        // Upstream connections are always HTTP/1.1
-        parts.version = http::Version::HTTP_11;
-        
-        // Remove HTTP/2 and HTTP/3 pseudo-headers (they start with ':')
-        // These are not valid in HTTP/1.1 and will cause upstream errors
-        parts.headers.remove(":authority");
-        parts.headers.remove(":method");
-        parts.headers.remove(":path");
-        parts.headers.remove(":scheme");
-        parts.headers.remove(":status");
-        parts.headers.remove(":protocol");
-        
-        let body_bytes = BodyExt::collect(body).await.map_err(|e| anyhow::anyhow!("{}", e.into()))?.to_bytes();
-        let req = Request::from_parts(parts, Full::new(body_bytes));
-
-        // Get the http_client from the appropriate source
-        let http_client = if let Some(client) = &self.static_http_client {
-            client.clone()
-        } else {
-            let conn = self.app_connection.lock().await;
-            match conn.as_ref() {
-                Some(c) => c.http_client.clone(),
-                None => anyhow::bail!("502 application not started"),
-            }
-        };
-
-        let resp = match http_client.request(req).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                if e.is_connect() {
-                    // Upstream unreachable. ProcessExit (not Shutdown) so an Application's
-                    // lifecycle restarts it on the next request instead of exiting permanently;
-                    // harmlessly ignored by proxy/forward stop-listeners.
-                    self.request_stop(StopReason::ProcessExit);
-                    let source = StdError::source(&e).map(|s| s.to_string()).unwrap_or_default();
-                    anyhow::bail!("502 upstream connect failed: {}", source);
-                }
-                return Err(e.into());
-            }
-        };
-
-        // Return the upstream response body as-is for streaming.
-        // When the client disconnects, the response is dropped, which drops the body,
-        // which closes the connection to the upstream server.
-        let (parts, body) = resp.into_parts();
-        Ok(Response::from_parts(parts, BoxBody::new(body.map_err(|e| anyhow::anyhow!("{}", e)))))
-    }
-
-    async fn handle_application<B>(self: Arc<Self>, req: Request<B>) -> Result<Response<StreamBody>>
-    where
-        B: http_body::Body<Data = Bytes> + Send + 'static,
-        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    {
-        self.wait_for_app_ready().await?;
-        let result = self.forward_request(req).await;
-        self.untrack_request();
-        result
-    }
-
-    /// Wait for application to be ready, tracking the request.
-    /// On success, caller MUST call untrack_request() when done.
-    ///
-    /// No timeout here on purpose: the lifecycle always resolves to Running or Failed (it gives up
-    /// after `startup_deadline`), so a slow startup is left to finish and the client's own timeout
-    /// applies instead of us forcing a premature error.
-    async fn wait_for_app_ready(&self) -> Result<()> {
-        self.track_request();
-
-        let mut rx = self.state_rx.clone();
-        let state = match rx.wait_for(|&s| s == AppState::Running || s == AppState::Failed).await {
-            Ok(s) => *s,
-            Err(_) => {
-                self.untrack_request();
-                anyhow::bail!("Application state channel closed");
-            }
-        };
-
-        if state == AppState::Failed {
-            self.untrack_request();
-            anyhow::bail!("502 application failed to start");
-        }
-
-        Ok(())
-    }
-
-    /// Spawns the application process and workers. Returns handles to await for process exit.
-    /// Allocates a new port and stores connection info in app_connection.
-    /// Does NOT wait for port readiness - caller should do that.
-    async fn spawn_processes(&self) -> Result<Vec<tokio::process::Child>> {
-        // Allocate a new port for this startup cycle
-        let port = get_free_port()?;
-        let addr = format!("localhost:{}", port);
-        let connector = AnyConnector::FixedTcp(addr.clone());
-        let http_client = Client::builder(SHARED_EXECUTOR.clone()).build(connector.clone());
-        
-        // Store the new connection info
-        *self.app_connection.lock().await = Some(AppConnection {
-            port,
-            http_client,
-            connector,
-        });
-
-        self.logger.write("supervisor", &format!("Starting on port {}", port));
-
-        let (command, podman, workers) = match &self.config.project_type {
-            ProjectType::Application {
-                command,
-                podman,
-                workers,
-                ..
-            } => (command.clone(), podman.clone(), workers.clone()),
-            _ => unreachable!("spawn_processes called for non-Application project"),
-        };
-
-        let mut process = if let Some(podman_config) = &podman {
-            self.build_podman_command(port, podman_config, &command)
-                .await?
-        } else {
-            self.build_shell_command(&command)?
-        };
-
-        // Set environment
-        process.env("PORT", port.to_string());
-        for (key, val) in &self.config.environment {
-            process.env(key, val);
-        }
-
-        // Set working directory
-        process.current_dir(&self.dir);
-
-        // Capture stdout/stderr
-        process.stdout(std::process::Stdio::piped());
-        process.stderr(std::process::Stdio::piped());
-
-        self.logger.write("supervisor", &format!("Starting application: {:?}", process));
-
-        let mut child = process.spawn()?;
-        let mut children = Vec::new();
-
-        // Stream stdout to log
-        if let Some(stdout) = child.stdout.take() {
-            let logger = self.logger.clone();
-            tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    logger.write("stdout", &line);
-                }
-            });
-        }
-
-        // Stream stderr to log
-        if let Some(stderr) = child.stderr.take() {
-            let logger = self.logger.clone();
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    logger.write("stderr", &line);
-                }
-            });
-        }
-
-        children.push(child);
-
-        // Spawn workers
-        if !workers.is_empty() {
-            self.logger.write("supervisor", &format!("Starting {} worker(s)", workers.len()));
-        }
-
-        for (name, cmd) in &workers {
-            let mut process = match self.build_shell_command(cmd) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.logger.write("supervisor", &format!("Failed to build worker {}: {}", name, e));
-                    continue;
-                }
-            };
-
-            process.env("PORT", port.to_string());
-            for (key, val) in &self.config.environment {
-                process.env(key, val);
-            }
-            process.current_dir(&self.dir);
-            process.stdout(std::process::Stdio::piped());
-            process.stderr(std::process::Stdio::piped());
-
-            match process.spawn() {
-                Ok(mut worker_child) => {
-                    let logger = self.logger.clone();
-                    let label = format!("worker-{}", name);
-                    if let Some(stdout) = worker_child.stdout.take() {
-                        let logger = logger.clone();
-                        let label = label.clone();
-                        tokio::spawn(async move {
-                            let reader = BufReader::new(stdout);
-                            let mut lines = reader.lines();
-                            while let Ok(Some(line)) = lines.next_line().await {
-                                logger.write(&label, &line);
-                            }
-                        });
-                    }
-                    if let Some(stderr) = worker_child.stderr.take() {
-                        let logger = logger.clone();
-                        let label = label.clone();
-                        tokio::spawn(async move {
-                            let reader = BufReader::new(stderr);
-                            let mut lines = reader.lines();
-                            while let Ok(Some(line)) = lines.next_line().await {
-                                logger.write(&label, &line);
-                            }
-                        });
-                    }
-                    children.push(worker_child);
-                }
-                Err(e) => {
-                    self.logger.write("supervisor", &format!("Failed to start worker {}: {}", name, e));
-                }
-            }
-        }
-
-        Ok(children)
-    }
-
-    /// Main lifecycle state machine for Application projects.
-    /// Manages: Stopped -> Starting -> Running -> (stop trigger) -> Stopped cycle.
-    /// On startup failure (not ready within startup_deadline) -> Failed -> deregister; the next
-    /// request builds a fresh project.
-    async fn lifecycle_task(self: Arc<Self>, mut stop_rx: mpsc::Receiver<StopReason>) {
-        let timeout_duration = if self.config.reload.timeout > 0 {
-            Some(Duration::from_secs(self.config.reload.timeout as u64))
-        } else {
-            None
-        };
-
-        loop {
-            let state = *self.state_rx.borrow();
-            
-            match state {
-                AppState::Stopped => {
-                    // Wait for a pending request to trigger startup
-                    loop {
-                        if self.pending_requests.load(Ordering::SeqCst) > 0 {
-                            break;
-                        }
-                        // Check for shutdown signal while waiting
-                        // Use a timeout to periodically re-check pending_requests
-                        // in case we missed a notification
-                        tokio::select! {
-                            reason = stop_rx.recv() => {
-                                match reason {
-                                    Some(StopReason::Shutdown) | None => {
-                                        self.logger.write("supervisor", "Shutdown requested");
-                                        return;
-                                    }
-                                    Some(StopReason::FileChange) => {
-                                        // Config/files changed while idle. The next request builds a
-                                        // fresh project with the new config, so stop watching and let
-                                        // this (now orphaned) instance go away.
-                                        self.logger.write("supervisor", "Stopped app (file change while idle)");
-                                        self.stop_watcher();
-                                        return;
-                                    }
-                                    // Inactivity/ProcessExit are meaningless while already stopped.
-                                    _ => {}
-                                }
-                            }
-                            _ = self.state_changed.notified() => {
-                                // Got notification, loop back to check pending_requests
-                            }
-                            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                                // Periodic check in case notification was missed
-                            }
-                        }
-                    }
-                    
-                    let _ = self.state_tx.send(AppState::Starting);
-                }
-                
-                AppState::Starting => {
-                    self.logger.write("supervisor", "Starting application");
-                    
-                    // Spawn processes
-                    let mut children = match self.spawn_processes().await {
-                        Ok(c) => c,
-                        Err(e) => {
-                            self.logger.write("supervisor", &format!("Failed to spawn: {}; giving up", e));
-                            let _ = self.state_tx.send(AppState::Failed);
-                            continue;
-                        }
-                    };
-
-                    // Wait for port with deadline, checking stop signals and process exit
-                    let startup_deadline = self.config.reload.startup_deadline;
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(startup_deadline);
-                    let port_ready = loop {
-                        tokio::select! {
-                            reason = stop_rx.recv() => {
-                                self.kill_processes_by_ref(&mut children).await;
-                                match reason {
-                                    Some(StopReason::Shutdown) => {
-                                        self.logger.write("supervisor", "Shutdown during startup");
-                                        return;
-                                    }
-                                    Some(StopReason::FileChange) => {
-                                        self.logger.write("supervisor", "File change during startup");
-                                        self.stop_watcher();
-                                        return;
-                                    }
-                                    _ => break false,
-                                }
-                            }
-                            status = async { children.first_mut().unwrap().wait().await } => {
-                                self.logger.write("supervisor", &format!("Process exited during startup: {:?}", status));
-                                break false;
-                            }
-                            ready = self.probe_port() => {
-                                if ready {
-                                    break true;
-                                } else if tokio::time::Instant::now() >= deadline {
-                                    self.logger.write("supervisor", &format!("Port did not become ready within {}s", startup_deadline));
-                                    break false;
-                                }
-                                sleep(Duration::from_millis(50)).await;
-                            }
-                        }
-                    };
-
-                    if !port_ready {
-                        // Single attempt: terminate and give up. Failed fails waiting requests; a
-                        // later request rebuilds.
-                        self.logger.write("supervisor", "Startup failed; terminating application and giving up");
-                        self.kill_processes_by_ref(&mut children).await;
-                        let _ = self.state_tx.send(AppState::Failed);
-                        continue;
-                    }
-
-                    // Get port from app_connection for logging
-                    let port = {
-                        let conn = self.app_connection.lock().await;
-                        conn.as_ref().map(|c| c.port).unwrap_or(0)
-                    };
-                    self.logger.write("supervisor", &format!("Ready on port {}", port));
-                    let _ = self.state_tx.send(AppState::Running);
-                    
-                    // Run until stop trigger or process exit
-                    let stop_reason = self.run_until_stop(children, &mut stop_rx, timeout_duration).await;
-                    
-                    match stop_reason {
-                        StopReason::Shutdown => {
-                            self.logger.write("supervisor", "Stopped app (shutdown)");
-                            self.stop_watcher();
-                            return;
-                        }
-                        StopReason::FileChange => {
-                            self.logger.write("supervisor", "Stopped app (file change)");
-                            self.stop_watcher();
-                            return;
-                        }
-                        StopReason::Inactivity => {
-                            self.logger.write("supervisor", "Stopped app (inactivity)");
-                            // Loop continues, will restart on next request
-                        }
-                        StopReason::ProcessExit => {
-                            self.logger.write("supervisor", "Stopped app (process exit)");
-                            // Loop continues, will restart on next request
-                        }
-                    }
-                    // State is already Stopped (set by run_until_stop before killing processes)
-                }
-                
-                AppState::Running => {
-                    // Shouldn't happen (run_until_stop owns Running). Recover instead of panicking,
-                    // which would kill the lifecycle task and wedge the project.
-                    self.logger.write("supervisor", "Unexpected Running state in lifecycle; resetting to Stopped");
-                    let _ = self.state_tx.send(AppState::Stopped);
-                }
-                
-                AppState::Failed => {
-                    // Deregister from server and exit
-                    self.logger.write("supervisor", "Deregistering failed project");
-                    crate::server::deregister_project(&self.domain, &self);
-                    self.stop_watcher();
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Single port probe with 2s timeout. Returns true if ready, false if not yet.
-    async fn probe_port(&self) -> bool {
-        let port = self.app_connection.lock().await.as_ref().map(|c| c.port).unwrap_or(0);
-        let addr = format!("localhost:{}", port);
-
-        let probe = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut stream = TcpStream::connect(&addr).await?;
-            stream.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n").await?;
-            let mut buf = [0u8; 32];
-            let n = stream.read(&mut buf).await?;
-            Ok::<_, std::io::Error>((n, buf))
-        }).await;
-
-        matches!(probe, Ok(Ok((n, buf))) if n >= 12 && buf.starts_with(b"HTTP/1.") && buf[9] != b'5')
-    }
-
-    /// Run until a stop trigger occurs. Returns the stop reason.
-    async fn run_until_stop(
-        self: &Arc<Self>,
-        mut children: Vec<tokio::process::Child>,
-        stop_rx: &mut mpsc::Receiver<StopReason>,
-        timeout_duration: Option<Duration>,
-    ) -> StopReason {
-        loop {
-            // Calculate inactivity deadline
-            let inactivity_deadline = if let Some(timeout) = timeout_duration {
-                let last = *self.last_activity.lock().await;
-                Some(tokio::time::Instant::now() + timeout.saturating_sub(last.elapsed()))
-            } else {
-                None
-            };
-
-            tokio::select! {
-                // Stop signal received
-                reason = stop_rx.recv() => {
-                    let reason = reason.unwrap_or(StopReason::Shutdown);
-
-                    // Immediately transition to Stopped so new requests wait for restart
-                    let _ = self.state_tx.send(AppState::Stopped);
-                    self.kill_processes_by_ref(&mut children).await;
-                    return reason;
-                }
-                
-                // Check for main process exit (first child is the main process)
-                result = async {
-                    if let Some(main) = children.first_mut() {
-                        main.wait().await
-                    } else {
-                        std::future::pending().await
-                    }
-                } => {
-                    if let Ok(status) = result {
-                        self.logger.write("supervisor", &format!("Main process exited: {}", status));
-                    }
-                    // Immediately transition to Stopped so new requests wait for restart
-                    let _ = self.state_tx.send(AppState::Stopped);
-                    self.kill_processes_by_ref(&mut children).await;
-                    return StopReason::ProcessExit;
-                }
-                
-                // Inactivity timeout
-                _ = async {
-                    if let Some(deadline) = inactivity_deadline {
-                        tokio::time::sleep_until(deadline).await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    // Check if actually inactive (activity might have happened)
-                    if let Some(timeout) = timeout_duration {
-                        let last = *self.last_activity.lock().await;
-                        if last.elapsed() >= timeout {
-                            // Only stop if no active upgraded connections (WebSockets)
-                            if self.active_upgrades.load(Ordering::SeqCst) == 0 {
-                                self.logger.write("supervisor", "Stopping due to inactivity");
-                                // Immediately transition to Stopped so new requests wait for restart
-                                let _ = self.state_tx.send(AppState::Stopped);
-                                self.kill_processes_by_ref(&mut children).await;
-                                return StopReason::Inactivity;
-                            }
-                        }
-                    }
-                    // Activity happened or active upgrades exist, loop again
-                }
-            }
-        }
-    }
-
-    /// Kill all processes gracefully (SIGTERM then SIGKILL after 5s)
-    async fn kill_processes_by_ref(&self, children: &mut Vec<tokio::process::Child>) {
-        // Send SIGTERM to all
-        for child in children.iter() {
-            if let Some(pid) = child.id() {
-                #[cfg(unix)]
-                {
-                    use nix::sys::signal::{kill, Signal};
-                    use nix::unistd::Pid;
-                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-                }
-            }
-        }
-
-        // Wait up to 5s for graceful exit
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        for child in children.iter_mut() {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            tokio::select! {
-                _ = child.wait() => {}
-                _ = sleep(remaining) => {
-                    // start_kill() (sync) actually sends SIGKILL; Child::kill() is async and a
-                    // no-op if its future is dropped unawaited.
-                    let _ = child.start_kill();
-                    // Bound the reap: an unkillable (D-state) process must not freeze the lifecycle.
-                    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-                }
-            }
-        }
-        children.clear();
-    }
-
-    /// Request stop - sends to the lifecycle task
-    pub fn request_stop(&self, reason: StopReason) {
-        let _ = self.stop_tx.try_send(reason);
-    }
-
-    fn build_shell_command(&self, command: &str) -> Result<Command> {
-        let has_podman = matches!(
-            self.config.project_type,
-            ProjectType::Application {
-                podman: Some(_),
-                ..
-            }
+        // Deregister before tearing down: the teardown is asynchronous, and until it happens this
+        // project would keep serving with the old configuration.
+        crate::server::deregister_project_by_dir(&self.dir);
+        let name = changed.file_name().unwrap_or(changed.as_os_str());
+        self.logger.write(
+            "supervisor",
+            &format!(
+                "Stopping due to file changes: {} (reloading configuration)",
+                Path::new(name).display()
+            ),
         );
-
-        let mut cmd = if self.use_firejail && !has_podman {
-            let mut c = Command::new("firejail");
-            // Wrap command with cd to set working directory inside sandbox
-            let wrapped_command = format!("cd {} && {}", self.dir.display(), command);
-            c.args(&[
-				"--noprofile",
-				format!("--whitelist={}", self.dir.display()).as_str(),  // Project dir accessible, home is empty tmpfs
-				"--private-dev",
-				"--private-etc=group,hostname,localtime,nsswitch.conf,passwd,resolv.conf,alternatives,pki,crypto-policies",
-				"--private-tmp",
-				"--seccomp",
-				"--caps.drop=all",
-				"--disable-mnt",
-                "--",
-                "/bin/sh",
-                "-c",
-            ]);
-            c.arg(&wrapped_command);
-            c
-        } else {
-            let mut c = Command::new("/bin/sh");
-            c.args(&["-c", &command]);
-            c
-        };
-
-        // Set user and HOME if running as root
-        #[cfg(target_os = "linux")]
-        if nix::unistd::geteuid().is_root() {
-            cmd.uid(self.uid);
-            cmd.gid(self.gid);
-            cmd.env("HOME", get_user_home(self.uid));
-        }
-
-        Ok(cmd)
+        self.shutdown();
+        true
     }
 
-    /// Create a directory for the container to write in, owned by the project owner - which is
-    /// where the container's writes land on every supported path, since `add_userns_args` maps
-    /// whatever user the container runs as onto the owner. Directories that already exist are
-    /// left alone. Chown failure only means webcentral runs as neither root nor the owner, the
-    /// same unsupported case `add_userns_args` warns about - so a warning, not an error.
-    fn create_dir_for_container(&self, path: &Path) -> Result<()> {
-        if path.exists() {
-            return Ok(());
+    /// Stop every server and wait for them to be gone. Signalling alone is not enough at
+    /// shutdown: the process would exit before the lifecycle tasks ran, leaving the containers
+    /// running with nothing left to stop them.
+    pub async fn stop(self: Arc<Self>) {
+        for server in &self.servers {
+            server.request_stop(StopReason::Shutdown);
         }
-        fs::create_dir_all(path)?;
-        if get_ownership(path) != (self.uid, self.gid) {
-            if let Err(e) = std::os::unix::fs::chown(path, Some(self.uid), Some(self.gid)) {
-                self.logger.write("podman", &format!(
-                    "Could not give {} to {}:{} ({}); the container may not be able to write there.",
-                    path.display(), self.uid, self.gid, e));
-            }
-        }
-        Ok(())
-    }
-
-    /// The uid/gid a container started from `image` actually runs as. This needs podman's help:
-    /// `USER` may name a user that only exists inside the image, and an image declaring no user
-    /// at all runs as root. Cached per image+user, as it costs a container round trip.
-    async fn container_user_ids(&self, image: &str, user_arg: Option<&str>) -> Option<(u32, u32)> {
-        use std::collections::HashMap;
-        use std::sync::{Mutex, OnceLock};
-        static CACHE: OnceLock<Mutex<HashMap<String, (u32, u32)>>> = OnceLock::new();
-        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-
-        let key = format!("{}\0{}", image, user_arg.unwrap_or(""));
-        if let Some(ids) = cache.lock().unwrap().get(&key) {
-            return Some(*ids);
-        }
-
-        // Asking `id` inside the container resolves names and an absent USER uniformly, and pulls
-        // the image if it isn't local yet - which `run` would do moments later anyway.
-        let mut probe = Command::new(get_podman_path());
-        probe.args(&["run", "--rm", "--entrypoint", "/bin/sh"]);
-        if let Some(user) = user_arg {
-            probe.args(&["--user", user]);
-        }
-        probe.args(&[image, "-c", "id -u; id -g"]);
-
-        let ids = match probe.output().await {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let mut fields = stdout.split_whitespace();
-                match (fields.next().and_then(|v| v.parse().ok()),
-                       fields.next().and_then(|v| v.parse().ok())) {
-                    (Some(uid), Some(gid)) => Some((uid, gid)),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-
-        // Images without a shell (distroless and friends) can't be probed, so fall back to the
-        // declared USER. Only a numeric uid:gid pair is usable - anything else would need the
-        // image's passwd to resolve.
-        let ids = match (ids, user_arg) {
-            (None, None) => {
-                let out = Command::new(get_podman_path())
-                    .args(&["image", "inspect", "--format", "{{.Config.User}}", image])
-                    .output().await;
-                match out {
-                    Ok(out) if out.status.success() => {
-                        let declared = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                        if declared.is_empty() || declared == "root" {
-                            Some((0, 0))
-                        } else {
-                            parse_numeric_user(&declared)
-                        }
-                    }
-                    _ => None,
-                }
-            }
-            (ids, _) => ids,
-        };
-
-        if let Some(ids) = ids {
-            cache.lock().unwrap().insert(key, ids);
-        }
-        ids
-    }
-
-    fn dir_hash(&self) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        self.dir.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    /// Build (or reuse) an image derived from the configured base, optionally with `uid:gid` added
-    /// as a real user that the image then runs as.
-    async fn build_image(&self, pc: &PodmanConfig, build_user: Option<(u32, u32)>) -> Result<String> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut dockerfile = format!("FROM {}\n", pc.base);
-
-        if !pc.packages.is_empty() {
-            let packages = pc.packages.join(" ");
-            dockerfile.push_str(&format!(
-                "RUN if command -v apk > /dev/null ; then apk update && apk add --no-cache {} ; \
-                elif command -v apt-get > /dev/null ; then apt-get update && apt-get install --no-install-recommends --yes {} ; \
-                elif command -v dnf > /dev/null ; then dnf install -y {} ; \
-                elif command -v yum > /dev/null ; then yum install -y {} ; \
-                else echo 'No supported package manager found' && exit 1 ; fi\n",
-                packages, packages, packages, packages
-            ));
-        }
-
-        for cmd in &pc.commands {
-            dockerfile.push_str(&format!("RUN {}\n", cmd));
-        }
-
-        // Added last, so the build itself still runs as root. Appending to passwd/group only when
-        // the ids are absent keeps this additive: unlike bind-mounting the host's passwd over the
-        // image's at runtime, it can't break users the image defines for itself. A real entry
-        // matters because a uid without one has no name and no home, which trips up git, npm and
-        // anything else calling getpwuid().
-        if let Some((uid, gid)) = build_user {
-            dockerfile.push_str(&format!(
-                "RUN grep -q \"^[^:]*:[^:]*:{gid}:\" /etc/group || echo \"webcentral:x:{gid}:\" >> /etc/group ; \
-                grep -q \"^[^:]*:[^:]*:{uid}:\" /etc/passwd || echo \"webcentral:x:{uid}:{gid}::{home}:/bin/sh\" >> /etc/passwd\n\
-                USER {uid}:{gid}\n",
-                uid = uid, gid = gid, home = self.container_home(pc)
-            ));
-        }
-
-        // Tag by what goes into the image rather than by project directory alone, so an unchanged
-        // configuration can skip the build entirely. Even a fully cached build costs about a
-        // second, and projects are started on demand while a request is waiting. The base image's
-        // local ID is part of the hash, so a pulled base update triggers one (cached) rebuild -
-        // exactly what building every time used to do. A base that isn't local yet hashes as
-        // empty and self-corrects once the first build pulls it.
-        let base_id = Command::new(get_podman_path())
-            .args(&["image", "inspect", "--format", "{{.Id}}", &pc.base])
-            .output()
-            .await
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .unwrap_or_default();
-        let mut hasher = DefaultHasher::new();
-        dockerfile.hash(&mut hasher);
-        base_id.hash(&mut hasher);
-        let repo = format!("webcentral-{:x}", self.dir_hash());
-        let image_name = format!("{}:{:x}", repo, hasher.finish());
-
-        let exists = Command::new(get_podman_path())
-            .args(&["image", "inspect", &image_name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if exists {
-            return Ok(image_name);
-        }
-
-        let dockerfile_path = self.dir.join("_webcentral_data/Dockerfile");
-        fs::create_dir_all(dockerfile_path.parent().unwrap())?;
-        fs::write(&dockerfile_path, &dockerfile)?;
-
-        let output = Command::new(get_podman_path())
-            .args(&["build", "-t", &image_name, "-f"])
-            .arg(&dockerfile_path)
-            .arg(&self.dir)
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            self.logger.write("podman", &stderr);
-            anyhow::bail!("Image build failed");
-        }
-
-        // Remove this project's images for older configs. They are named tags, which
-        // `podman image prune` never touches, so they would otherwise pile up forever.
-        if let Ok(out) = Command::new(get_podman_path())
-            .args(&["images", &repo, "--format", "{{.Tag}}"])
-            .output()
-            .await
-        {
-            for tag in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-                let stale = format!("{}:{}", repo, tag);
-                if stale != image_name {
-                    let _ = Command::new(get_podman_path())
-                        .args(&["rmi", &stale])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await;
-                }
-            }
-        }
-
-        Ok(image_name)
-    }
-
-    /// Home directory for the baked-in user. It lives in the project directory when that is mounted,
-    /// so it persists; otherwise there is nowhere to put it that outlives the container.
-    fn container_home(&self, pc: &PodmanConfig) -> String {
-        if pc.mount_app_dir {
-            format!("{}/_webcentral_data/home", pc.app_dir)
-        } else {
-            "/tmp".to_string()
+        for server in &self.servers {
+            server.wait_finished().await;
         }
     }
 
-    /// The one place uid policy lives: whatever user the container runs as inside, everything it
-    /// writes into the project directory or `mounts[]` must land on the host owned by the project
-    /// owner. Rootful podman maps host ids straight through, so when the container user differs
-    /// from the owner, an identity mapping with the two swapped puts the container's writes on
-    /// the owner - and shows it the owner's files as its own. A non-root webcentral means
-    /// rootless podman, where the only host user a container can write as is webcentral's own:
-    /// that's the owner precisely when the project is ours, and unsupported otherwise. Container
-    /// root already is us under rootless podman (`user = project` resolves to it for that
-    /// reason), so only an explicitly requested other uid needs keep-id - which fails at start,
-    /// loudly rather than by leaking ownership, on setups where custom rootless mappings are
-    /// broken (e.g. containers/podman#27785).
-    fn add_userns_args(&self, cmd: &mut Command, run_uid: u32, run_gid: u32) {
-        let euid = nix::unistd::geteuid().as_raw();
-        if euid == 0 {
-            if (run_uid, run_gid) != (self.uid, self.gid) {
-                cmd.args(swap_map_args("--uidmap", run_uid, self.uid));
-                cmd.args(swap_map_args("--gidmap", run_gid, self.gid));
-            }
-        } else if self.uid != euid {
-            self.logger.write("podman", &format!(
-                "This project is owned by uid {} but webcentral runs as uid {}; a non-root \
-                 webcentral can only keep container-written files owned by its own user. Files \
-                 this container writes may end up owned by a meaningless subuid.",
-                self.uid, euid));
-        } else if run_uid == 0 {
-            // Rootless podman maps container root to us all by itself.
-        } else if (run_uid, run_gid) == (euid, nix::unistd::getegid().as_raw()) {
-            // The plain form works on any podman version, unlike the uid=/gid= form below.
-            cmd.args(&["--userns", "keep-id"]);
-        } else {
-            // Map us to whatever the container runs as (needs podman >= 4.3).
-            cmd.args(&["--userns", &format!("keep-id:uid={},gid={}", run_uid, run_gid)]);
-        }
-    }
-
-    async fn build_podman_command(
-        &self,
-        port: u16,
-        pc: &PodmanConfig,
-        command: &str,
-    ) -> Result<Command> {
-        let container_name = format!("webcentral-{:x}", self.dir_hash());
-
-        // `user` only decides who the container runs as *inside* - host-side, add_userns_args
-        // makes its writes land owned by the project owner regardless. Under a root webcentral,
-        // `project` bakes the owner into the image as a real user and lets the image declare it,
-        // so it works exactly like a third-party image declaring its own. Under a non-root
-        // webcentral (rootless podman) the owner is container root - that is how rootless podman
-        // represents the invoking user - so there is nothing to bake and nothing to map, which
-        // also keeps the common case off keep-id (see add_userns_args). `known_ids` skips asking
-        // podman when the config already tells us, and must always agree with what podman would
-        // report.
-        let rootful = nix::unistd::geteuid().is_root();
-        let build_user = match pc.user.as_str() {
-            "project" if rootful => Some((self.uid, self.gid)),
-            _ => None,
-        };
-        let (user_arg, known_ids): (Option<&str>, Option<(u32, u32)>) = match pc.user.as_str() {
-            // Rootful bakes a USER directive; rootless forces root explicitly, so a base image
-            // declaring its own USER can't sneak in a different (unmapped) uid.
-            "project" if rootful => (None, build_user),
-            "project" => (Some("0:0"), Some((0, 0))),
-            "image" => (None, None),
-            // Names resolve inside the image, so their ids have to come from the probe.
-            spec => (Some(spec), parse_numeric_user(spec)),
-        };
-
-        let image_name = if build_user.is_none() && pc.packages.is_empty() && pc.commands.is_empty() {
-            // Nothing to add to the base image
-            pc.base.clone()
-        } else {
-            self.build_image(pc, build_user).await?
-        };
-
-        // A container that outlived its webcentral (killed rather than shut down) keeps holding the
-        // name, and `run` then fails with a name conflict on every subsequent attempt - wedging the
-        // project for good. The name is derived from the project directory, so anything still
-        // answering to it is a leftover of ours.
-        let _ = Command::new(get_podman_path())
-            .args(&["rm", "--force", &container_name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-
-        // Resolve who the container will run as; the entire host-side policy derives from this.
-        let (run_uid, run_gid) = match known_ids {
-            Some(ids) => ids,
-            None => match self.container_user_ids(&image_name, user_arg).await {
-                Some(ids) => ids,
-                None => {
-                    self.logger.write("podman", &format!(
-                        "Could not determine which user image {} runs as; assuming root. If \
-                         that's wrong, files the container writes may not end up owned by the \
-                         project owner, and it may not be able to write in its mounts.",
-                        image_name));
-                    (0, 0)
-                }
-            },
-        };
-
-        // Prepare run command
-        let mut cmd = Command::new(get_podman_path());
-        cmd.args(&["run", "--rm", "--name", &container_name]);
-
-        self.add_userns_args(&mut cmd, run_uid, run_gid);
-
-        // Port mapping
-        cmd.args(&["-p", &format!("{}:{}", port, pc.http_port)]);
-
-        if let Some(user) = user_arg {
-            cmd.args(&["--user", user]);
-        }
-
-        // App directory mount
-        if pc.mount_app_dir {
-            cmd.args(&["-v", &format!("{}:{}", self.dir.display(), pc.app_dir)]);
-            cmd.args(&["-w", &pc.app_dir]);
-        }
-
-        // A persistent home for `project` containers, whether the owner is baked in (rootful,
-        // where the passwd entry also points here) or is container root (rootless). Set the
-        // environment variable explicitly rather than trusting podman to resolve it from passwd.
-        if pc.user == "project" {
-            if pc.mount_app_dir {
-                self.create_dir_for_container(&self.dir.join("_webcentral_data/home"))?;
-            }
-            cmd.args(&["-e", &format!("HOME={}", self.container_home(pc))]);
-        }
-
-        // Additional mounts. These live on the host but are written by the container; owner
-        // ownership is exactly where the container's writes land through the userns mapping.
-        for mount in &pc.mounts {
-            let container_path = if mount.starts_with('/') {
-                mount.clone()
-            } else {
-                format!("{}/{}", pc.app_dir, mount)
-            };
-            let host_path = self.dir
-                .join("_webcentral_data/mounts")
-                .join(&container_path.trim_start_matches('/'));
-            self.create_dir_for_container(&host_path)?;
-            cmd.args(&["-v", &format!("{}:{}", host_path.display(), container_path)]);
-        }
-
-        // Environment variables
-        cmd.args(&["-e", &format!("PORT={}", pc.http_port)]);
-        for (key, val) in &self.config.environment {
-            cmd.args(&["-e", &format!("{}={}", key, val)]);
-        }
-
-        cmd.arg(&image_name);
-
-        if !command.is_empty() {
-            cmd.args(&["/bin/sh", "-c", command]);
-        }
-
-        Ok(cmd)
-    }
-
-    async fn watch_files(self: Arc<Self>) -> Result<()> {
-        let proj = self.clone();
-
-        // Canonicalize directory to resolve symlinks (inotify doesn't follow symlinks)
-        let watch_dir = std::fs::canonicalize(&self.dir)
-            .unwrap_or_else(|_| self.dir.clone());
-
-        // Watch files with callback
-        file_watcher::Watcher::new()
-            .set_base_dir(&watch_dir)
-            .add_includes(&self.config.reload.include)
-            .add_excludes(&self.config.reload.exclude)
-            .run_debounced(100, move |path| {
-                // Deregister before signalling the stop: the stop is only picked up asynchronously
-                // by the lifecycle task (or stop listener), and until then this project would keep
-                // serving requests with the old config.
-                crate::server::deregister_project(&proj.domain, &proj);
-                proj.logger.write("supervisor", &format!("Stopping due to file changes: {}", path.display()));
-                proj.request_stop(StopReason::FileChange);
-            })
-            .await?;
-
-        Ok(())
-    }
-
-    fn stop_watcher(&self) {
-        // Abort the file watcher task
-        if let Ok(mut guard) = self.watcher_task.try_lock() {
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
-        }
-    }
-
-    /// Stop this project (for server shutdown)
-    pub fn stop(self: Arc<Self>) {
-        self.request_stop(StopReason::Shutdown);
-    }
-
-    /// Fully tear down this project: abort its file watcher and tell its lifecycle/stop-listener
-    /// task to exit. Called when the domain is removed or re-registered (its `DomainInfo` is
-    /// dropped), so a replaced project doesn't keep a zombie watcher running on the same
-    /// directory (which would log spurious file-change events and leak the lifecycle task).
+    /// Fully tear down: stop the servers and abort every watcher. Called when the domain is
+    /// removed or re-registered, so a replaced project doesn't leave zombie watchers behind.
     pub fn shutdown(&self) {
-        self.request_stop(StopReason::Shutdown);
-        self.stop_watcher();
-    }
-
-    /// Get the project type name for dashboard display
-    pub fn get_type_name(&self) -> String {
-        match &self.config.project_type {
-            ProjectType::Application { podman: Some(_), .. } => "Podman",
-            ProjectType::Application { .. } => "Application",
-            ProjectType::Static => "Static",
-            ProjectType::Redirect { .. } => "Redirect",
-            ProjectType::Proxy { .. } => "Proxy",
-            ProjectType::TcpForward { .. } => "TCP Forward",
-            ProjectType::UnixForward { .. } => "Unix Forward",
-            ProjectType::Dashboard => "Dashboard",
-        }.to_string()
-    }
-
-    /// Get the current status for dashboard display
-    pub fn get_status(&self) -> String {
-        match &self.config.project_type {
-            ProjectType::Application { .. } => {
-                match *self.state_rx.borrow() {
-                    AppState::Stopped => "Stopped".to_string(),
-                    AppState::Starting => "Starting".to_string(),
-                    AppState::Running => {
-                        // Try to get port from app_connection without blocking
-                        if let Ok(conn) = self.app_connection.try_lock() {
-                            if let Some(c) = conn.as_ref() {
-                                return format!("Running (port {})", c.port);
-                            }
-                        }
-                        "Running".to_string()
-                    }
-                    AppState::Failed => "Failed".to_string(),
-                }
-            }
-            _ => "Active".to_string()
+        for server in &self.servers {
+            server.shutdown();
         }
     }
 
-    /// Get pending request count
-    pub fn get_pending_requests(&self) -> u64 {
-        self.pending_requests.load(Ordering::Relaxed)
+    // --- Status, for the dashboard ---
+
+    pub fn get_type_name(&self) -> String {
+        self.config.summary()
     }
 
-    /// Get total request count
     pub fn get_total_requests(&self) -> u64 {
         self.total_requests.load(Ordering::Relaxed)
     }
 
-    /// Get active upgraded (WebSocket) connections
-    pub fn get_active_upgrades(&self) -> u64 {
-        self.active_upgrades.load(Ordering::Relaxed)
+    pub fn get_server_status(&self) -> Vec<ServerStatus> {
+        self.servers
+            .iter()
+            .map(|server| ServerStatus {
+                name: server.name().to_string(),
+                kind: server
+                    .config
+                    .base
+                    .clone()
+                    .unwrap_or_else(|| crate::config::DEFAULT_BASE_IMAGE.to_string()),
+                state: match server.state() {
+                    AppState::Stopped => "Stopped",
+                    AppState::Starting => "Starting",
+                    AppState::Running => "Running",
+                    AppState::Failed => "Failed",
+                }
+                .to_string(),
+                port: server.port(),
+                total_requests: server.total_requests(),
+                pending_requests: server.pending_requests(),
+                active_upgrades: server.active_upgrades(),
+                idle_seconds: server.idle_seconds(),
+            })
+            .collect()
     }
 
-    /// Get seconds since last activity (returns None if lock unavailable)
-    pub fn get_idle_seconds(&self) -> Option<u64> {
-        self.last_activity.try_lock().ok().map(|guard| guard.elapsed().as_secs())
+    // --- Request handling ---
+
+    /// HTTP/1.1 and HTTP/2, where a request may ask to be upgraded (WebSockets).
+    pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Result<Response<StreamBody>> {
+        let mut req = stream_request(req);
+
+        if is_upgrade_request(&req) {
+            self.log_request(&req);
+            let outcome = self.script_pass(&mut req, self.vars.clone()).await?;
+            let response = match outcome.terminal {
+                Terminal::Response(response) => response,
+                Terminal::ServeApp(name) => {
+                    let Some(server) = self.server(&name) else {
+                        anyhow::bail!("502 no server named '{}'", name);
+                    };
+                    server.wait_until_ready().await?;
+                    let connector = server.connector().await?;
+                    let result = self.clone().upgrade(connector, req, Some(server.clone())).await;
+                    server.untrack_request();
+                    result?
+                }
+                Terminal::Forward(target) => {
+                    let connector = forward_connector(&target);
+                    self.clone().upgrade(connector, req, None).await?
+                }
+                Terminal::Proxy(target) => {
+                    let req = rewrite_for_proxy(req, &target)?;
+                    self.clone().upgrade(DEFAULT_CONNECTOR.clone(), req, None).await?
+                }
+            };
+            return Ok(decorate(response, outcome.headers));
+        }
+
+        self.serve_chain(req).await
     }
 
-    async fn proxy_upgrade(
+    /// HTTP/3, which has no upgrade mechanism.
+    pub async fn handle_inner<B>(self: Arc<Self>, req: Request<B>) -> Result<Response<StreamBody>>
+    where
+        B: http_body::Body<Data = Bytes> + Send + Sync + 'static,
+        B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    {
+        self.serve_chain(stream_request(req)).await
+    }
+
+    /// Run the script and perform what it decided, following internal redirects: an upstream
+    /// response naming a path in `X-Accel-Redirect` is discarded and the request re-routed there,
+    /// so an application can authenticate or account a request and leave the actual delivery to
+    /// the script - typically a static file. The next pass sees `$redirected_from` and
+    /// `$redirected_by`, and the redirected request is a plain GET: the upstream consumed the
+    /// original, body and all, and this pass only delivers something else in its place (which is
+    /// also what keeps redirects compatible with request streaming). The redirecting response's
+    /// remaining headers carry over onto the final response, so the application still controls
+    /// things like Content-Type and Content-Disposition.
+    async fn serve_chain(self: Arc<Self>, mut req: Request<StreamBody>) -> Result<Response<StreamBody>> {
+        self.log_request(&req);
+        let mut vars = self.vars.clone();
+        let mut headers = Vec::new();
+        let mut carried: Vec<(http::HeaderName, HeaderValue)> = Vec::new();
+
+        loop {
+            let outcome = self.script_pass(&mut req, vars.clone()).await?;
+            headers.extend(outcome.headers);
+
+            // What could issue a redirect this pass, and what the next pass needs of a request
+            // that `dispatch` is about to consume.
+            let upstream = match &outcome.terminal {
+                Terminal::ServeApp(name) => Some(name.clone()),
+                Terminal::Forward(target) | Terminal::Proxy(target) => Some(target.clone()),
+                Terminal::Response(_) => None,
+            };
+            let orig_uri = req.uri().clone();
+            let orig_headers = req.headers().clone();
+
+            let mut response = self.clone().dispatch(outcome.terminal, req).await?;
+
+            let target = upstream.as_ref().and_then(|_| {
+                response.headers().get("X-Accel-Redirect")?.to_str().ok().map(str::to_string)
+            });
+            let Some(target) = target else {
+                for (name, value) in carried {
+                    response.headers_mut().insert(name, value);
+                }
+                return Ok(decorate(response, headers));
+            };
+            if !target.starts_with('/') {
+                anyhow::bail!("502 X-Accel-Redirect '{}' is not an absolute path", target);
+            }
+            if !carried.is_empty() {
+                anyhow::bail!("502 X-Accel-Redirect chained more than once (to '{}')", target);
+            }
+
+            // Everything else the redirecting response said is carried onto the final response -
+            // minus the marker itself and the framing of the body we are replacing.
+            let mut kept = std::mem::take(response.headers_mut());
+            for name in ["x-accel-redirect", "content-length", "transfer-encoding", "connection", "date"] {
+                kept.remove(name);
+            }
+            let mut last_name = None;
+            for (name, value) in kept {
+                let name = name.or(last_name.take()).expect("first header entry carries its name");
+                carried.push((name.clone(), value));
+                last_name = Some(name);
+            }
+
+            vars.set("redirected_from", orig_uri.path());
+            vars.set("redirected_by", upstream.unwrap_or_default());
+
+            let mut parts = orig_uri.into_parts();
+            parts.path_and_query = Some(target.parse().map_err(|e| {
+                anyhow::anyhow!("502 X-Accel-Redirect to '{}' is not a valid path: {}", target, e)
+            })?);
+            let mut redirected = Request::builder()
+                .method(http::Method::GET)
+                .uri(http::Uri::from_parts(parts)?)
+                .body(empty_body())?;
+            *redirected.headers_mut() = orig_headers;
+            for name in [http::header::CONTENT_LENGTH, http::header::CONTENT_TYPE, http::header::TRANSFER_ENCODING] {
+                redirected.headers_mut().remove(name);
+            }
+            req = redirected;
+        }
+    }
+
+    async fn script_pass(
+        &self,
+        req: &mut Request<StreamBody>,
+        vars: script::Vars,
+    ) -> Result<script::Outcome> {
+        let env = script::Env {
+            dir: &self.dir,
+            logger: &self.logger,
+            domain: &self.domain,
+            admin_allowed: self.admin_allowed,
+        };
+        script::run(&self.config.script, env, vars, req).await
+    }
+
+    /// Perform whatever the script decided, for a request that is not being upgraded.
+    async fn dispatch(self: Arc<Self>, terminal: Terminal, req: Request<StreamBody>) -> Result<Response<StreamBody>> {
+        match terminal {
+            Terminal::Response(response) => Ok(response),
+            Terminal::ServeApp(name) => {
+                let Some(server) = self.server(&name) else {
+                    anyhow::bail!("502 no server named '{}'", name);
+                };
+                server.wait_until_ready().await?;
+                let client = server.http_client().await?;
+                let result = self.send(client, req, Some(server.clone())).await;
+                server.untrack_request();
+                result
+            }
+            Terminal::Forward(target) => {
+                let (_, client) = self.target(&target, || forward_connector(&target));
+                self.send(client, req, None).await
+            }
+            Terminal::Proxy(target) => {
+                let req = rewrite_for_proxy(req, &target)?;
+                self.send(DEFAULT_HTTP_CLIENT.clone(), req, None).await
+            }
+        }
+    }
+
+    fn log_request<B>(&self, req: &Request<B>) {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        if self.config.log_requests {
+            let addr = req
+                .headers()
+                .get("X-Forwarded-For")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("-");
+            self.logger
+                .write("request", &format!("{} {} {}", addr, req.method(), req.uri().path()));
+        }
+    }
+
+    /// Build (once) and reuse a connector/client pair for a `forward` target. Proxying goes
+    /// through the shared client instead, which pools per upstream host by itself.
+    fn target(
+        &self,
+        key: &str,
+        connector: impl FnOnce() -> AnyConnector,
+    ) -> (AnyConnector, Client<AnyConnector, StreamBody>) {
+        if let Some(existing) = self.targets.get(key) {
+            return existing.clone();
+        }
+        let connector = connector();
+        let client = Client::builder(SHARED_EXECUTOR.clone())
+            .retry_canceled_requests(false)
+            .build(connector.clone());
+        let pair = (connector, client);
+        self.targets.insert(key.to_string(), pair.clone());
+        pair
+    }
+
+    async fn send(
+        &self,
+        client: Client<AnyConnector, StreamBody>,
+        req: Request<StreamBody>,
+        server: Option<Arc<AppServer>>,
+    ) -> Result<Response<StreamBody>> {
+        let (mut parts, body) = req.into_parts();
+
+        // Upstream connections are always HTTP/1.1, so the HTTP/2 and HTTP/3 pseudo-headers have
+        // to go: they are not valid there and upstream servers reject them.
+        parts.version = http::Version::HTTP_11;
+        for pseudo in [":authority", ":method", ":path", ":scheme", ":status", ":protocol"] {
+            parts.headers.remove(pseudo);
+        }
+
+        // The body is streamed through, not collected: an upload costs one chunk of memory, and
+        // the trade is that a request whose body was already partly sent can never be retried on
+        // a stale pooled connection - such failures 502 (and restart the service) instead.
+        let req = Request::from_parts(parts, body);
+
+        let response = match client.request(req).await {
+            Ok(response) => response,
+            Err(e) => {
+                // Anything the client reports is a failure to talk to the upstream, so it is a bad
+                // gateway rather than webcentral breaking - and a reason to stop the service, so
+                // the next request rebuilds it. Not just on a refused connection: a service that
+                // dies while a pooled connection is open fails as a closed connection instead, and
+                // treating only the former as fatal left it wedged. ProcessExit (not Shutdown) so
+                // the lifecycle restarts it rather than exiting for good.
+                if let Some(server) = &server {
+                    server.request_stop(StopReason::ProcessExit);
+                }
+                let source = StdError::source(&e).map(|s| s.to_string()).unwrap_or_default();
+                anyhow::bail!("502 upstream request failed: {} {}", e, source);
+            }
+        };
+
+        // Stream the upstream body through as-is. When the client disconnects the response is
+        // dropped, which drops the body, which closes the upstream connection.
+        let (parts, body) = response.into_parts();
+        Ok(Response::from_parts(parts, BoxBody::new(body.map_err(|e| anyhow::anyhow!("{}", e)))))
+    }
+
+    /// Bridge a protocol upgrade (WebSocket and friends) to the backend, which needs raw byte
+    /// piping rather than the HTTP client.
+    async fn upgrade(
         self: Arc<Self>,
-        req: Request<Incoming>,
+        mut connector: AnyConnector,
+        req: Request<StreamBody>,
+        server: Option<Arc<AppServer>>,
     ) -> Result<Response<StreamBody>> {
         let method = req.method().clone();
         let uri = req.uri().clone();
         let headers = req.headers().clone();
         let logger = self.logger.clone();
-        
-        // Track this as an active upgrade to prevent inactivity timeout
-        self.active_upgrades.fetch_add(1, Ordering::SeqCst);
-        let project = self.clone();
 
-        // Get the upgrade future before we return a response
         let upgrade_fut = hyper::upgrade::on(req);
 
-        // Get the connector from the appropriate source
-        let mut connector = if let Some(c) = &self.static_connector {
-            c.clone()
-        } else {
-            let conn = self.app_connection.lock().await;
-            match conn.as_ref() {
-                Some(c) => c.connector.clone(),
-                None => anyhow::bail!("502 application not started"),
-            }
-        };
-
-        // Connect to backend
-        let io = connector.call(uri.clone()).await.map_err(|e| anyhow::anyhow!("Connector error: {}", e))?;
+        let io = connector
+            .call(uri.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Connector error: {}", e))?;
         let mut backend = io.into_tokio();
 
-        // Build and send the upgrade request to backend
         let mut buf = Vec::new();
         use std::io::Write;
-
-        let path = uri
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/")
-            .to_string();
+        let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
         write!(&mut buf, "{} {} HTTP/1.1\r\n", method, path).unwrap();
         for (name, value) in &headers {
             write!(&mut buf, "{}: ", name).unwrap();
@@ -1752,143 +499,171 @@ tr:hover {{ background: #f5f5f5; }}
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send upgrade request to backend: {}", e))?;
 
-        // Read response headers from backend
         let mut response_buf = [0u8; 4096];
         let mut bytes_read = 0;
-
         let header_end = loop {
             let n = backend
                 .read(&mut response_buf[bytes_read..])
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to read backend response: {}", e))?;
-
             if n == 0 {
-                return Err(anyhow::anyhow!(
-                    "Backend closed connection during handshake"
-                ));
+                anyhow::bail!("Backend closed connection during handshake");
             }
-
             bytes_read += n;
-            let window = &response_buf[..bytes_read];
-            if let Some(idx) = window.windows(4).position(|w| w == b"\r\n\r\n") {
-                break idx + 4;
+            if let Some(index) = response_buf[..bytes_read].windows(4).position(|w| w == b"\r\n\r\n") {
+                break index + 4;
             }
             if bytes_read == response_buf.len() {
-                return Err(anyhow::anyhow!("Response headers too long"));
+                anyhow::bail!("Response headers too long");
             }
         };
 
         let response_str = String::from_utf8_lossy(&response_buf[..header_end]);
-
-        // Parse backend response to extract status and headers
-        let mut response_lines = response_str.lines();
-        let status_line = response_lines
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Empty backend response"))?;
-
-        // Extract status code from "HTTP/1.1 101 Switching Protocols"
+        let mut lines = response_str.lines();
+        let status_line = lines.next().ok_or_else(|| anyhow::anyhow!("Empty backend response"))?;
         let status_code = status_line
             .split_whitespace()
             .nth(1)
             .and_then(|s| s.parse::<u16>().ok())
             .ok_or_else(|| anyhow::anyhow!("Invalid status line: {}", status_line))?;
 
-        // Build response with backend's headers
-        let mut response_builder = Response::builder().status(status_code);
-
-        for line in response_lines {
+        let mut builder = Response::builder().status(status_code);
+        for line in lines {
             if line.is_empty() {
                 break;
             }
-            if let Some(colon_idx) = line.find(':') {
-                let (name, value) = line.split_at(colon_idx);
-                let value = value[1..].trim();
-                response_builder = response_builder.header(name.trim(), value);
+            if let Some(index) = line.find(':') {
+                let (name, value) = line.split_at(index);
+                builder = builder.header(name.trim(), value[1..].trim());
             }
         }
 
-        // Spawn task to pipe data bidirectionally after upgrade completes
-        tokio::task::spawn(async move {
+        // Tracked only from here on: every failure path above returns without ever reaching the
+        // task below, and an increment nothing decrements would hold the server open forever. The
+        // handshake itself is covered by the caller's pending-request count instead.
+        if let Some(server) = &server {
+            server.track_upgrade();
+        }
+        tokio::spawn(async move {
             let result = match upgrade_fut.await {
                 Ok(upgraded) => {
                     let mut upgraded = TokioIo::new(upgraded);
-
-                    // Write any excess data from the response to the client
                     if header_end < bytes_read {
-                        if let Err(e) = upgraded
-                            .write_all(&response_buf[header_end..bytes_read])
-                            .await
-                        {
+                        if let Err(e) = upgraded.write_all(&response_buf[header_end..bytes_read]).await {
                             logger.write("error", &format!("Failed to write excess data to client: {}", e));
                             return;
                         }
                     }
-
-                    // Pipe data bidirectionally
                     tokio::io::copy_bidirectional(&mut upgraded, &mut backend).await.map(|_| ())
                 }
                 Err(e) => {
                     logger.write("error", &format!("Client upgrade failed: {}", e));
-                    Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    Err(std::io::Error::other(e))
                 }
             };
 
             if let Err(e) = result {
-                // Ignore common benign connection closure errors:
-                // - NotConnected/ConnectionReset: peer closed abruptly
-                // - UnexpectedEof: peer closed without TLS close_notify (common with browsers)
-                if e.kind() != std::io::ErrorKind::NotConnected
-                    && e.kind() != std::io::ErrorKind::ConnectionReset
-                    && e.kind() != std::io::ErrorKind::UnexpectedEof
-                {
+                // Benign closures: the peer went away, possibly without a TLS close_notify.
+                if !matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                ) {
                     logger.write("error", &format!("WebSocket error: {}", e));
                 }
             }
 
-            // Connection closed, update activity and decrement upgrade count
-            *project.last_activity.lock().await = Instant::now();
-            project.active_upgrades.fetch_sub(1, Ordering::SeqCst);
-            project.state_changed.notify_one();
+            if let Some(server) = server {
+                server.touch().await;
+                server.untrack_upgrade();
+            }
         });
 
-        Ok(response_builder.body(empty_body())?)
+        Ok(builder.body(empty_body())?)
     }
 }
 
-/// Resolve a request path to a file below `public_dir`, or `None` when it escapes (404).
+/// Box any request body into the one streaming body type used throughout, so requests stay one
+/// concrete type - and stream to the upstream rather than being collected first.
+fn stream_request<B>(req: Request<B>) -> Request<StreamBody>
+where
+    B: http_body::Body<Data = Bytes> + Send + Sync + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+{
+    req.map(|body| BoxBody::new(BodyExt::map_err(body, |e| anyhow::anyhow!("{}", e.into()))))
+}
+
+/// Apply the headers the script gathered (`set_header`) to the response.
+fn decorate(
+    mut response: Response<StreamBody>,
+    headers: Vec<(http::HeaderName, HeaderValue)>,
+) -> Response<StreamBody> {
+    for (name, value) in headers {
+        response.headers_mut().insert(name, value);
+    }
+    response
+}
+
+/// Collect a project's file changes until they stop arriving, then act on the batch as a whole.
 ///
-/// The path is percent-decoded and `.`/`..` are resolved here, before the filesystem is touched:
-/// `Path::join` doesn't normalize and `Path::starts_with` compares whole components, so
-/// `public/../../etc/passwd` passes a containment check while the kernel happily resolves it on
-/// open. Decoding first and normalizing after is what makes `%2e%2e` equivalent to `..`; a segment
-/// that decodes to something containing a separator or a NUL is rejected rather than resolved,
-/// since it can only have been an attempt to smuggle one past this function.
-fn resolve_static_path(public_dir: &Path, path: &str) -> Option<PathBuf> {
-    let mut segments: Vec<String> = Vec::new();
-    for segment in path.split('/') {
-        let segment = percent_encoding::percent_decode_str(segment)
-            .decode_utf8()
-            .ok()?;
-        match segment.as_ref() {
-            "" | "." => {}
-            ".." => {
-                segments.pop()?;
+/// Batching matters for more than log noise: a change to one of the files that *define* the
+/// project anywhere in the batch has to win, or a `git pull` touching both a source file and the
+/// configuration would restart the servers and go on serving the old rules.
+///
+/// Holds only a weak reference, so the project is still dropped when its domain goes away; the
+/// task then ends on the next event, or when the sender goes with it.
+async fn apply_file_changes(
+    project: std::sync::Weak<Project>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
+) {
+    const QUIET: std::time::Duration = std::time::Duration::from_millis(100);
+
+    while let Some(first) = rx.recv().await {
+        let mut paths = vec![first];
+        while let Ok(Some(path)) = tokio::time::timeout(QUIET, rx.recv()).await {
+            paths.push(path);
+        }
+        let Some(project) = project.upgrade() else { return };
+
+        // Ending the task only when the project was actually torn down matters: the batch may
+        // hold nothing but the (ignored) event for the write this project was built from, and a
+        // project must not lose its debouncer over that.
+        if let Some(path) = paths.iter().find(|path| is_project_file(&project, path)) {
+            if project.reload(&project.dir.join(path)) {
+                return;
             }
-            segment if segment.contains('/') || segment.contains('\0') => return None,
-            segment => segments.push(segment.to_string()),
+        }
+
+        // Each server decides for itself whether the change was any of its business.
+        for server in &project.servers {
+            let Some(path) = paths.iter().find(|p| server.wants(&p.to_string_lossy())) else {
+                continue;
+            };
+            project.logger.write(
+                &format!("server:{}", server.name()),
+                &format!("Stopping due to file changes: {}", path.display()),
+            );
+            server.request_stop(StopReason::FileChange);
         }
     }
-
-    let mut file_path = public_dir.to_path_buf();
-    file_path.extend(&segments);
-    // A directory request (empty path, or a trailing slash) serves its index.html
-    if segments.is_empty() || path.ends_with('/') {
-        file_path.push("index.html");
-    }
-    Some(file_path)
 }
 
-// Helper function to detect WebSocket upgrade requests
+/// Whether a path names one of the files that define a project: the ones it actually read (its
+/// configuration, whatever was auto-detected, any `env_file`), plus the project files at its root
+/// whether or not they exist yet - creating a `Procfile` has to be noticed too.
+fn is_project_file(project: &Project, relative: &Path) -> bool {
+    if project.config.config_files.iter().any(|f| Path::new(f) == relative) {
+        return true;
+    }
+    let mut parts = relative.components();
+    let first = parts.next();
+    parts.next().is_none()
+        && first.is_some_and(|c| {
+            crate::config::PROJECT_FILES.iter().any(|f| c.as_os_str() == *f)
+        })
+}
+
 fn is_upgrade_request<B>(req: &Request<B>) -> bool {
     req.headers()
         .get(hyper::header::CONNECTION)
@@ -1897,84 +672,38 @@ fn is_upgrade_request<B>(req: &Request<B>) -> bool {
         .unwrap_or(false)
 }
 
-fn get_free_port() -> Result<u16> {
-    use std::os::unix::io::AsRawFd;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    // Allow immediate port reuse - without this, ~5% failure rate in tests
-    unsafe {
-        libc::setsockopt(listener.as_raw_fd(), libc::SOL_SOCKET, libc::SO_REUSEADDR,
-            &1i32 as *const _ as _, std::mem::size_of::<i32>() as _);
+/// A `forward` target: a bare number is a port on this host, a path is a unix socket, anything
+/// else an address. Forwarding leaves the Host header alone - that is what makes it a *forward*.
+fn forward_connector(target: &str) -> AnyConnector {
+    if target.starts_with('/') {
+        AnyConnector::FixedUnix(target.to_string())
+    } else if target.chars().all(|c| c.is_ascii_digit()) {
+        AnyConnector::FixedTcp(format!("127.0.0.1:{}", target))
+    } else if target.contains(':') {
+        AnyConnector::FixedTcp(target.to_string())
+    } else {
+        AnyConnector::FixedTcp(format!("{}:80", target))
     }
-    Ok(listener.local_addr()?.port())
 }
 
-fn get_ownership(path: &Path) -> (u32, u32) {
-    fs::metadata(path)
-        .ok()
-        .map(|m| (m.uid(), m.gid()))
-        .unwrap_or((0, 0))
-}
+/// Point a request at an absolute `proxy` target: the request path is appended to it, the Host
+/// header becomes the upstream's, and the original travels on in X-Forwarded-Host.
+fn rewrite_for_proxy<B>(req: Request<B>, target: &str) -> Result<Request<B>> {
+    let (mut parts, body) = req.into_parts();
+    let base = target.trim_end_matches('/');
+    let path = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let uri: http::Uri = format!("{}{}", base, path).parse()?;
 
-fn get_user_home(uid: u32) -> PathBuf {
-    fs::read_to_string("/etc/passwd").ok()
-        .and_then(|s| s.lines()
-            .filter_map(|l| l.split(':').collect::<Vec<_>>().try_into().ok())
-            .find(|f: &[&str; 7]| f[2].parse::<u32>().ok() == Some(uid))
-            .map(|f| PathBuf::from(f[5])))
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-}
-
-/// Returns the podman installation to use, checking PATH on first call.
-fn get_podman_path() -> &'static str {
-    use std::sync::OnceLock;
-    use std::os::unix::fs::PermissionsExt;
-    static PODMAN_PATH: OnceLock<String> = OnceLock::new();
-
-    PODMAN_PATH.get_or_init(|| {
-        let path_var = std::env::var("PATH").unwrap_or_default();
-        for dir in path_var.split(':') {
-            let full_path = PathBuf::from(dir).join("podman");
-            if let Ok(meta) = fs::metadata(&full_path) {
-                if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 {
-                    return full_path.to_string_lossy().to_string();
-                }
-            }
-        }
-        println!("Warning: podman not found in PATH");
-        "podman".to_string()
-    })
-}
-
-/// Parse a numeric `uid:gid` pair. Anything else - including a bare uid, whose gid would depend
-/// on the image's /etc/passwd - returns None.
-fn parse_numeric_user(spec: &str) -> Option<(u32, u32)> {
-    let (uid, gid) = spec.split_once(':')?;
-    Some((uid.parse().ok()?, gid.parse().ok()?))
-}
-
-/// Podman `--uidmap`/`--gidmap` arguments for an identity mapping over 0..max(65536, ids+1) with
-/// `container_id` and `host_id` swapped (a mapping must be a bijection, so the displaced id has
-/// to land somewhere). Under rootful podman host ids map directly, so this makes everything the
-/// container writes as `container_id` land on the host as `host_id` and vice versa, while every
-/// other id stays put, keeping the rest of the image's ownership intact. Equal ids degenerate to
-/// a plain identity map.
-fn swap_map_args(flag: &str, container_id: u32, host_id: u32) -> Vec<String> {
-    let (lo, hi) = (container_id.min(host_id), container_id.max(host_id));
-    let top = 65536.max(hi.saturating_add(1));
-    let mut args = Vec::new();
-    let mut push = |from: u32, to: u32, amount: u32| {
-        if amount > 0 {
-            args.push(flag.to_string());
-            args.push(format!("{}:{}:{}", from, to, amount));
-        }
-    };
-    push(0, 0, lo);
-    push(lo, hi, 1);
-    push(lo + 1, lo + 1, hi.saturating_sub(lo + 1));
-    if hi != lo {
-        push(hi, lo, 1);
+    let original_host = parts
+        .headers
+        .get(http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    parts.headers.insert("X-Forwarded-Host", HeaderValue::from_str(&original_host)?);
+    if let Some(authority) = uri.authority() {
+        parts.headers.insert(http::header::HOST, HeaderValue::from_str(authority.as_str())?);
     }
-    push(hi.saturating_add(1), hi.saturating_add(1), top.saturating_sub(hi.saturating_add(1)));
-    args
+    parts.uri = uri;
+    Ok(Request::from_parts(parts, body))
 }
-

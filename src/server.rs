@@ -79,7 +79,9 @@ const SELF_CHECK_PATH: &str = "/.well-known/webcentral-self-check";
 /// Streaming body adapter for HTTP/3 - wraps h3 RecvStream as an http_body::Body.
 #[cfg(feature = "http3")]
 struct H3RecvBody<S: h3::quic::RecvStream> {
-    stream: h3::server::RequestStream<S, Bytes>,
+    // SyncWrapper only hands out `&mut`, which is what makes this body `Sync` - required by the
+    // boxed streaming body every request is converted into - without the h3 stream being so.
+    stream: sync_wrapper::SyncWrapper<h3::server::RequestStream<S, Bytes>>,
 }
 
 #[cfg(feature = "http3")]
@@ -94,7 +96,7 @@ impl<S: h3::quic::RecvStream> http_body::Body for H3RecvBody<S> {
         use bytes::Buf;
         use std::future::Future;
         
-        let fut = self.stream.recv_data();
+        let fut = self.stream.get_mut().recv_data();
         tokio::pin!(fut);
         
         match fut.poll(cx) {
@@ -118,24 +120,43 @@ fn alt_domain(domain: &str) -> String {
         .unwrap_or_else(|| format!("www.{}", domain))
 }
 
-/// Deregister a project (only if it's still the current one for the domain).
-/// Called when a project enters Failed state or on file change.
-pub fn deregister_project(domain: &str, project: &Arc<project::Project>) {
-    if let Some(mut domain_info) = DOMAINS.get_mut(domain) {
-        if let Some(ref current) = domain_info.project {
-            if Arc::ptr_eq(current, project) {
-                domain_info.project = None;
-            }
+/// Hand a changed file to the project whose directory holds it. Nothing happens for a directory
+/// no project has been built for yet - the next request reads the new configuration anyway.
+fn file_changed(changed: &std::path::Path) {
+    // Paths come back relative to the watcher's base directory, which is the filesystem root, so
+    // they arrive without their leading separator.
+    let changed = std::path::Path::new("/").join(changed);
+
+    let found = DOMAINS.iter().find_map(|entry| {
+        let relative = changed.strip_prefix(&entry.directory).ok()?;
+        Some((entry.project.clone()?, relative.to_path_buf()))
+    });
+    if let Some((project, relative)) = found {
+        project.file_changed(relative);
+    }
+}
+
+/// Forget the project registered for `dir`, whatever domain it is under.
+pub fn deregister_project_by_dir(dir: &std::path::Path) {
+    let dir = dir.to_string_lossy();
+    let domain = DOMAINS.iter().find(|entry| entry.directory == dir).map(|e| e.key().clone());
+    if let Some(domain) = domain {
+        if let Some(mut info) = DOMAINS.get_mut(&domain) {
+            info.project = None;
         }
     }
 }
 
 // Stop all running projects (called during shutdown)
-pub fn stop_all_projects() {
-    for entry in DOMAINS.iter() {
-        if let Some(project) = entry.project.clone() {
-            project.stop();
-        }
+pub async fn stop_all_projects() {
+    // Collected first: holding DashMap iteration guards across an await would deadlock anything
+    // that touches the map while we wait.
+    let projects: Vec<_> = DOMAINS.iter().filter_map(|entry| entry.project.clone()).collect();
+    // Concurrently, since each one spends a couple of seconds waiting for podman.
+    let stopping: Vec<_> =
+        projects.into_iter().map(|project| tokio::spawn(project.stop())).collect();
+    for handle in stopping {
+        let _ = handle.await;
     }
 }
 
@@ -145,48 +166,30 @@ pub fn get_domain_status() -> Vec<DomainStatus> {
         let domain = entry.key().clone();
         let directory = entry.directory.clone();
         let cert_status = CERT_STATUS.get(&domain).map(|s| s.clone());
-        if let Some(project) = &entry.project {
-            DomainStatus {
+        match &entry.project {
+            Some(project) => DomainStatus {
                 domain,
                 directory,
-                project_type: project.get_type_name(),
-                status: project.get_status(),
-                pending_requests: project.get_pending_requests(),
-                active_upgrades: project.get_active_upgrades(),
+                summary: project.get_type_name(),
+                servers: project.get_server_status(),
                 total_requests: project.get_total_requests(),
-                idle_seconds: project.get_idle_seconds(),
                 cert_status,
-            }
-        } else {
-            DomainStatus {
+            },
+            None => DomainStatus {
                 domain,
                 directory,
-                project_type: "Unknown".to_string(),
-                status: "Not loaded".to_string(),
-                pending_requests: 0,
-                active_upgrades: 0,
+                summary: "Not loaded".to_string(),
+                servers: Vec::new(),
                 total_requests: 0,
-                idle_seconds: None,
                 cert_status,
-            }
+            },
         }
     }).collect();
     result.sort_by(|a, b| a.domain.cmp(&b.domain));
     result
 }
 
-/// Status info for a single domain
-pub struct DomainStatus {
-    pub domain: String,
-    pub directory: String,
-    pub project_type: String,
-    pub status: String,
-    pub pending_requests: u64,
-    pub active_upgrades: u64,
-    pub total_requests: u64,
-    pub idle_seconds: Option<u64>,
-    pub cert_status: Option<String>,
-}
+pub use crate::dashboard::DomainStatus;
 
 /// Server-wide status info
 pub struct ServerInfo {
@@ -347,6 +350,38 @@ impl Server {
                 })
                 .await {
                 eprintln!("Directory watcher error: {}", e);
+            }
+        });
+
+        // One file watcher for every project at once. An inotify *instance* is a scarce
+        // per-user resource (fs.inotify.max_user_instances is 128 by default) while the *watches*
+        // it holds are not (hundreds of thousands), so one watcher for the whole tree costs the
+        // same in watches as one per project and nothing in instances. Which project - and which
+        // of its servers - an event concerns is then worked out in `Project`, against the same
+        // patterns this watcher was given.
+        let server = self.clone();
+        tokio::spawn(async move {
+            let projects = &server.config.projects;
+            // Pruning has to be expressed relative to each project directory, which is what the
+            // per-project patterns mean; anchored ones stay at the project root.
+            let excludes: Vec<String> = crate::config::DEFAULT_EXCLUDES
+                .iter()
+                .map(|pattern| match pattern.strip_prefix('/') {
+                    Some(anchored) => format!("{}/*.*/{}", projects, anchored),
+                    None => format!("{}/*.*/**/{}", projects, pattern),
+                })
+                .collect();
+
+            if let Err(e) = include_exclude_watcher::Watcher::new()
+                .set_base_dir("/")
+                .add_include(format!("{}/*.*/**/*", projects))
+                .add_excludes(&excludes)
+                .return_absolute(true)
+                .match_dirs(false)
+                .run(move |_event, path| file_changed(&path))
+                .await
+            {
+                eprintln!("File watcher error: {}", e);
             }
         });
 
@@ -599,7 +634,7 @@ impl Server {
         };
 
         // Wrap recv stream as streaming body
-        let body = H3RecvBody { stream: recv_stream };
+        let body = H3RecvBody { stream: sync_wrapper::SyncWrapper::new(recv_stream) };
 
         // Add forwarding headers (for the likely case this connection will be proxied)
         if let Ok(forwarded_for) = HeaderValue::from_str(&addr.ip().to_string()) {
@@ -884,7 +919,6 @@ impl Server {
         let project = project::Project::new(
             &PathBuf::from(&domain_info.directory),
             domain.to_string(),
-            self.config.firejail,
             self.config.prune_logs,
         )?;
 

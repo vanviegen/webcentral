@@ -41,6 +41,55 @@ def require_podman():
     return path
 
 
+
+# An image with python3 already in it, so tests spend their time on what they are testing rather
+# than on `apk add` per project. Tests that are *about* image building set their own base.
+TEST_BASE_IMAGE = 'webcentral-test-base'
+
+# Auto-detected projects (Procfile, package.json) get the real default base image, which is bare
+# alpine - so their test commands have to make do with busybox. This serves one connection at a
+# time, which is enough to be found ready; the tests around it check detection, not serving.
+BUSYBOX_SERVER = "while true; do printf 'HTTP/1.0 200 OK\\r\\n\\r\\nok' | nc -l -p $PORT; done"
+
+
+def build_test_base_image():
+    """Build the image test services run from. Cheap: one layer on top of alpine, cached after."""
+    podman = shutil.which('podman')
+    if not podman:
+        return False
+    dockerfile = 'FROM alpine\nRUN apk add --update --no-cache python3\n'
+    result = subprocess.run([podman, 'build', '-t', TEST_BASE_IMAGE, '-'],
+                            input=dockerfile, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        print(f"{RED}Could not build the test base image:{RESET}\n{result.stderr}")
+        return False
+    return True
+
+
+def _test_defaults(config):
+    """Fill in what every test service wants but shouldn't have to say.
+
+    A service is a container, so without these each test would build its own image and then leave
+    it running for the default five minutes - a full run would pile up a hundred of them. Tests
+    that care about either setting give it explicitly and are left alone.
+    """
+    def fill(match):
+        # Appended to the block's own line, so every line number below it stays put - several
+        # tests assert on the line a diagnostic points at.
+        added = []
+        # Only top-level services: an indented `service` is a sidecar, which has no
+        # shutdown_time of its own (injecting one is a parse error) and inherits its parent's
+        # image - naming one here would quietly turn that inheritance off.
+        if match.group(2) == '':
+            if 'shutdown_time' not in config:
+                added.append('shutdown_time = 5')
+            if 'base' not in config and 'packages' not in config:
+                added.append(f'base = {TEST_BASE_IMAGE}')
+        return match.group(0) + ''.join(f' {setting} ;' for setting in added)
+
+    return re.sub(r'(^|\n)([ \t]*)(service\b[^\n{]*\{)', fill, config)
+
+
 class TestRunner:
     def __init__(self):
         self.tests = []
@@ -48,7 +97,6 @@ class TestRunner:
         self.webcentral_proc = None
         self.port = None
         self.log_positions = {}  # project -> position in log file
-        self.use_firejail = True
         self.current_test_domain = None  # Set during test execution
         self.current_test_domains = set()  # All domains used in current test
 
@@ -100,7 +148,7 @@ class TestRunner:
                '--http', str(self.port),
                '--https', '0',
                '--data-dir', self.tmpdir,
-               '--firejail', "true" if self.use_firejail else "false"]
+]
         print(" ".join(cmd))
         self.webcentral_proc = subprocess.Popen(
             cmd,
@@ -175,10 +223,19 @@ class TestRunner:
             self.current_test_domains.add(domain)
             if not path.startswith(domain):
                 path = f"{domain}/{path}"
+        if os.path.basename(path) == 'webcentral.conf':
+            content = _test_defaults(content)
         full_path = os.path.join(self.tmpdir, path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         with open(full_path, 'w') as f:
             f.write(content)
+
+    def poke(self, host=None):
+        """Make a request only to bring the project up; whatever it answers is fine."""
+        try:
+            self.assert_http('/', check_code=None, host=host, timeout=10)
+        except Exception:
+            pass
 
     def mark_log_read(self, project=None):
         """Mark current log position as read. Defaults to current test domain."""
@@ -376,6 +433,10 @@ class TestRunner:
                     print(f"{RED}Error: Test '{name}' not found{RESET}")
                     sys.exit(1)
 
+        if not build_test_base_image():
+            print(f"{RED}podman is required to run the tests{RESET}")
+            sys.exit(1)
+
         self.setup()
 
         failed = False
@@ -518,13 +579,12 @@ def test_static_file_nested(t):
 
 @test
 def test_rewrite_static(t):
-    """Rewrites change which static file is served"""
+    """rewrite changes which static file is served"""
     t.write_file('public/index.html', '<h1>App Shell</h1>')
     t.write_file('public/articles/hello.html', '<h1>Hello Article</h1>')
-    t.write_file('webcentral.ini', '''
-[rewrite]
-/blog/(.*) = /articles/$1.html
-/deep/link = /index.html
+    t.write_file('webcentral.conf', '''
+match /blog/(.*) rewrite /articles/${1}.html
+match /deep/link rewrite /index.html
 ''')
 
     t.assert_http('/blog/hello', check_body='Hello Article')
@@ -535,51 +595,737 @@ def test_rewrite_static(t):
 
 
 @test
-def test_rewrite_order(t):
-    """Rewrite rules are applied in file order, first match wins"""
+def test_script_runs_in_order(t):
+    """Statements run top to bottom and a terminal one stops the script"""
     t.write_file('public/index.html', '<h1>Shell</h1>')
     t.write_file('public/favicon.ico', 'icon')
     t.write_file('public/app.js', 'script')
-    t.write_file('public/style.css', 'styles')
-    t.write_file('public/robots.txt', 'robots')
-    # The catch-all is last, so the passthroughs above it must win. With an unordered
-    # config this only holds when the catch-all happens to be iterated last.
-    t.write_file('webcentral.ini', '''
-[rewrite]
-/favicon.ico = /favicon.ico
-/app.js = /app.js
-/style.css = /style.css
-/robots.txt = /robots.txt
-/.* = /index.html
+    t.write_file('webcentral.conf', '''
+match /favicon.ico serve_dir public
+match /app.js serve_dir public
+serve_file public/index.html
 ''')
 
+    # The specific rules answer first; everything else reaches the shell at the bottom.
     t.assert_http('/favicon.ico', check_body='icon')
     t.assert_http('/app.js', check_body='script')
-    t.assert_http('/style.css', check_body='styles')
-    t.assert_http('/robots.txt', check_body='robots')
     t.assert_http('/anything/else', check_body='Shell')
+    t.assert_http('/deep/link/here', check_body='Shell')
 
 
 @test
-def test_rewrite_redirect(t):
-    """A rewrite target that isn't an absolute path redirects instead"""
+def test_try_serve_dir_falls_through(t):
+    """try_serve_dir declines when there is no such file, serve_dir answers 404"""
     t.write_file('public/index.html', '<h1>Shell</h1>')
-    t.write_file('webcentral.ini', '''
-[rewrite]
-/old/(.*) = https://example.com/new/$1
+    t.write_file('public/real.txt', 'real file')
+    t.write_file('webcentral.conf', '''
+try_serve_dir public
+serve_file public/index.html
+''')
+
+    t.assert_http('/real.txt', check_body='real file')
+    # No such file, so the SPA shell below takes over instead of a 404
+    t.assert_http('/some/spa/route', check_body='Shell')
+
+
+@test
+def test_serve_dir_is_terminal(t):
+    """Without try_, a miss is a 404 and nothing below it runs"""
+    t.write_file('public/index.html', '<h1>Shell</h1>')
+    t.write_file('webcentral.conf', '''
+serve_dir public
+serve_file public/index.html
+''')
+    t.assert_http('/', check_body='Shell')
+    t.assert_http('/some/spa/route', check_code=404)
+
+
+@test
+def test_else_branch(t):
+    """else runs when the statement before it declined, and not otherwise"""
+    t.write_file('public/index.html', 'shell')
+    t.write_file('public/real.txt', 'real file')
+    t.write_file('webcentral.conf', '''
+match /files/(.*) {
+  try_serve_file public/${1}
+  else respond 404 "no file called ${1}"
+}
+else respond 418 "not a file request"
+''')
+
+    t.assert_http('/files/real.txt', check_body='real file')
+    t.assert_http('/files/missing.txt', check_code=404, check_body='no file called missing.txt')
+    t.assert_http('/something/else', check_code=418, check_body='not a file request')
+
+
+@test
+def test_redirect_and_moved(t):
+    """redirect is a 302, moved a 301, and status= overrides either"""
+    t.write_file('webcentral.conf', '''
+match /old/(.*) moved https://example.com/new/${1}
+match /tmp/(.*) redirect https://example.com/t/${1}
+match /odd/(.*) redirect https://example.com/o/${1} status=307
 ''')
 
     t.assert_http('/old/page', check_code=301, check_header=('Location', 'https://example.com/new/page'))
+    t.assert_http('/tmp/page', check_code=302, check_header=('Location', 'https://example.com/t/page'))
+    t.assert_http('/odd/page', check_code=307, check_header=('Location', 'https://example.com/o/page'))
+
+
+def _echo_server(name):
+    """A tiny server that echoes its name and the path it was asked for"""
+    return f'''
+import os, http.server, socketserver
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"{name} says " + self.path.encode())
+    def log_message(self, *args):
+        pass
+print("{name} starting", flush=True)
+socketserver.TCPServer(("", int(os.environ['PORT'])), Handler).serve_forever()
+'''
+
+
+@test
+def test_multiple_servers(t):
+    """Two servers in one project, each started only by the route that needs it"""
+    t.write_file('api.py', _echo_server('api'))
+    t.write_file('web.py', _echo_server('web'))
+    t.write_file('webcentral.conf', '''
+service api {
+  command = python3 -u api.py
+}
+service web {
+  command = python3 -u web.py
+}
+
+match /api/(.*) {
+  rewrite /${1}
+  serve api
+}
+serve web
+''')
+
+    # A plain request only needs the web server, so the api one stays stopped
+    t.assert_http('/hello', check_body='web says /hello')
+    t.await_log('web starting')
+    t.assert_log('api starting', count=0)
+
+    # The /api route starts the other one, and the rewrite reaches it
+    t.assert_http('/api/thing', check_body='api says /thing')
+    t.await_log('api starting')
+
+    # Both are listed separately, on their own ports
+    t.assert_log('[server:api] Ready on port', count=1)
+    t.assert_log('[server:web] Ready on port', count=1)
+
+
+@test
+def test_per_server_reload_rules(t):
+    """Each server watches its own files: a PHP change doesn't restart the JS one"""
+    t.write_file('api.py', _echo_server('api'))
+    t.write_file('web.py', _echo_server('web'))
+    t.write_file('webcentral.conf', '''
+service api {
+  command = python3 -u api.py
+  reload_include = *.php api.py
+}
+service web {
+  command = python3 -u web.py
+  reload_include = *.js web.py
+}
+
+match /api/(.*) serve api
+serve web
+''')
+
+    t.assert_http('/', check_body='web says /')
+    t.assert_http('/api/x', check_body='api says /api/x')
+    t.await_log('[server:api] Ready on port')
+    t.await_log('[server:web] Ready on port')
+    t.mark_log_read()
+
+    # A PHP change is only the api server's business
+    t.write_file('index.php', '<?php echo 1;')
+    t.await_log('[server:api] Stopping due to file changes: index.php')
+    t.assert_log('[server:web] Stopping due to file changes', count=0)
+
+    # ...and a JS change is only the web server's
+    t.mark_log_read()
+    t.write_file('app.js', 'console.log(1)')
+    t.await_log('[server:web] Stopping due to file changes: app.js')
+    t.assert_log('[server:api] Stopping due to file changes', count=0)
+
+    # A file neither of them listed leaves both alone
+    t.mark_log_read()
+    t.write_file('notes.txt', 'nothing to see')
+    t.assert_http('/', check_body='web says /')
+    t.assert_log('Stopping due to file changes', count=0)
+
+
+@test
+def test_reload_rules_default_to_project_settings(t):
+    """settings.reload_include is the default for servers that declare none"""
+    t.write_file('api.py', _echo_server('api'))
+    # Created up front: a directory that appears and is written to in the same instant can be
+    # missed, since the watch for it is added only once it exists.
+    t.write_file('watched/deep/file.txt', 'first')
+    t.write_file('webcentral.conf', '''
+settings {
+  reload_include = *.py watched
+}
+
+service api {
+  command = python3 -u api.py
+}
+serve api
+''')
+
+    t.assert_http('/', check_body='api says /')
+    t.await_log('Ready on port')
+    t.mark_log_read()
+
+    # An unlisted file is ignored...
+    t.write_file('ignored.txt', 'x')
+    t.assert_http('/', check_body='api says /')
+    t.assert_log('Stopping due to file changes', count=0)
+
+    # ...and a listed directory covers what is inside it, however deep
+    t.write_file('watched/deep/file.txt', 'second')
+    t.await_log('Stopping due to file changes: watched/deep/file.txt')
+
+
+@test
+def test_sidecars_share_their_parents_life(t):
+    """A nested service starts with the one it is nested in, and they find each other by name"""
+    t.write_file('queue.py', """
+import os, socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("", int(os.environ['PORT'])))
+s.listen(1)
+print("queue listening, app reachable at default.internal:8000", flush=True)
+while True:
+    conn, _ = s.accept()
+    conn.sendall(b"pong")
+    conn.close()
+""")
+    # The app reports where it was told the sidecar lives, and proves it is really there.
+    t.write_file('app.py', """
+import os, socket, http.server, socketserver
+QUEUE = ("queue.internal", 8000)
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            c = socket.create_connection(QUEUE, timeout=5)
+            reply = c.recv(4).decode()
+            c.close()
+        except Exception as e:
+            reply = f"error {e}"
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(f"queue at {QUEUE[0]}:{QUEUE[1]} says {reply}".encode())
+    def log_message(self, *args):
+        pass
+print("app starting", flush=True)
+socketserver.TCPServer(("", int(os.environ["PORT"])), Handler).serve_forever()
+""")
+    t.write_file('webcentral.conf', """
+service {
+  command = python3 -u app.py
+
+  service queue {
+    command = python3 -u queue.py
+  }
+}
+""")
+
+    body = t.assert_http('/', check_body='says pong', timeout=60)
+    assert 'queue at queue.internal:' in body, body
+    # The group is symmetric: the sidecar reaches its parent by name on the same network
+    t.await_log('app reachable at default.internal:')
+
+
+@test
+def test_sidecars_cannot_nest(t):
+    """A sidecar already shares its parent's life, so nesting further has nothing left to mean"""
+    t.write_file('public/index.html', 'shell')
+    t.write_file('webcentral.conf', '''
+service app {
+  command = true
+  service db {
+    command = true
+    reload_include = x
+    service deeper {
+      command = true
+    }
+  }
+}
+serve app
+''')
+    t.assert_http('/', check_code=None)
+    t.await_log('A sidecar cannot have sidecars of its own')
+    # Lifecycle settings are the parent's business, so a sidecar declaring them is reported
+    t.assert_log("'reload_include' is not available in a sidecar", count=1)
+
+
+@test
+def test_capture_scoping(t):
+    """Captures resolve innermost-first then outwards, so nesting keeps outer groups reachable"""
+    t.write_file('webcentral.conf', '''
+match /shop/(?<section>[a-z]+)/(.*) {
+  match .*\\.json respond 200 "json in ${section} from ${2}"
+  respond 200 "page ${section}/${2}"
+}
+respond 200 "no match"
+''')
+
+    # The inner match captures nothing, so ${2} and ${section} come from the outer one
+    t.assert_http('/shop/books/x.json', check_body='json in books from x.json')
+    t.assert_http('/shop/books/y', check_body='page books/y')
+    t.assert_http('/other', check_body='no match')
+
+
+@test
+def test_else_pairs_with_the_preceding_statement(t):
+    """else always pairs with the statement right before it, inline body or not"""
+    t.write_file('public/real.txt', 'real file')
+    t.write_file('webcentral.conf', '''
+match /files/(.*) try_serve_file public/${1} else respond 418 "not a files request"
+respond 200 fell-through
+''')
+
+    t.assert_http('/files/real.txt', check_body='real file')
+    # The else belongs to the match, so a /files path that finds no file falls out of the match
+    # rather than taking the else branch
+    t.assert_http('/files/nope', check_body='fell-through')
+    t.assert_http('/other', check_code=418, check_body='not a files request')
+
+    # Pairing it with the inner statement instead is what the block form is for
+    t.write_file('webcentral.conf', '''
+match /files/(.*) {
+  try_serve_file public/${1}
+  else respond 404 "no ${1} here"
+}
+respond 200 fell-through
+''')
+    t.await_log('(reloading configuration)')
+    t.assert_http('/files/nope', check_code=404, check_body='no nope here')
+    t.assert_http('/other', check_body='fell-through')
+
+    # A capture is raw URI text, so serving a file by it decodes the way the request path does
+    t.write_file('public/my file.txt', 'spaced')
+    t.assert_http('/files/my%20file.txt', check_body='spaced')
+
+
+@test
+def test_match_subjects(t):
+    """method= and host= match those instead of the path"""
+    t.write_file('webcentral.conf', '''
+match POST subject=${method} respond 200 posted
+match subject=${host} nope.example matcher=literal respond 200 wrong-host
+match subject=${host} .*\\.test respond 200 right-host
+respond 200 unreachable
+''')
+
+    t.assert_http('/', method='POST', check_body='posted')
+    # The first host pattern doesn't match, so the second one answers
+    t.assert_http('/', check_body='right-host')
+
+
+@test
+def test_response_shaping(t):
+    """set_header decorates whatever answers, and named arguments tune respond and serve_dir"""
+    t.write_file('public/index.html', 'root page')
+    t.write_file('public/app/main.html', 'app shell')
+    t.write_file('webcentral.conf', '''
+match .*\\.html set_header Cache-Control "max-age=31536000"
+match /html respond 200 "<b>hi</b>" type=text/html
+match /app/ serve_dir public index=main.html
+serve_dir public
+''')
+
+    # set_header falls through, so the serve_dir below still answers - now with the header
+    t.assert_http('/index.html', check_body='root page',
+                  check_header=('Cache-Control', 'max-age=31536000'))
+    t.assert_http('/html', check_body='<b>hi</b>', check_header=('Content-Type', 'text/html'))
+    t.assert_http('/app/', check_body='app shell')
+
+
+@test
+def test_named_arguments(t):
+    """Positional arguments can also be given by name, and named ones tune the rest"""
+    t.write_file('public/index.html', 'root')
+    t.write_file('webcentral.conf', '''
+match subject=${path} pattern=/named respond status=200 body="by name" type=text/html
+match /positional respond 200 "by position"
+serve_dir dir=public index=index.html
+''')
+
+    t.assert_http('/named', check_body='by name', check_header=('Content-Type', 'text/html'))
+    t.assert_http('/positional', check_body='by position')
+    t.assert_http('/', check_body='root')
+
+
+@test
+def test_unknown_named_argument(t):
+    """Anything shaped like name=value is one, so an unknown name is reported rather than guessed"""
+    t.write_file('public/index.html', 'root')
+    t.write_file('webcentral.conf', '''
+set_header Cache-Control max-age=60
+match /x subject=${nosuchvar} respond 200 never
+respond 200 "kept going"
+''')
+
+    t.assert_http('/', check_body='kept going')
+    t.assert_log("'max-age' is not an argument of 'set_header' (it takes name, value)", count=1)
+    t.assert_log("quote the value if the '=' is part of it", count=1)
+    # An unset variable is empty, so a pattern expecting something never matches
+    t.assert_http('/x', check_body='kept going')
+
+
+@test
+def test_request_variables(t):
+    """${path}, ${method}, ${host} and ${query} are available wherever captures are"""
+    t.write_file('public/deep/file.txt', 'deep file')
+    t.write_file('webcentral.conf', '''
+match /echo respond 200 "${method} ${path}?${query} via ${host}"
+match /files/(.*) try_serve_file public/${path}
+match /shadow/(?<path>.*) respond 200 "shadowed ${path}"
+respond 200 "no match"
+''')
+
+    t.assert_http('/echo?a=1', check_body='GET /echo?a=1 via request-variables.test')
+    # ${path} is the request path, so this finds public/files/... - which doesn't exist
+    t.assert_http('/files/nope', check_body='no match')
+    # A capture of the same name shadows the request variable, like any other nested capture
+    t.assert_http('/shadow/xyz', check_body='shadowed xyz')
+
+
+@test
+def test_request_variables_follow_rewrite(t):
+    """${path} describes the request as it stands now, so a rewrite updates it"""
+    t.write_file('webcentral.conf', '''
+match /old/(.*) rewrite /new/${1}
+respond 200 "path is ${path}"
+''')
+
+    t.assert_http('/old/thing', check_body='path is /new/thing')
+
+
+@test
+def test_set_and_constants(t):
+    """Top-level set defines a constant the rest of the file can use, and set assigns per request"""
+    t.write_file('public/index.html', 'root')
+    t.write_file('webcentral.conf', '''
+set greeting hello
+set suffix /(.*)
+
+match /say${suffix} {
+  set who ${1}
+  respond 200 "${greeting} ${who}"
+}
+match /raw respond 200 '${greeting} is not substituted here'
+serve_dir public
+''')
+
+    # The constant reaches both the pattern (read once, at load) and the body (per request)
+    t.assert_http('/say/world', check_body='hello world')
+    # Single quotes take the text as written
+    t.assert_http('/raw', check_body='${greeting} is not substituted here')
+    t.assert_http('/', check_body='root')
+
+
+@test
+def test_match_subject_and_literal(t):
+    """subject= names the variable to test; matcher=literal compares without regex"""
+    t.write_file('webcentral.conf', '''
+set wanted /exact.path
+
+match POST subject=${method} respond 200 posted
+match ${wanted} matcher=literal respond 200 "literal hit"
+match subject=${host} .*\\.test respond 200 "host hit"
+respond 200 fallthrough
+''')
+
+    t.assert_http('/', method='POST', check_body='posted')
+    # A literal match compares the whole string, so the '.' is not a wildcard
+    t.assert_http('/exact.path', check_body='literal hit')
+    t.assert_http('/exactXpath', check_body='host hit')
+
+
+@test
+def test_set_from_any_variable(t):
+    """Variables are one flat map, so set can copy any of them"""
+    t.write_file('webcentral.conf', '''
+match /copy/(.*) {
+  set original ${path}
+  rewrite /${1}
+  respond 200 "was ${original}, now ${path}"
+}
+respond 200 other
+''')
+
+    t.assert_http('/copy/thing', check_body='was /copy/thing, now /thing')
+
+
+@test
+def test_subject_is_an_ordinary_argument(t):
+    """subject= is a value like any other, so it can be built from several variables"""
+    t.write_file('webcentral.conf', '''
+match .*\\.test/admin/.* subject=${host}${path} respond 200 "admin on this host"
+match /admin/.* respond 200 "admin elsewhere"
+respond 200 other
+''')
+
+    t.assert_http('/admin/x', check_body='admin on this host')
+    t.assert_http('/other', check_body='other')
+
+
+@test
+def test_unanchored_matching(t):
+    """anchored=false matches anywhere in the value, for a regex or a plain string"""
+    t.write_file('webcentral.conf', '''
+match /internal/ anchored=false matcher=literal respond 200 "contains internal"
+match v[0-9]+ anchored=false respond 200 "has a version"
+respond 200 plain
+''')
+
+    t.assert_http('/a/internal/b', check_body='contains internal')
+    t.assert_http('/api/v2/thing', check_body='has a version')
+    t.assert_http('/nothing', check_body='plain')
+
+
+@test
+def test_undefined_variables_are_reported(t):
+    """A ${name} nothing ever sets is empty, and said so at load time"""
+    t.write_file('public/index.html', 'root')
+    t.write_file('webcentral.conf', '''
+match /typo respond 200 "value is ${verison}"
+serve_dir public
+''')
+
+    t.assert_http('/typo', check_body='value is ')
+    t.assert_log("'${verison}' is never set, so it is always empty", count=1)
+    # Names that are set somewhere in the file are fine, even in another branch
+    t.assert_log("'${path}' is never set", count=0)
+
+
+@test
+def test_constants_reach_declaration_blocks(t):
+    """A top-level set is a constant the rest of the file is read with, blocks included"""
+    t.write_file('serve.py', _echo_server('app'))
+    # A short ${idle} on purpose: this container outlives webcentral by shutdown_time if the
+    # harness dies, and a leftover slows the next run's start for the whole grace period.
+    t.write_file('webcentral.conf', '''
+set runner serve.py
+set idle 6s
+
+service {
+  command = python3 -u ${runner} --port $PORT
+  shutdown_time = ${idle}
+}
+''')
+
+    # ${runner} was substituted into the command; $PORT was left for the shell
+    t.assert_http('/', check_body='app says /')
+    t.await_log('Running:')
+    t.assert_log('serve.py --port $PORT', count=1)
+    # ${idle} really was substituted, not parsed as a literal duration and defaulted away
+    t.assert_log('Expected a duration', count=0)
+
+
+@test
+def test_only_braces_are_substituted(t):
+    """${name} is the only substitution: every other $ is an ordinary character"""
+    t.write_file('webcentral.conf', """
+set who world
+
+match /shell respond 200 "$HOME and $PATH and $$ are not mine"
+match /plain respond 200 "$who is literal, ${who} is not"
+match /price respond 200 'costs ${5}'
+match /a{2}b respond 200 "quantifier works"
+match /tail$ anchored=false respond 200 "trailing anchor works"
+respond 200 other
+""")
+
+    # A $ not followed by { reaches the response untouched - shell vars, $$ and bare names alike
+    t.assert_http('/shell', check_body='$HOME and $PATH and $$ are not mine')
+    t.assert_http('/plain', check_body='$who is literal, world is not')
+    # Single quotes make even ${...} literal
+    t.assert_http('/price', check_body='costs ${5}')
+    # A regex quantifier ending a word, and a trailing anchor, need no quoting
+    t.assert_http('/aab', check_body='quantifier works')
+    t.assert_http('/x/tail', check_body='trailing anchor works')
+
+
+@test
+def test_env_file(t):
+    """env_file makes a secret a constant, reaching only what names it"""
+    t.write_file('.env', """
+# A comment, and a blank line follow
+
+DB_PASSWORD=hunter2
+export QUOTED="with spaces"
+DASHBOARD_SECRET=letmein
+""")
+    t.write_file('app.py', _echo_server('app'))
+    t.write_file('webcentral.conf', """
+env_file .env
+
+service {
+  command = python3 -u app.py --port $PORT
+  env {
+    DATABASE_URL = postgres://app:${DB_PASSWORD}@db.internal:5432/app
+    NOTE = ${QUOTED}
+  }
+}
+
+match /secret respond 200 "the secret is ${DB_PASSWORD}"
+check_auth ${DASHBOARD_SECRET} respond 200 "admin ok"
+serve
+""")
+
+    # Reaches statements...
+    secret = 'hunter2'
+    t.assert_http('/secret', check_body=f'the secret is {secret}')
+    t.assert_http('/?secret=letmein', check_body='admin ok')
+    # ...and env blocks
+    t.assert_http('/', check_body='app says /')
+    t.await_log('Running:')
+    # ...but never the log, nor the command line, where every user on the machine could read it
+    t.assert_log(secret, count=0)
+    # Only processes that *are* podman: any other command line mentioning the secret belongs to
+    # whatever launched this test run, not to webcentral.
+    listing = subprocess.run(['ps', '-eo', 'args'], capture_output=True, text=True, timeout=30).stdout
+    offenders = [line for line in listing.splitlines()
+                 if secret in line and line.split(' ', 1)[0].endswith('podman')]
+    assert not offenders, f"secret visible in a container's command line: {offenders}"
+    # It reaches the container through podman's own environment: the command line names the
+    # variable without its value, and /proc/<pid>/environ is readable only by its owner.
+    log = t.get_log_content(t.current_test_domain)
+    assert '-e DATABASE_URL ' in log, "DATABASE_URL was not passed by name"
+    assert 'DATABASE_URL=' not in log, "the value reached the command line"
+    # Nothing is written to disk for it either
+    data = os.path.join(t.tmpdir, t.current_test_domain, '_webcentral_data')
+    leftovers = [f for f in os.listdir(data) if f.startswith('env.')] if os.path.isdir(data) else []
+    assert not leftovers, f"environment written to disk: {leftovers}"
+
+
+@test
+def test_env_file_problems_are_reported(t):
+    """A missing or escaping env_file is a diagnostic, not a silent empty value"""
+    t.write_file('public/index.html', 'shell')
+    t.write_file('webcentral.conf', """
+env_file ../../etc/passwd
+env_file nope.env
+serve_dir public
+""")
+    t.assert_http('/', check_body='shell')
+    t.await_log('is outside the project directory')
+    t.assert_log("Could not read 'nope.env'", count=1)
+
+
+@test
+def test_env_file_change_reloads(t):
+    """Editing an env_file changes what the configuration means, so the project reloads"""
+    t.write_file('.env', 'GREETING=first\n')
+    t.write_file('webcentral.conf', 'env_file .env\nrespond 200 "${GREETING}"\n')
+    t.assert_http('/', check_body='first')
+    t.mark_log_read()
+
+    t.write_file('.env', 'GREETING=second\n')
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='second')
+
+
+@test
+def test_conditional_serving(t):
+    """A top-level match can pick between servers, so declaring them conditionally isn't needed"""
+    t.write_file('a.py', _echo_server('a'))
+    t.write_file('b.py', _echo_server('b'))
+    t.write_file('webcentral.conf', '''
+service a {
+  command = python3 -u a.py
+}
+service b {
+  command = python3 -u b.py
+}
+
+match /b/.* serve b
+serve a
+''')
+
+    # Only the one that is actually reached ever starts, so an unused declaration costs nothing
+    t.assert_http('/x', check_body='a says /x')
+    t.assert_log('[server:b] Starting', count=0)
+    t.assert_http('/b/y', check_body='b says /b/y')
+    t.await_log('[server:b] Ready on port')
+    # ...and neither is reported as unserved, since the serve is inside a match
+    t.assert_log('declared but never served', count=0)
+
+
+@test
+def test_check_auth(t):
+    """check_auth runs its block only when the request carries the secret"""
+    t.write_file('public/index.html', 'public page')
+    t.write_file('webcentral.conf', '''
+set admin_secret hunter2
+
+match /admin/(.*) {
+  check_auth ${admin_secret} respond 200 "admin area"
+  else respond 403 denied
+}
+serve_dir public
+''')
+
+    t.assert_http('/', check_body='public page')
+    # Without the secret, or with a wrong one, the else branch answers
+    t.assert_http('/admin/x', check_code=403)
+    t.assert_http('/admin/x', check_code=403, headers={'Authorization': 'Bearer nope'})
+    # The secret passes as a Bearer token or - so a link can carry it - a query parameter
+    t.assert_http('/admin/x', check_body='admin area', headers={'Authorization': 'Bearer hunter2'})
+    t.assert_http('/admin/x?secret=hunter2', check_body='admin area')
+
+
+@test
+def test_forward_and_proxy_statements(t):
+    """forward and proxy are ordinary statements, so one project can route to several backends"""
+    t.write_file('backend.py', _echo_server('backend'))
+    t.write_file('webcentral.conf', '''
+service backend {
+  command = python3 -u backend.py
+}
+serve backend
+''')
+    t.assert_http('/', check_body='backend says /')
+    backend_port = re.search(r'Ready on port (\d+)',
+                             t.get_log_content(t.current_test_domain, 0)).group(1)
+
+    t.write_file('webcentral.conf', f'''
+match /fwd/(.*) forward {backend_port}
+match /prx/(.*) proxy http://localhost:{backend_port}
+respond 200 neither
+''', domain='router.test')
+
+    # forward keeps the original path and Host; proxy rewrites Host to the upstream
+    t.assert_http('/fwd/a', check_body='backend says /fwd/a', host='router.test')
+    t.assert_http('/prx/b', check_body='backend says /prx/b', host='router.test')
+    t.assert_http('/other', check_body='neither', host='router.test')
 
 
 @test
 def test_rewrite_application(t):
-    """Rewrites apply to applications, preserving the query string"""
-    t.write_file('webcentral.ini', '''
-command=python3 -u -m http.server $PORT
-
-[rewrite]
-/pretty/(.*) = /$1.txt
+    """Rewrites reach the application, preserving the query string"""
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u -m http.server $PORT
+}
+match /pretty/(.*) rewrite /${1}.txt
 ''')
     t.write_file('real.txt', 'the real file')
 
@@ -589,24 +1335,12 @@ command=python3 -u -m http.server $PORT
     t.await_log('"GET /real.txt?x=1 HTTP/1.1"')
 
 
-@test
-def test_rewrite_invalid_pattern(t):
-    """An unparsable rewrite pattern is reported and skipped, not silently ignored"""
-    t.write_file('public/index.html', '<h1>Shell</h1>')
-    t.write_file('webcentral.ini', '''
-[rewrite]
-/broken( = /index.html
-/deep/link = /index.html
-''')
-
-    t.assert_http('/deep/link', check_body='Shell')
-    t.assert_log('Invalid rewrite pattern', count=1)
 
 
 @test
 def test_simple_application(t):
     """Start and serve from a simple application"""
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
     t.write_file('index.html', '<h1>App Server</h1>')
 
     # Making the HTTP request will trigger app start
@@ -620,7 +1354,7 @@ def test_simple_application(t):
 @test
 def test_application_starts_on_demand(t):
     """Application should not start until first request"""
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
     t.write_file('index.html', '<h1>On Demand</h1>')
     
     # Wait a moment to ensure webcentral has seen the files
@@ -637,22 +1371,42 @@ def test_application_starts_on_demand(t):
     t.assert_log('Ready on port', count=1)
 
 
+def _version_server(version):
+    """A tiny HTTP server that answers with a fixed string, for reload tests."""
+    return f'''
+import sys, http.server, socketserver
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"{version}")
+    def log_message(self, *args):
+        pass
+socketserver.TCPServer(("", int(sys.argv[1])), Handler).serve_forever()
+'''
+
+
 @test
 def test_application_file_change_reload(t):
-    """Application reloads when files change"""
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
-    t.write_file('index.html', '<h1>Version 1</h1>')
+    """A service restarts when its own source changes - and not for every other file"""
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u app.py $PORT\n}')
+    t.write_file('app.py', _version_server('Version 1'))
 
     # Make HTTP request to trigger app start
     t.assert_http('/', check_body='Version 1')
     t.assert_log('Ready on port', count=1)
-
-    # Mark logs as read before making changes
     t.mark_log_read()
 
-    # Modify file and wait for stop
-    t.write_file('index.html', '<h1>Version 2</h1>')
-    t.await_log('Stopping due to file changes: index.html')
+    # An asset is not program text: by default it does not restart anything, because whoever
+    # serves it reads it from disk anyway
+    t.write_file('notes.html', '<h1>irrelevant</h1>')
+    t.assert_http('/', check_body='Version 1')
+    t.assert_log('Stopping due to file changes', count=0)
+
+    # Source does restart it
+    t.write_file('app.py', _version_server('Version 2'))
+    t.await_log('Stopping due to file changes: app.py')
 
     # Make HTTP request to trigger restart and serve new content
     t.assert_http('/', check_body='Version 2')
@@ -662,7 +1416,7 @@ def test_application_file_change_reload(t):
 @test
 def test_config_change_reload(t):
     """Application reloads when config changes"""
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
     t.write_file('page.html', '<h1>Test Page</h1>')
 
     # Make HTTP request to trigger app start
@@ -671,10 +1425,15 @@ def test_config_change_reload(t):
     t.mark_log_read()
 
     # Change config and wait for stop
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=300')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  shutdown_time = 300
+}
+''')
 
-    t.await_log('Stopping due to file changes')
+    t.await_log('(reloading configuration)')
 
     # Make HTTP request to trigger restart
     t.assert_http('/page.html', check_body='Test Page')
@@ -702,7 +1461,7 @@ with socketserver.TCPServer(("", PORT), Handler) as httpd:
     httpd.serve_forever()
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n}')
     t.write_file('data.txt', 'Slow Server Data')
 
     # Make HTTP request (will take ~1 second to start)
@@ -736,9 +1495,11 @@ while True:
 ''')
 
     # Use a 5s startup deadline for faster test (default is 30s)
-    t.write_file('webcentral.ini', '''
-command=python3 -u server.py
-startup_deadline=5
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u server.py
+  startup_time = 5
+}
 ''')
     
     # Request should fail. The lifecycle makes a single startup attempt bounded by
@@ -787,7 +1548,7 @@ while True:
     conn.close()
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n}')
     
     # Start request in background thread
     import threading
@@ -811,7 +1572,7 @@ while True:
     # Now trigger file change while startup probe is in progress
     time.sleep(0.5)
     t.mark_log_read()
-    t.write_file('trigger.txt', 'trigger reload')
+    t.write_file('trigger.py', '# trigger reload')
     
     # Should see the file change stop and deregister
     t.await_log('Stopping due to file changes', timeout=3)
@@ -858,7 +1619,7 @@ with socketserver.TCPServer(("", PORT), Handler) as httpd:
     httpd.serve_forever()
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n}')
     t.write_file('index.html', '<h1>Shutdown Test</h1>')
 
     # Make HTTP request to trigger app start
@@ -881,7 +1642,7 @@ with socketserver.TCPServer(("", PORT), Handler) as httpd:
 @test
 def test_redirect_configuration(t):
     """Test HTTP redirect configuration"""
-    t.write_file('webcentral.ini', 'redirect=https://example.org/')
+    t.write_file('webcentral.conf', 'match (.*) moved https://example.org${1}')
 
     # Expect 301 redirect
     t.assert_http('/', check_code=301)
@@ -890,21 +1651,32 @@ def test_redirect_configuration(t):
 @test
 def test_dashboard_type(t):
     """Test dashboard type shows project status"""
-    # Create a dashboard project
-    t.write_file('webcentral.ini', 'type=dashboard')
-    
+    # The test runner owns its projects and runs webcentral, so the admin view is allowed
+    t.write_file('webcentral.conf', 'admin_dashboard')
+
     # Create an app project to show in the dashboard
-    t.write_file('webcentral.ini', 'command=sleep 999', domain='app.test')
+    t.write_file('webcentral.conf', 'service {\n  command = sleep 999\n}', domain='app.test')
     t.await_log('stdout', 'Domain app.test added')
-    
+
     # Access dashboard - check structure
     t.assert_http('/', check_body='<title>Webcentral Dashboard</title>')
-    t.assert_http('/', check_body='<th>Domain</th>')
+    t.assert_http('/', check_body='<th>Domain / server</th>')
     t.assert_http('/', check_body='<th>TLS</th>')
     t.assert_http('/', check_body='<th>Requests</th>')
     t.assert_http('/', check_body='<th>Idle</th>')
     t.assert_http('/', check_body='Uptime')
     t.assert_http('/', check_body='app.test')
+    # Each project's services get their own row under it, showing the image they run
+    t.assert_http('/', check_body=TEST_BASE_IMAGE)
+
+    # project_dashboard shows only the project's own slice: no other domains, and none of the
+    # server-wide numbers
+    pd_domain = 'project-dash.test'
+    t.write_file('webcentral.conf', 'project_dashboard', domain=pd_domain)
+    t.await_log('stdout', 'Domain project-dash.test added')
+    body = t.assert_http('/', host=pd_domain, check_body='project-dash.test')
+    assert 'app.test' not in body, "project_dashboard leaked another project's domain"
+    assert 'Uptime' not in body, "project_dashboard leaked server-wide info"
 
 
 @test
@@ -913,8 +1685,12 @@ def test_multiple_projects_isolation(t):
     # This test needs multiple domains
     t.write_file('public/index.html', '<h1>Project 1</h1>', domain='project1.test')
     t.write_file('public/index.html', '<h1>Project 2</h1>', domain='project2.test')
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT', domain='project3.test')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+}
+''', domain='project3.test')
     t.write_file('index.html', '<h1>Project 3</h1>', domain='project3.test')
 
     # Wait for all domains to be registered
@@ -943,8 +1719,13 @@ def test_404_on_missing_file(t):
 @test
 def test_application_stops_on_inactivity(t):
     """Application stops after inactivity timeout"""
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=1')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  shutdown_time = 1
+}
+''')
     t.write_file('index.html', '<h1>Timeout Test</h1>')
 
     # Make HTTP request to trigger app start
@@ -979,7 +1760,7 @@ def test_application_recovers_after_connect_refused(t):
         "time.sleep(3600)\n"
     )
     t.write_file('app.py', app)
-    t.write_file('webcentral.ini', 'command=python3 -u app.py\n\n[reload]\ntimeout=300')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u app.py\n  shutdown_time = 300\n}')
 
     t.assert_http('/', check_body='alive', timeout=10)
     t.await_log('Ready on port', timeout=5)
@@ -991,10 +1772,12 @@ def test_application_recovers_after_connect_refused(t):
 
     # Next request hits the dead port -> connect refused -> lifecycle restarts (not bricked).
     t.assert_http('/', check_code=502)
-    t.await_log('upstream connect failed', timeout=3)
+    t.await_log('upstream request failed', timeout=3)
+    # The stop is handled asynchronously; a request that beats it would just fail again.
+    t.await_log('Stopped (process exit)', timeout=15)
 
     # A subsequent request must rebuild and serve again.
-    t.assert_http('/', check_body='alive', timeout=10)
+    t.assert_http('/', check_body='alive', timeout=30)
     t.await_log('Ready on port', timeout=8)
 
 
@@ -1014,7 +1797,7 @@ def test_sigterm_ignoring_process_is_killed_not_wedged(t):
         "socketserver.TCPServer(('', PORT), H).serve_forever()\n"
     )
     t.write_file('app.py', app)
-    t.write_file('webcentral.ini', 'command=exec python3 -u app.py\n\n[reload]\ntimeout=1')
+    t.write_file('webcentral.conf', 'service {\n  command = exec python3 -u app.py\n  shutdown_time = 1\n}')
 
     # Start and serve
     t.assert_http('/', check_body='alive', timeout=10)
@@ -1023,7 +1806,7 @@ def test_sigterm_ignoring_process_is_killed_not_wedged(t):
     # Inactivity fires -> SIGTERM (ignored) -> must escalate to SIGKILL within the 5s grace,
     # rather than blocking the lifecycle task forever on child.wait().
     t.await_log('Stopping due to inactivity', timeout=4)
-    t.await_log('Stopped app (inactivity)', timeout=10)
+    t.await_log('Stopped (inactivity)', timeout=10)
     t.mark_log_read()
 
     # The lifecycle survived the kill: a new request restarts and serves.
@@ -1034,8 +1817,13 @@ def test_sigterm_ignoring_process_is_killed_not_wedged(t):
 @test
 def test_application_restarts_after_timeout(t):
     """Application restarts on request after timeout"""
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=1')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  shutdown_time = 1
+}
+''')
     t.write_file('index.html', '<h1>Restart Test</h1>')
 
     # Make HTTP request to trigger app start
@@ -1054,8 +1842,13 @@ def test_application_restarts_after_timeout(t):
 
 def _count_file_change_msgs(t):
     t.mark_log_read()
-    t.write_file('webcentral.ini',
-                 f'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=300\n# {time.time()}')
+    t.write_file('webcentral.conf',
+                 f'''
+service {{
+  command = python3 -u -m http.server $PORT
+  shutdown_time = 300
+}}
+''')
     time.sleep(0.6)  # allow debounce (100ms) + processing
     content = t.get_log_content(t.current_test_domain,
                                 t.log_positions.get(t.current_test_domain, 0))
@@ -1066,7 +1859,7 @@ def _count_file_change_msgs(t):
 def test_deleted_project_directory_is_removed(t):
     """Removing a project directory deregisters the domain (404 afterwards)."""
     domain = t.current_test_domain
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=300')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n  shutdown_time = 300\n}')
     t.write_file('index.html', 'hi')
     t.assert_http('/', check_body='hi')
     t.await_log('Ready on port', timeout=5)
@@ -1091,8 +1884,13 @@ def test_deleted_project_directory_is_removed(t):
 def test_idle_app_picks_up_config_change(t):
     """A config change while the app is idle (stopped) must take effect on next request."""
     t.write_file('index.html', 'VERSION ONE')
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=1')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  shutdown_time = 1
+}
+''')
     # Start the application and serve v1
     t.assert_http('/', check_body='VERSION ONE')
     t.await_log('Ready on port', timeout=5)
@@ -1100,8 +1898,8 @@ def test_idle_app_picks_up_config_change(t):
     t.await_log('Stopping due to inactivity', timeout=3)
     t.mark_log_read()
     # Change config while idle: turn the project into a redirect
-    t.write_file('webcentral.ini', 'redirect=http://example.com/')
-    t.await_log('Stopping due to file changes', timeout=3)
+    t.write_file('webcentral.conf', 'match (.*) moved http://example.com${1}')
+    t.await_log('(reloading configuration)', timeout=3)
     time.sleep(0.3)
     # Next request must use the NEW config (a 301 redirect), not restart the old app
     t.assert_http('/', check_code=301, check_header=('Location', 'http://example.com/'))
@@ -1110,8 +1908,13 @@ def test_idle_app_picks_up_config_change(t):
 @test
 def test_watcher_leak_on_running_reload(t):
     """Repeated reload-while-running cycles must not accumulate file watchers."""
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=300')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  shutdown_time = 300
+}
+''')
     t.write_file('index.html', '<h1>Leak Test</h1>')
 
     for i in range(6):
@@ -1121,7 +1924,9 @@ def test_watcher_leak_on_running_reload(t):
         # Change config while Running -> deregister + reload
         n = _count_file_change_msgs(t)
         print(f"\n  cycle {i}: {n} 'file changes' message(s)")
-        t.await_log('Stopped app (file change)', timeout=3)
+        # A config change replaces the whole project, so its servers are shut down rather than
+        # restarted in place.
+        t.await_log('Stopped (shutdown)', timeout=3)
         if n > 1:
             raise AssertionError(
                 f"cycle {i}: expected exactly 1 'Stopping due to file changes' "
@@ -1158,8 +1963,15 @@ with socketserver.TCPServer(("", PORT), MyHandler) as httpd:
     httpd.serve_forever()
 ''')
 
-    t.write_file('webcentral.ini',
-                 'command=python3 -u server.py\n\n[environment]\nTEST_VAR=hello_world')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u server.py
+  env {
+    TEST_VAR = hello_world
+  }
+}
+''')
 
     # Make HTTP request to trigger app start and verify env var
     t.assert_http('/', check_body='TEST_VAR=hello_world')
@@ -1190,7 +2002,7 @@ with socketserver.TCPServer(("", PORT), MyHandler) as httpd:
     httpd.serve_forever()
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n}')
 
     # Make POST request to trigger app start and verify
     t.assert_http('/', method='POST', data='test_data', check_body='Received: test_data')
@@ -1200,19 +2012,20 @@ with socketserver.TCPServer(("", PORT), MyHandler) as httpd:
 @test
 def test_multiple_file_changes_single_reload(t):
     """Multiple rapid file changes result in single reload"""
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
-    t.write_file('file1.html', 'v1')
-    t.write_file('file2.html', 'v1')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
+    t.write_file('file1.py', 'v1')
+    t.write_file('file2.py', 'v1')
+    t.write_file('file3.py', 'v1')
 
     # Make HTTP request to trigger app start
-    t.assert_http('/file1.html', check_body='v1')
+    t.assert_http('/file1.py', check_body='v1')
     t.await_log('Ready on port')
     t.mark_log_read()
 
     # Make multiple changes rapidly
-    t.write_file('file1.html', 'v2')
-    t.write_file('file2.html', 'v2')
-    t.write_file('file3.html', 'v2')
+    t.write_file('file1.py', 'v2')
+    t.write_file('file2.py', 'v2')
+    t.write_file('file3.py', 'v2')
 
     # Wait for stop
     t.await_log('Stopping due to file changes')
@@ -1221,14 +2034,14 @@ def test_multiple_file_changes_single_reload(t):
     t.assert_log('Stopping due to file changes', count=1)
 
     # Make HTTP request to trigger restart
-    t.assert_http('/file1.html', check_body='v2')
+    t.assert_http('/file1.py', check_body='v2')
     t.await_log('Ready on port')
 
     # Verify that file watcher runs again
     t.mark_log_read()
-    t.write_file('file1.html', 'v3')
+    t.write_file('file1.py', 'v3')
     t.await_log('Stopping due to file changes')
-    t.assert_http('/file1.html', check_body='v3')
+    t.assert_http('/file1.py', check_body='v3')
 
 
 @test
@@ -1252,7 +2065,7 @@ def test_index_html_default(t):
 @test
 def test_application_with_custom_port(t):
     """Application can specify custom port in command"""
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
     t.write_file('test.html', '<h1>Custom Port</h1>')
 
     # Make HTTP request to trigger app start
@@ -1291,47 +2104,101 @@ def test_webcentral_starts_successfully(t):
 
 
 @test
-def test_config_unknown_key_in_root(t):
-    """Unknown keys in root section are logged as errors"""
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\nunknown_key=value')
-    t.write_file('index.html', '<h1>Test</h1>')
+def test_readme_examples_are_valid(t):
+    """Every configuration example in the README parses without complaint"""
+    root = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(root, 'README.md')) as f:
+        readme = f.read()
 
-    # Make HTTP request to trigger project creation and config loading
-    t.assert_http('/', check_body='Test')
-    t.assert_log("Unexpected key 'unknown_key'", count=1)
+    # Only the Configuration chapter; the changelog and comparison table aren't config.
+    chapter = readme.split('## Configuration', 1)[1].split('\n## Command-Line Options', 1)[0]
+    examples = re.findall(r'```ini\n(.*?)```', chapter, re.S)
+    assert len(examples) >= 8, f"expected the config chapter to have examples, found {len(examples)}"
+
+    checked = 0
+    for i, example in enumerate(examples):
+        # Examples reference commands and images that don't exist here; only parsing is checked.
+        d = os.path.join(t.tmpdir, f'readme-example-{i}')
+        os.makedirs(d, exist_ok=True)
+        # Examples that read secrets need the file to exist; the values do not matter here.
+        with open(os.path.join(d, '.env'), 'w') as f:
+            f.write('DB_PASSWORD=x\nDASHBOARD_SECRET=y\n')
+        with open(os.path.join(d, 'webcentral.conf'), 'w') as f:
+            f.write(example)
+        result = subprocess.run(['./webcentral', 'check', d], capture_output=True, text=True,
+                                cwd=root, timeout=10)
+        if result.returncode != 0:
+            raise AssertionError(
+                f"README example {i} is not valid configuration:\n{example}\n{result.stdout}")
+        checked += 1
+    print(f"\n  {checked} README examples check out")
 
 
 @test
-def test_config_unknown_section(t):
-    """Unknown sections are logged as errors"""
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n\n[invalid_section]\nkey=value')
-    t.write_file('index.html', '<h1>Test</h1>')
+def test_check_reports_problems(t):
+    """`webcentral check` fails and prints the diagnostics for a bad file"""
+    root = os.path.dirname(os.path.abspath(__file__))
+    d = os.path.join(t.tmpdir, 'check-bad')
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, 'webcentral.conf'), 'w') as f:
+        f.write('serve nonexistent\n')
 
-    # Make HTTP request to trigger project creation and config loading
-    t.assert_http('/', check_body='Test')
-    t.assert_log("Unexpected key 'invalid_section.key'", count=1)
+    result = subprocess.run(['./webcentral', 'check', d], capture_output=True, text=True,
+                            cwd=root, timeout=10)
+    assert result.returncode != 0, f"expected a non-zero exit, got {result.returncode}"
+    assert "Unknown server 'nonexistent'" in result.stdout, result.stdout
 
 
 @test
-def test_config_unknown_key_in_podman_section(t):
-    """Unknown keys in the [podman] section ([docker] alias here) are logged as errors"""
-    # Just serve static files - podman section is present but not used
-    t.write_file('webcentral.ini', '[docker]\nbase=alpine\ninvalid_podman_key=value')
-    t.write_file('public/index.html', '<h1>Test</h1>')
+def test_config_diagnostics(t):
+    """Every mistake in a file is reported with its line, and the file still does what it can"""
+    t.write_file('public/index.html', '<h1>Shell</h1>')
+    t.write_file('webcentral.conf', f'''
+invalid_statement key value
+match /broken( rewrite /index.html
+match \\.css$ respond 200 css
+service api {{
+  command = python3 -u -m http.server $PORT
+  nonesuch = 1
+}}
+serve_dir public
+else respond 404 nope
+serve typo
+''')
 
-    # First make a request to create the project and load config - this may fail
-    # because a container is configured but we'll check the logs were written
-    try:
-        t.assert_http('/', check_body='Test')
-    except:
-        # Even if request fails, the config should have been loaded and error logged
-        pass
+    # The valid statements still run: public/ is served by the serve_dir above
+    t.assert_http('/', check_body='Shell')
 
-    # The [docker] alias normalizes to podman.*, so the error names the podman key.
-    # Verify the config error was logged at least once (may appear multiple times due to restarts)
-    t.await_log("Unexpected key 'podman.invalid_podman_key'", timeout=2)
+    t.assert_log("line 2:1: Unknown statement 'invalid_statement'", count=1)
+    t.assert_log("line 3:7: Invalid pattern '/broken('", count=1)
+    t.assert_log('already match the whole value', count=1)
+    t.assert_log("Unknown setting 'nonesuch'", count=1)
+    t.assert_log("Unknown server 'typo' (declared: api)", count=1)
+    t.assert_log("'else' can only follow", count=1)
+    # A server nobody serves is dead configuration
+    t.assert_log("server 'api' is declared but never served", count=1)
+
+
+@test
+def test_config_unknown_setting(t):
+    """An unknown setting is reported with its line, and the rest of the file still works"""
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  unknown_key=value
+}
+''')
+    t.write_file('index.html', '<h1>Test</h1>')
+
+    t.assert_http('/', check_body='Test')
+    t.assert_log("Unknown setting 'unknown_key'", count=1)
+    t.assert_log('line 4:', count=1)
+
+
+
+
+
 
 
 @test
@@ -1402,132 +2269,144 @@ def test_http2_support(t):
 
 
 @test
-def test_config_unknown_key_in_reload(t):
-    """Unknown keys in reload section are logged as errors"""
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n\n[reload]\ntimeout=60\nbad_key=123')
+def test_config_error_does_not_stop_the_rest(t):
+    """A bad setting is reported but the server it belongs to still starts"""
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  shutdown_time = 60
+  bad_key = 123
+}
+''')
     t.write_file('index.html', '<h1>Test</h1>')
 
-    # Make HTTP request to trigger project creation and app start
     t.assert_http('/', check_body='Test')
-    t.assert_log("Unexpected key 'reload.bad_key'", count=1)
+    t.assert_log("Unknown setting 'bad_key'", count=1)
     t.assert_log('Ready on port', count=1)
 
 
 @test
 def test_procfile_unsupported_type(t):
     """Unsupported Procfile process types are logged as errors"""
-    t.write_file('Procfile', 'web: python3 -u -m http.server $PORT\nclock: python3 clock.py')
-    t.write_file('index.html', '<h1>Procfile Test</h1>')
+    t.write_file('Procfile', f'web: {BUSYBOX_SERVER}\nclock: sleep 100')
 
-    # Make HTTP request to trigger project creation and app start
-    t.assert_http('/', check_body='Procfile Test')
-    t.assert_log("Procfile process type 'clock' is not supported", count=1)
-    t.assert_log('Ready on port', count=1)
+    t.poke()
+    t.await_log("Procfile process type 'clock' is not supported", timeout=30)
+    t.await_log('Ready on port', timeout=30)
 
 
 @test
 def test_procfile_web_only(t):
     """Procfile with only web process starts successfully"""
-    t.write_file('Procfile', 'web: python3 -u -m http.server $PORT')
-    t.write_file('index.html', '<h1>Procfile Web</h1>')
+    t.write_file('Procfile', f'web: {BUSYBOX_SERVER}')
 
-    # Make HTTP request to trigger app start
-    t.assert_http('/', check_body='Procfile Web')
-    t.assert_log('Ready on port', count=1)
+    t.poke()
+    t.await_log('Ready on port', timeout=30)
 
 
 @test
 def test_procfile_with_worker(t):
     """Procfile with web + worker processes"""
-    # Create a worker script that writes to a file
-    t.write_file('worker.py', '''
-import time
-import os
-print("I am a starting test worker...", flush=True)
-time.sleep(0.5)
-with open("worker_output.txt", "w") as f:
-    f.write("Worker was here")
-print("I am a finished little worker", flush=True)
-time.sleep(100)  # Keep running
-''')
+    worker = ('echo "I am a starting test worker..." ; '
+              'echo "Worker was here" > worker_output.txt ; '
+              'echo "I am a finished little worker" ; sleep 100')
 
-    t.write_file('Procfile', 'web: python3 -u -m http.server $PORT\nworker: python3 -u worker.py')
-    t.write_file('index.html', '<h1>Procfile with Worker</h1>')
+    t.write_file('Procfile', f'web: {BUSYBOX_SERVER}\nworker: {worker}')
 
-    # Make HTTP request to trigger app start
-    t.assert_http('/', check_body='Procfile with Worker')
-    t.assert_log('Ready on port', count=1)
+    t.poke()
+    t.await_log('Ready on port', timeout=30)
 
-    # Verify worker started
-    t.assert_log('Starting 1 worker(s)', count=1)
+    # Verify the worker follower started, as a sidecar in the parent's image
+    t.assert_log('Started sidecar w0', count=1)
     t.await_log('I am a starting test worker...')
     t.await_log('I am a finished little worker')
 
-    # Verify worker output file was created
-    time.sleep(0.2)
+    # Verify the worker really ran, by what it left behind
     worker_output = os.path.join(t.tmpdir, f'{t.current_test_domain}/worker_output.txt')
-    if not os.path.exists(worker_output):
+    for _ in range(50):
+        if os.path.exists(worker_output):
+            break
+        time.sleep(0.1)
+    else:
         raise AssertionError("Worker output file was not created")
 
 
 @test
 def test_procfile_multiple_workers(t):
     """Procfile with multiple worker processes"""
-    t.write_file('worker1.py', '''
-import time
-print("Worker 1 starting", flush=True)
-time.sleep(100)
-''')
-
-    t.write_file('worker2.py', '''
-import time
-print("Worker 2 starting", flush=True)
-time.sleep(100)
-''')
-
     t.write_file('Procfile',
-                 'web: python3 -u -m http.server $PORT\n'
-                 'worker: python3 -u worker1.py\n'
-                 'urgentworker: python3 -u worker2.py')
-    t.write_file('index.html', '<h1>Multiple Workers</h1>')
+                 f'web: {BUSYBOX_SERVER}\n'
+                 'worker: echo "Worker 1 starting" ; sleep 100\n'
+                 'urgentworker: echo "Worker 2 starting" ; sleep 100')
 
-    # Make HTTP request to trigger app start
-    t.assert_http('/', check_body='Multiple Workers')
-    t.assert_log('Ready on port', count=1)
+    t.poke()
+    t.await_log('Ready on port', timeout=30)
 
-    # Verify both workers started
-    t.assert_log('Starting 2 worker(s)', count=1)
+    # Verify both worker followers started
+    t.assert_log('Started sidecar w0', count=1)
+    t.assert_log('Started sidecar w1', count=1)
     t.await_log('Worker 1 starting')
     t.await_log('Worker 2 starting')
 
 
 @test
+def test_procfile_merges_into_declared_service(t):
+    """A command-less service is completed by auto-detection, so a Procfile project can be tuned"""
+    t.write_file('Procfile',
+                 'web: python3 -u -m http.server $PORT\n'
+                 'worker: echo "merged worker ran" ; sleep 100')
+    # The service tunes a setting but names no command: the Procfile supplies it (and the worker)
+    t.write_file('webcentral.conf', 'service {\n  shutdown_time = 5\n}')
+
+    t.assert_http('/', check_code=200)
+    t.await_log('merged worker ran')
+    t.assert_log('has no command', count=0)
+
+
+@test
+def test_command_less_service_without_detection_is_reported(t):
+    """A mounted service with no command and nothing to detect is a reported mistake"""
+    t.write_file('webcentral.conf', 'service {\n  shutdown_time = 5\n}')
+
+    # Nothing to run: the image's entrypoint exits immediately, so requests get a 502 - but the
+    # config error names the actual problem
+    t.assert_http('/', check_code=502, timeout=15)
+    t.assert_log("service 'default' has no command", count=1)
+
+
+@test
 def test_ini_single_worker(t):
-    """webcentral.ini with single worker process"""
+    """webcentral.conf with single worker process"""
     t.write_file('worker.py', '''
 import time
 print("INI Worker running", flush=True)
 time.sleep(100)
 ''')
 
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n'
-                 'worker=python3 -u worker.py')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  service worker {
+    command = python3 -u worker.py
+  }
+}
+''')
     t.write_file('index.html', '<h1>INI Worker</h1>')
 
     # Make HTTP request to trigger app start
     t.assert_http('/', check_body='INI Worker')
     t.assert_log('Ready on port', count=1)
 
-    # Verify worker started
-    t.assert_log('Starting 1 worker(s)', count=1)
+    # Verify the nested service started alongside
+    t.assert_log('Started sidecar worker', count=1)
     t.await_log('INI Worker running')
 
 
 @test
 def test_ini_multiple_named_workers(t):
-    """webcentral.ini with multiple named worker processes"""
+    """webcentral.conf with multiple named worker processes"""
     t.write_file('email_worker.py', '''
 import time
 print("Email worker active", flush=True)
@@ -1540,18 +2419,27 @@ print("Task worker active", flush=True)
 time.sleep(100)
 ''')
 
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n'
-                 'worker:email=python3 -u email_worker.py\n'
-                 'worker:tasks=python3 -u task_worker.py')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  service email {
+    command = python3 -u email_worker.py
+  }
+  service tasks {
+    command = python3 -u task_worker.py
+  }
+}
+''')
     t.write_file('index.html', '<h1>Multiple Named Workers</h1>')
 
     # Make HTTP request to trigger app start
     t.assert_http('/', check_body='Multiple Named Workers')
     t.assert_log('Ready on port', count=1)
 
-    # Verify workers started
-    t.assert_log('Starting 2 worker(s)', count=1)
+    # Verify both nested services started
+    t.assert_log('Started sidecar email', count=1)
+    t.assert_log('Started sidecar tasks', count=1)
     t.await_log('Email worker active')
     t.await_log('Task worker active')
 
@@ -1565,9 +2453,15 @@ print("Worker v1", flush=True)
 time.sleep(100)
 ''')
 
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n'
-                 'worker=python3 -u worker.py')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  service worker {
+    command = python3 -u worker.py
+  }
+}
+''')
     t.write_file('index.html', '<h1>Version 1</h1>')
 
     # Make HTTP request to trigger app start
@@ -1603,10 +2497,16 @@ print("Worker running", flush=True)
 time.sleep(100)
 ''')
 
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n'
-                 'worker=python3 -u worker.py\n\n'
-                 '[reload]\ntimeout=1')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  shutdown_time = 1
+  service worker {
+    command = python3 -u worker.py
+  }
+}
+''')
     t.write_file('index.html', '<h1>Worker Timeout</h1>')
 
     # Make HTTP request to trigger app start
@@ -1621,35 +2521,33 @@ time.sleep(100)
 
 
 @test
-def test_broken_ini_syntax_error(t):
-    """Broken webcentral.ini shows error in log"""
-    # Create a completely broken ini file (just nonsense)
-    t.write_file('webcentral.ini', 'asdfasdf\n!!@@##\ngarbage\n')
+def test_broken_config_reports_every_line(t):
+    """A broken config reports each bad statement, rather than stopping at the first"""
+    t.write_file('webcentral.conf', 'asdfasdf\n!!@@##\ngarbage\n')
     t.write_file('public/index.html', '<h1>Static Content</h1>')
 
-    # Should still serve static files
+    # Static files still work: an unusable script leaves the implicit tail
     t.assert_http('/', check_body='Static Content')
 
-    # Should log errors about the invalid syntax
-    t.assert_log('Invalid syntax in webcentral.ini at line 1: asdfasdf', count=1)
-    t.assert_log('Invalid syntax in webcentral.ini at line 2: !!@@##', count=1)
-    t.assert_log('Invalid syntax in webcentral.ini at line 3: garbage', count=1)
+    t.assert_log("webcentral.conf: line 1:1: Unknown statement 'asdfasdf'", count=1)
+    t.assert_log("webcentral.conf: line 2:1: Unknown statement '!!@@##'", count=1)
+    t.assert_log("webcentral.conf: line 3:1: Unknown statement 'garbage'", count=1)
 
 
 @test
 def test_edit_broken_ini_triggers_reload(t):
-    """Editing webcentral.ini triggers reload even if broken"""
+    """Editing webcentral.conf triggers reload even if broken"""
     # Start with a broken ini
-    t.write_file('webcentral.ini', 'garbage nonsense\n!!!')
+    t.write_file('webcentral.conf', 'garbage nonsense\n!!!')
     t.write_file('public/index.html', '<h1>Version 1</h1>')
 
     # Make initial request
     t.assert_http('/', check_body='Version 1')
     t.mark_log_read()
-    t.write_file('webcentral.ini', 'different garbage\n###')
+    t.write_file('webcentral.conf', 'different garbage\n###')
 
     # Should trigger a reload/restart
-    t.await_log('Stopping due to file changes', timeout=2)
+    t.await_log('(reloading configuration)', timeout=2)
 
     # Should still serve static files after reload
     t.assert_http('/', check_body='Version 1')
@@ -1657,9 +2555,9 @@ def test_edit_broken_ini_triggers_reload(t):
 
 @test
 def test_ini_disappearing_app_becomes_static(t):
-    """Removing webcentral.ini converts app to static site"""
+    """Removing webcentral.conf converts app to static site"""
     # Start with an application
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
     t.write_file('index.html', '<h1>App Content</h1>')
     t.write_file('public/index.html', '<h1>Static Content</h1>')
 
@@ -1669,19 +2567,19 @@ def test_ini_disappearing_app_becomes_static(t):
     t.mark_log_read()
 
     # Remove the ini file
-    os.remove(os.path.join(t.tmpdir, f'{t.current_test_domain}/webcentral.ini'))
+    os.remove(os.path.join(t.tmpdir, f'{t.current_test_domain}/webcentral.conf'))
 
     # Should trigger reload and stop the process
-    t.await_log('Stopped app', timeout=10)
+    t.await_log('Stopped (shutdown)', timeout=10)
 
     # Now should serve static files from public/
     t.assert_http('/', check_body='Static Content')
-    t.await_log('Static file server', timeout=4)
+    t.await_log('supervisor] Static', timeout=4)
 
 
 @test
 def test_ini_appearing_static_becomes_app(t):
-    """Adding webcentral.ini converts static site to app"""
+    """Adding webcentral.conf converts static site to app"""
     # Start with static site
     t.write_file('public/index.html', '<h1>Static Only</h1>')
     t.write_file('index.html', '<h1>App Will Serve This</h1>')
@@ -1691,10 +2589,10 @@ def test_ini_appearing_static_becomes_app(t):
     t.mark_log_read()
 
     # Add ini file to make it an app
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
 
     # Should trigger reload
-    t.await_log('Stopping due to file changes', timeout=2)
+    t.await_log('(reloading configuration)', timeout=2)
 
     # Now should serve via app
     t.assert_http('/', check_body='App Will Serve This')
@@ -1705,20 +2603,20 @@ def test_ini_appearing_static_becomes_app(t):
 def test_ini_broken_to_valid(t):
     """Fixing broken ini starts the application"""
     # Start with broken ini
-    t.write_file('webcentral.ini', 'broken syntax!!!\n###')
+    t.write_file('webcentral.conf', 'broken syntax!!!\n###')
     t.write_file('public/index.html', '<h1>Static</h1>')
     t.write_file('index.html', '<h1>App Content</h1>')
 
     # Access as static (broken ini means no app)
     t.assert_http('/', check_body='Static')
-    t.assert_log('Invalid syntax in webcentral.ini', count=1)
+    t.assert_log('Unknown statement', count=1)
     t.mark_log_read()
 
     # Fix the ini
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
 
     # Should trigger reload
-    t.await_log('Stopping due to file changes', timeout=2)
+    t.await_log('(reloading configuration)', timeout=2)
 
     # Now should work as app
     t.assert_http('/', check_body='App Content')
@@ -1729,7 +2627,7 @@ def test_ini_broken_to_valid(t):
 def test_ini_valid_to_broken(t):
     """Breaking ini converts app back to static"""
     # Start with valid ini
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
     t.write_file('index.html', '<h1>App</h1>')
     t.write_file('public/index.html', '<h1>Static</h1>')
 
@@ -1739,21 +2637,21 @@ def test_ini_valid_to_broken(t):
     t.mark_log_read()
 
     # Break the ini
-    t.write_file('webcentral.ini', 'invalid!!!\ngarbage')
+    t.write_file('webcentral.conf', 'invalid!!!\ngarbage')
 
     # Should trigger reload
-    t.await_log('Stopping due to file changes', timeout=2)
+    t.await_log('(reloading configuration)', timeout=2)
 
     # Now should serve static
     t.assert_http('/', check_body='Static')
-    t.assert_log('Invalid syntax in webcentral.ini', count=2)
+    t.assert_log('Unknown statement', count=2)
 
 
 @test
 def test_command_changing(t):
     """Changing command in ini restarts with new command"""
     # Start with simple server
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
     t.write_file('index.html', '<h1>HTTP Server</h1>')
 
     # Start the app
@@ -1780,10 +2678,10 @@ with socketserver.TCPServer(("", PORT), CustomHandler) as httpd:
     httpd.serve_forever()
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n}')
 
     # Should trigger reload
-    t.await_log('Stopping due to file changes', timeout=2)
+    t.await_log('(reloading configuration)', timeout=2)
 
     # Should start with new command
     t.assert_http('/', check_body='Custom Server')
@@ -1811,7 +2709,7 @@ with socketserver.TCPServer(("", PORT), EnvHandler) as httpd:
     httpd.serve_forever()
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py\n\n[environment]\nMY_VAR=value1')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n  env {\n    MY_VAR = value1\n  }\n}')
 
     # Start the app
     t.assert_http('/', check_body='MY_VAR=value1')
@@ -1819,10 +2717,10 @@ with socketserver.TCPServer(("", PORT), EnvHandler) as httpd:
     t.mark_log_read()
 
     # Change environment variable
-    t.write_file('webcentral.ini', 'command=python3 -u server.py\n\n[environment]\nMY_VAR=value2')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n  env {\n    MY_VAR = value2\n  }\n}')
 
     # Should trigger reload
-    t.await_log('Stopping due to file changes', timeout=2)
+    t.await_log('(reloading configuration)', timeout=2)
 
     # Should have new value
     t.assert_http('/', check_body='MY_VAR=value2')
@@ -1832,7 +2730,7 @@ with socketserver.TCPServer(("", PORT), EnvHandler) as httpd:
 def test_workers_added_via_config_change(t):
     """Adding workers to ini starts them on reload"""
     # Start without workers
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
     t.write_file('index.html', '<h1>Test</h1>')
     t.write_file('worker.py', '''
 import time
@@ -1846,16 +2744,22 @@ time.sleep(100)
     t.mark_log_read()
 
     # Add worker to config
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n'
-                 'worker=python3 -u worker.py')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  service worker {
+    command = python3 -u worker.py
+  }
+}
+''')
 
     # Should trigger reload
-    t.await_log('Stopping due to file changes', timeout=2)
+    t.await_log('(reloading configuration)', timeout=2)
 
-    # Should start with worker
+    # Should start with the nested service
     t.assert_http('/', check_body='Test')
-    t.assert_log('Starting 1 worker(s)', count=1)
+    t.assert_log('Started sidecar worker', count=1)
     t.await_log('New worker started')
 
 
@@ -1868,9 +2772,15 @@ import time
 print("Worker running", flush=True)
 time.sleep(100)
 ''')
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT\n'
-                 'worker=python3 -u worker.py')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  service worker {
+    command = python3 -u worker.py
+  }
+}
+''')
     t.write_file('index.html', '<h1>Test</h1>')
 
     # Start the app
@@ -1879,26 +2789,28 @@ time.sleep(100)
     t.mark_log_read()
 
     # Remove worker from config
-    t.write_file('webcentral.ini', 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
 
     # Should trigger reload
-    t.await_log('Stopping due to file changes', timeout=2)
+    t.await_log('(reloading configuration)', timeout=2)
 
     # Should not log about workers anymore
     t.mark_log_read()
     t.assert_http('/', check_body='Test')
-    # No "starting N worker(s)" message in new logs
+    # No sidecar start in the new logs
     new_logs = t.get_log_content(t.current_test_domain, t.log_positions[t.current_test_domain])
-    if 'Starting 1 worker(s)' in new_logs:
-        raise AssertionError("Workers should not be started after removal from config")
+    if 'Started sidecar' in new_logs:
+        raise AssertionError("The removed nested service must not be started again")
 
 
 @test
 def test_redirect_changes_to_app(t):
     """Changing from redirect to app restarts as application"""
     # Start as redirect
-    t.write_file('webcentral.ini',
-                 'redirect=https://example.com/')
+    t.write_file('webcentral.conf',
+                 '''
+match (.*) moved https://example.com${1}
+''')
     t.write_file('index.html', '<h1>App Content</h1>')
 
     # Should redirect
@@ -1906,11 +2818,15 @@ def test_redirect_changes_to_app(t):
     t.mark_log_read()
 
     # Change to app
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+}
+''')
 
     # Should trigger reload
-    t.await_log('Stopping due to file changes', timeout=2)
+    t.await_log('(reloading configuration)', timeout=2)
 
     # Should now serve app
     t.assert_http('/', check_body='App Content')
@@ -1921,8 +2837,12 @@ def test_redirect_changes_to_app(t):
 def test_app_changes_to_redirect(t):
     """Changing from app to redirect stops app and redirects"""
     # Start as app
-    t.write_file('webcentral.ini',
-                 'command=python3 -u -m http.server $PORT')
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+}
+''')
     t.write_file('index.html', '<h1>App</h1>')
 
     # Start the app
@@ -1931,11 +2851,13 @@ def test_app_changes_to_redirect(t):
     t.mark_log_read()
 
     # Change to redirect
-    t.write_file('webcentral.ini',
-                 'redirect=https://example.org/')
+    t.write_file('webcentral.conf',
+                 '''
+match (.*) moved https://example.org${1}
+''')
 
     # Should trigger reload
-    t.await_log('Stopping due to file changes', timeout=2)
+    t.await_log('(reloading configuration)', timeout=2)
 
     # Should now redirect
     t.assert_http('/', check_code=301)
@@ -1943,7 +2865,7 @@ def test_app_changes_to_redirect(t):
 
 @test
 def test_static_ignores_non_config_file_changes(t):
-    """Static file servers should only reload on webcentral.ini/Procfile changes"""
+    """Static file servers should only reload on webcentral.conf/Procfile changes"""
     # Start with static site
     t.write_file('public/index.html', '<h1>Static</h1>')
     
@@ -1958,20 +2880,21 @@ def test_static_ignores_non_config_file_changes(t):
     t.assert_http('/', check_body='Static')
     t.assert_log('Stopping due to file changes', count=0)
     
-    # But adding webcentral.ini should trigger reload
-    t.write_file('webcentral.ini', 'command=echo test')
-    t.await_log('Stopping due to file changes', timeout=2)
+    # But adding webcentral.conf should trigger reload
+    t.write_file('webcentral.conf', 'service {\n  command = echo test\n}')
+    t.await_log('(reloading configuration)', timeout=2)
 
 
 @test
 def test_app_respects_include_patterns(t):
     """Apps should only reload for files matching include patterns"""
     # Start with app that only watches .py files
-    t.write_file('webcentral.ini', '''
-command=python3 -u -m http.server $PORT
-[reload]
-include[]=*.py
-include[]=webcentral.ini
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u -m http.server $PORT
+  reload_include = *.py
+  reload_include = webcentral.conf
+}
 ''')
     t.write_file('index.html', '<h1>Original</h1>')
     
@@ -1996,11 +2919,12 @@ include[]=webcentral.ini
 def test_app_respects_exclude_patterns(t):
     """Apps should not reload for files matching exclude patterns"""
     # Start with app that excludes .tmp files
-    t.write_file('webcentral.ini', '''
-command=python3 -u -m http.server $PORT
-[reload]
-exclude[]=*.tmp
-exclude[]=temp/*
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u -m http.server $PORT
+  reload_exclude = *.tmp
+  reload_exclude = temp/*
+}
 ''')
     t.write_file('index.html', '<h1>Test</h1>')
     
@@ -2010,21 +2934,21 @@ exclude[]=temp/*
     t.mark_log_read()
     
     # Create excluded .tmp file (should NOT trigger reload)
-    t.write_file('temp.tmp', 'temporary')
+    t.write_file('handler.tmp', 'temporary')
     
     # Should NOT have reloaded
     t.assert_http('/', check_body='Test')
     t.assert_log('Stopping due to file changes', count=0)
     
-    # Create file in excluded directory (should NOT trigger reload)
-    t.write_file('temp/file.txt', 'data')
+    # Create file in an excluded directory (should NOT trigger reload, even though it is source)
+    t.write_file('temp/file.py', 'data = 1')
     
     # Wait a bit
     t.assert_http('/', check_body='Test')
     t.assert_log('Stopping due to file changes', count=0)
     
-    # Create regular file (should trigger reload)
-    t.write_file('data.json', '{}')
+    # Create a source file outside the excluded paths (should trigger reload)
+    t.write_file('handler.py', 'x = 1')
     t.await_log('Stopping due to file changes', timeout=2)
 
 
@@ -2032,11 +2956,12 @@ exclude[]=temp/*
 def test_rooted_path_pattern(t):
     """Pattern with leading ./ should match from root only"""
     # App that watches all files but demonstrates basename matching
-    t.write_file('webcentral.ini', '''
-command=python3 -u -m http.server $PORT
-[reload]
-include[]=**/*
-exclude[]=subdir/package.json
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u -m http.server $PORT
+  reload_include = **/*
+  reload_exclude = subdir/package.json
+}
 ''')
     t.write_file('package.json', '{"version": "1.0.0"}')
     t.write_file('subdir/package.json', '{"version": "2.0.0"}')
@@ -2061,11 +2986,11 @@ def test_matches_pattern_logic(t):
     """Verify matchesPattern behavior with path patterns"""
     # Test that pattern "src" matches "src/package.json"
     # This is the root cause: exclude pattern "src" blocks "src/package.json" before includes are checked
-    t.write_file('webcentral.ini', '''
-command=python3 -u -m http.server $PORT
-[reload]
-# With only includes and no excludes, verify src/package.json triggers reload
-include[]=src/package.json
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u -m http.server $PORT
+  reload_include = src/package.json
+}
 ''')
     t.write_file('index.html', '<h1>V1</h1>')
     t.write_file('src/package.json', '{"version": "1.0.0"}')
@@ -2190,7 +3115,7 @@ def test_websocket_proxy(t):
     shutil.copy(wstool_src, os.path.join(project_dir, 'wstool.py'))
 
     # Start wstool server in echo mode
-    t.write_file('Procfile', 'web: python3 -u wstool.py server $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u wstool.py server $PORT\n}')
 
     # Connect to localhost but use test domain as the Host header for routing
     client = wstool.WebSocketClient(
@@ -2278,7 +3203,7 @@ with socketserver.TCPServer(("", PORT), HeaderEchoHandler) as httpd:
     httpd.serve_forever()
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n}')
 
     # Make request and verify Host header is preserved
     response = t.assert_http('/test/path', check_code=200)
@@ -2323,7 +3248,7 @@ with socketserver.TCPServer(("", PORT), SimpleHandler) as httpd:
     httpd.serve_forever()
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n}')
 
     # First, start the backend to get a port assigned
     t.assert_http('/', check_code=200)
@@ -2332,13 +3257,15 @@ with socketserver.TCPServer(("", PORT), SimpleHandler) as httpd:
     # Extract the port from logs
     backend_log = t.get_log_content(t.current_test_domain, 0)
     import re
-    port_match = re.search(r'Backend on (\d+)', backend_log)
+    port_match = re.search(r'Ready on port (\d+)', backend_log)
     if not port_match:
         raise AssertionError("Could not find backend port in logs")
     backend_port = port_match.group(1)
 
     # Now create a forward that points to this backend
-    t.write_file('webcentral.ini', f'port={backend_port}', domain='forwarder.test')
+    t.write_file('webcentral.conf', f'''
+forward {backend_port}
+''', domain='forwarder.test')
 
     # Make request through the forwarder
     response = t.assert_http('/api/endpoint', check_code=200, host='forwarder.test')
@@ -2381,7 +3308,7 @@ with socketserver.TCPServer(("", PORT), HeaderEchoHandler) as httpd:
     httpd.serve_forever()
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n}')
 
     # Start backend and get its port
     t.assert_http('/', check_code=200)
@@ -2389,13 +3316,15 @@ with socketserver.TCPServer(("", PORT), HeaderEchoHandler) as httpd:
 
     backend_log = t.get_log_content(t.current_test_domain, 0)
     import re
-    port_match = re.search(r'Proxy backend on (\d+)', backend_log)
+    port_match = re.search(r'Ready on port (\d+)', backend_log)
     if not port_match:
         raise AssertionError("Could not find backend port")
     backend_port = port_match.group(1)
 
     # Create a proxy that points to this backend
-    t.write_file('webcentral.ini', f'proxy=http://localhost:{backend_port}', domain='proxy-test.test')
+    t.write_file('webcentral.conf', f'''
+proxy http://localhost:{backend_port}
+''', domain='proxy-test.test')
 
     # Make request through the proxy
     response = t.assert_http('/api/data', check_code=200, host='proxy-test.test')
@@ -2439,7 +3368,7 @@ with socketserver.TCPServer(("", PORT), PathHandler) as httpd:
     httpd.serve_forever()
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n}')
 
     # Start backend
     t.assert_http('/', check_code=200)
@@ -2447,14 +3376,18 @@ with socketserver.TCPServer(("", PORT), PathHandler) as httpd:
 
     backend_log = t.get_log_content(t.current_test_domain, 0)
     import re
-    port_match = re.search(r'Path backend on (\d+)', backend_log)
+    port_match = re.search(r'Ready on port (\d+)', backend_log)
     backend_port = port_match.group(1)
 
     # Create forward
-    t.write_file('webcentral.ini', f'port={backend_port}', domain='path-forward.test')
+    t.write_file('webcentral.conf', f'''
+forward {backend_port}
+''', domain='path-forward.test')
 
     # Create proxy
-    t.write_file('webcentral.ini', f'proxy=http://localhost:{backend_port}', domain='path-proxy.test')
+    t.write_file('webcentral.conf', f'''
+proxy http://localhost:{backend_port}
+''', domain='path-proxy.test')
 
     # Test that both preserve paths with query strings
     forward_response = t.assert_http('/some/path?query=value', check_code=200, host='path-forward.test')
@@ -2472,13 +3405,13 @@ with socketserver.TCPServer(("", PORT), PathHandler) as httpd:
 def test_forward_upstream_connect_error(t):
     """Forward to closed port returns 502 Bad Gateway"""
     # Configure forward to a port that's not listening
-    t.write_file('webcentral.ini', 'port=1')
+    t.write_file('webcentral.conf', 'forward 1')
 
     # Request should return 502 Bad Gateway
     t.assert_http('/', check_code=502)
 
     # Log should contain specific error message
-    t.await_log('upstream connect failed')
+    t.await_log('upstream request failed')
 
 
 @test
@@ -2521,12 +3454,12 @@ class StallHandler(BaseHTTPRequestHandler):
             print(f"Connection error: {e}", flush=True)
 
 port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-server = HTTPServer(('localhost', port), StallHandler)
+server = HTTPServer(('', port), StallHandler)
 print(f"Stalling server on {port}", flush=True)
 server.serve_forever()
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py $PORT\n}')
     
     # Start a connection that we'll close abruptly
     import socket
@@ -2585,7 +3518,7 @@ time.sleep(0.2)  # Small delay to ensure log is written
 sys.exit(1)
 ''')
     
-    t.write_file('webcentral.ini', 'command=python3 -u server.py')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n}')
     t.write_file('public/index.html', '<h1>Static Fallback</h1>')
     
     # First request triggers startup, process exits
@@ -2621,7 +3554,7 @@ import socket
 port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server_socket.bind(('localhost', port))
+server_socket.bind(('', port))
 server_socket.listen(1)
 print(f"Streaming server on {port}", flush=True)
 
@@ -2652,7 +3585,7 @@ while True:
         print(f"Request error: {e}", flush=True)
 ''')
 
-    t.write_file('webcentral.ini', 'command=python3 -u server.py $PORT')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py $PORT\n}')
     
     # Make request and measure time to receive each chunk
     import socket
@@ -2704,74 +3637,307 @@ while True:
 
 
 # ============================================================================
-# BASIC AUTH TESTS
+# AUTH AND INTERNAL REDIRECT TESTS
 # ============================================================================
 
-def make_basic_auth_header(username, password):
-    """Create a Basic auth header value from username and password."""
-    credentials = f"{username}:{password}"
-    encoded = base64.b64encode(credentials.encode()).decode()
-    return f"Basic {encoded}"
+@test
+def test_shutdown_stops_containers(t):
+    """SIGTERM must stop the containers, not just the webcentral that started them"""
+    import signal as sig
+    require_podman()
+    podman = shutil.which('podman')
 
-# Generate argon2 hash for 'testpass' using: ./target/debug/webcentral hash testpass
-TEST_PASSWORD_HASH = '$argon2id$v=19$m=19456,t=2,p=1$GuPKg0qepf5z8eL5pfrFYA$yb3Mr85cF0DxK4euCpnSKvKjKXOMpJcLIcMujnxqFj4'
+    # A webcentral of its own, so signalling it does not disturb the one the suite shares. The
+    # root has no dot in its name, so the suite's own project glob never sees it.
+    root = os.path.join(t.tmpdir, 'shutdown-root')
+    domain = 'shutdown-stops.test'
+    project = os.path.join(root, domain)
+    os.makedirs(project, exist_ok=True)
+    with open(os.path.join(project, 'webcentral.conf'), 'w') as f:
+        f.write('service {\n'
+                f'  base = {TEST_BASE_IMAGE}\n'
+                '  command = python3 -u -m http.server $PORT\n'
+                # Long, so nothing stops by itself: only the shutdown path can.
+                '  shutdown_time = 300\n'
+                '}\n')
+    with open(os.path.join(project, 'index.html'), 'w') as f:
+        f.write('running')
+
+    port = t.find_free_port()
+    log = open(os.path.join(root, 'out.log'), 'w')
+    proc = subprocess.Popen(
+        ['./webcentral', '--projects', root, '--http', str(port), '--https', '0',
+         '--data-dir', root],
+        stdout=log, stderr=subprocess.STDOUT,
+        cwd=os.path.dirname(os.path.abspath(__file__)))
+
+    def running_here():
+        names = subprocess.run([podman, 'ps', '--format', '{{.Names}}'],
+                               capture_output=True, text=True, timeout=30).stdout.split()
+        here = []
+        for name in names:
+            mounts = subprocess.run(
+                [podman, 'inspect', name, '--format', '{{range .Mounts}}{{.Source}} {{end}}'],
+                capture_output=True, text=True, timeout=30).stdout
+            if project in mounts:
+                here.append(name)
+        return here
+
+    try:
+        for attempt in range(60):
+            try:
+                conn = http.client.HTTPConnection('localhost', port, timeout=5)
+                conn.request('GET', '/', headers={'Host': domain})
+                if conn.getresponse().status == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        else:
+            raise AssertionError("the second webcentral never served a request")
+
+        assert running_here(), "the service's container should be running before shutdown"
+
+        # The same signal systemd sends on `systemctl stop`
+        proc.send_signal(sig.SIGTERM)
+        proc.wait(timeout=60)
+
+        leaked = running_here()
+        assert not leaked, f"containers left running after shutdown: {leaked}"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=30)
+        for name in running_here():
+            subprocess.run([podman, 'rm', '--force', '--time', '2', name],
+                           capture_output=True, timeout=60)
+        log.close()
+
 
 @test
-def test_basic_auth(t):
-    """Basic auth: no config passes through, with config requires credentials"""
-    # Without auth config, requests pass through
+def test_range_requests(t):
+    """Static files honour Range, so media seeking and resumed downloads work"""
+    t.write_file('public/data.txt', 'ABCDEFGHIJ')
+
+    # A whole-file request advertises range support
+    body, headers = t.assert_http('/data.txt', check_body='ABCDEFGHIJ', return_headers=True)
+    assert headers.get('accept-ranges') == 'bytes', headers
+    etag = headers.get('etag')
+    assert etag, "no ETag to validate a resumed download against"
+
+    # A plain range
+    body, headers = t.assert_http('/data.txt', check_code=206, headers={'Range': 'bytes=2-4'},
+                                  return_headers=True)
+    assert body == 'CDE', repr(body)
+    assert headers.get('content-range') == 'bytes 2-4/10', headers
+    assert headers.get('content-length') == '3', headers
+
+    # Open-ended, and suffix ranges
+    assert t.assert_http('/data.txt', check_code=206, headers={'Range': 'bytes=7-'}) == 'HIJ'
+    assert t.assert_http('/data.txt', check_code=206, headers={'Range': 'bytes=-3'}) == 'HIJ'
+    # An end past the file is clamped rather than refused
+    assert t.assert_http('/data.txt', check_code=206, headers={'Range': 'bytes=8-99'}) == 'IJ'
+
+    # Past the end entirely: 416 saying how long the file really is
+    body, headers = t.assert_http('/data.txt', check_code=416, headers={'Range': 'bytes=50-60'},
+                                  return_headers=True)
+    assert headers.get('content-range') == 'bytes */10', headers
+
+    # Unparsable or multi-range: the whole file, not an error
+    t.assert_http('/data.txt', check_body='ABCDEFGHIJ', headers={'Range': 'bytes=abc'})
+    t.assert_http('/data.txt', check_body='ABCDEFGHIJ', headers={'Range': 'bytes=0-1,5-6'})
+
+    # If-Range naming a version we no longer have gets the whole file, never a spliced one
+    t.assert_http('/data.txt', check_body='ABCDEFGHIJ',
+                  headers={'Range': 'bytes=2-4', 'If-Range': '"stale"'})
+    assert t.assert_http('/data.txt', check_code=206,
+                         headers={'Range': 'bytes=2-4', 'If-Range': etag}) == 'CDE'
+
+
+@test
+def test_default_reload_rules_are_conservative(t):
+    """Without reload_include, only plausible program text restarts a service"""
+    # Created up front: a directory that appears and is written to in the same instant can be
+    # missed, since the watch for it is added only once it exists.
+    t.write_file('src/handler.js', 'module.exports = 1')
+    t.write_file('uploads/photo.jpg', 'not really a jpeg')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u -m http.server $PORT\n}')
+    t.write_file('index.html', 'page')
+    t.assert_http('/', check_body='page')
+    t.await_log('Ready on port')
+    t.mark_log_read()
+
+    # Assets, data and uploads leave it alone
+    t.write_file('index.html', 'edited page')
+    t.write_file('style.css', 'body{}')
+    t.write_file('uploads/photo.jpg', 'still not a jpeg')
+    t.assert_http('/', check_body='edited page')
+    t.assert_log('Stopping due to file changes', count=0)
+
+    # Source anywhere, and a dependency manifest, do restart it
+    t.write_file('src/handler.js', 'module.exports = 2')
+    t.await_log('Stopping due to file changes: src/handler.js')
+    t.assert_http('/', check_body='edited page')
+    t.mark_log_read()
+    t.write_file('requirements.txt', 'flask==3.0.0')
+    t.await_log('Stopping due to file changes: requirements.txt')
+
+
+@test
+def test_copy_into_build(t):
+    """copy puts a project file in the image so build can use it, and rebuilds when it changes"""
+    t.write_file('greeting.txt', 'hello from the build')
+    t.write_file('webcentral.conf', '''
+service {
+  base = webcentral-test-base
+  shutdown_time = 5
+  copy = greeting.txt
+  build = cp greeting.txt /baked.txt
+  command = python3 -u -c "import sys,http.server,socketserver; d=open('/baked.txt').read().strip(); h=type('H',(http.server.BaseHTTPRequestHandler,),{'do_GET':lambda s:(s.send_response(200),s.end_headers(),s.wfile.write(d.encode())),'log_message':lambda s,*a:None}); socketserver.TCPServer(('',int(sys.argv[1])),h).serve_forever()" $PORT
+}
+''')
+
+    t.assert_http('/', check_body='hello from the build', timeout=120)
+
+    # Editing the copied file changes what the image *is*, so the next start rebuilds it
+    t.write_file('greeting.txt', 'hello again')
+    t.await_log('Stopping due to file changes')
+    t.assert_http('/', check_body='hello again', timeout=120)
+
+
+@test
+def test_copy_cannot_escape_the_project(t):
+    """A copy path leading out of the project directory is refused at parse time"""
+    t.write_file('public/index.html', 'shell')
+    t.write_file('webcentral.conf', '''
+service {
+  copy = ../../etc/passwd
+  command = true
+}
+serve_dir public
+''')
+    t.assert_http('/', check_body='shell')
+    t.await_log('is outside the project directory')
+
+
+@test
+def test_sidecar_inherits_parent_env(t):
+    """A sidecar in its parent's image starts from its parent's environment"""
+    t.write_file('app.py', _echo_server('app'))
+    t.write_file('helper.py', '''
+import os, time
+print(f"helper sees SHARED={os.environ.get('SHARED')} OWN={os.environ.get('OWN')}", flush=True)
+time.sleep(100)
+''')
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u app.py --port $PORT
+  env {
+    SHARED = from-parent
+    OWN = parent-value
+  }
+  service helper {
+    command = python3 -u helper.py
+    env { OWN = sidecar-wins }
+  }
+}
+''')
+
+    t.assert_http('/', check_body='app says /')
+    # Inherited where it says nothing, its own value where it does
+    t.await_log('helper sees SHARED=from-parent OWN=sidecar-wins')
+
+
+@test
+def test_check_auth_falls_through(t):
+    """A failed check_auth without an else just continues with the next statement"""
+    # Without any auth in the config, requests pass through
     t.write_file('public/index.html', '<h1>Page</h1>')
     t.assert_http('/', check_body='Page')
-    
-    # Add auth config
-    t.write_file('webcentral.ini', f'[auth]\ntestuser = {TEST_PASSWORD_HASH}')
-    t.await_log('file change')
-    
-    # Without credentials: 401 with WWW-Authenticate header
-    t.assert_http('/', check_code=401, check_header=('WWW-Authenticate', 'Basic realm="Authentication Required"'))
-    
-    # Wrong password/username: 401
-    t.assert_http('/', check_code=401, headers={'Authorization': make_basic_auth_header('testuser', 'wrong')})
-    t.assert_http('/', check_code=401, headers={'Authorization': make_basic_auth_header('wrong', 'testpass')})
-    
-    # Correct credentials: 200 with Set-Cookie
-    body, headers = t.assert_http('/', check_body='Page', headers={'Authorization': make_basic_auth_header('testuser', 'testpass')}, return_headers=True)
-    set_cookie = headers.get('set-cookie', '')
-    assert 'webcentral_auth=' in set_cookie and 'HttpOnly' in set_cookie, f"Bad Set-Cookie: {set_cookie}"
-    cookie = set_cookie.split(';')[0]
-    
-    # Cookie auth works without basic auth header, and doesn't re-set cookie
-    body, headers = t.assert_http('/', check_body='Page', headers={'Cookie': cookie}, return_headers=True)
-    assert 'set-cookie' not in headers, "Unexpected set-cookie on cookie auth"
-    
-    # Invalid cookie: 401
-    t.assert_http('/', check_code=401, headers={'Cookie': 'webcentral_auth=testuser:invalid'})
-    
-    # Logout: clears cookie and redirects
-    body, headers = t.assert_http('/webcentral/logout', check_code=302, headers={'Cookie': cookie}, return_headers=True)
-    assert headers.get('location') == '/' and 'Max-Age=0' in headers.get('set-cookie', ''), "Bad logout response"
 
+    t.write_file('webcentral.conf', 'check_auth s3cret serve_dir public\nrespond 401 "who goes there"\n')
+    t.await_log('(reloading configuration)')
 
-@test
-def test_basic_auth_multiple_users(t):
-    """Multiple users can be configured with different passwords"""
-    ANOTHER_HASH = '$argon2id$v=19$m=19456,t=2,p=1$n0qMIBo4Xc3+R5OWcz1u9A$QdmJraypHLGF/TavDRGscYI11gfHhFGgettpS2SU0rk'
-    t.write_file('public/index.html', '<h1>Page</h1>')
-    t.write_file('webcentral.ini', f'[auth]\nalice = {TEST_PASSWORD_HASH}\nbob = {ANOTHER_HASH}')
-    
-    t.assert_http('/', check_body='Page', headers={'Authorization': make_basic_auth_header('alice', 'testpass')})
-    t.assert_http('/', check_body='Page', headers={'Authorization': make_basic_auth_header('bob', 'anotherpass')})
-    t.assert_http('/', check_code=401, headers={'Authorization': make_basic_auth_header('alice', 'anotherpass')})
-
-
-@test
-def test_basic_auth_with_application(t):
-    """Basic auth works with application projects"""
-    t.write_file('webcentral.ini', f'command = python3 -u -m http.server $PORT\n[auth]\nuser = {TEST_PASSWORD_HASH}')
-    t.write_file('index.html', '<h1>App</h1>')
-    
     t.assert_http('/', check_code=401)
-    t.assert_http('/', check_body='App', headers={'Authorization': make_basic_auth_header('user', 'testpass')})
+    t.assert_http('/', check_code=401, headers={'Authorization': 'Bearer wrong'})
+    t.assert_http('/', check_body='Page', headers={'Authorization': 'Bearer s3cret'})
+    t.assert_http('/?secret=s3cret', check_body='Page')
+
+
+@test
+def test_check_auth_with_application(t):
+    """check_auth guards a service just like static files"""
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u -m http.server $PORT
+}
+check_auth topsecret serve
+respond 401 Unauthorized
+''')
+    t.write_file('index.html', '<h1>App</h1>')
+
+    t.assert_http('/', check_code=401)
+    t.assert_http('/', check_body='App', headers={'Authorization': 'Bearer topsecret'})
+
+
+@test
+def test_x_accel_redirect(t):
+    """An upstream response naming X-Accel-Redirect is replaced by an internal re-route"""
+    t.write_file('app.py', '''
+import http.server, socketserver, os
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("X-Accel-Redirect", "/protected/data.txt")
+        self.send_header("X-App", "was-here")
+        self.send_header("Content-Type", "application/x-download")
+        self.end_headers()
+        self.wfile.write(b"this body is discarded")
+    def log_message(self, *args):
+        pass
+socketserver.TCPServer(("", int(os.environ["PORT"])), Handler).serve_forever()
+''')
+    t.write_file('protected/data.txt', 'file payload')
+    t.write_file('webcentral.conf', '''
+service { command = python3 -u app.py }
+
+match /protected/(.*) {
+  # Only reachable through an internal redirect from the app, never directly
+  match default subject=${redirected_by} matcher=literal try_serve_dir .
+  respond 403 "no direct access"
+}
+serve
+''')
+
+    # The app's response body is discarded; the file is served in its place, with the app's
+    # headers carried over - so the app still controls the Content-Type
+    body, headers = t.assert_http('/download', check_body='file payload', return_headers=True)
+    assert headers.get('x-app') == 'was-here', f"App header not carried: {headers}"
+    assert headers.get('content-type') == 'application/x-download', f"Content-Type not carried: {headers}"
+
+    # Directly asking for the file does not work: ${redirected_by} is empty then
+    t.assert_http('/protected/data.txt', check_code=403)
+
+
+@test
+def test_sidecar_inherits_parent_image(t):
+    """A nested service without a base of its own runs in its parent's image"""
+    # `base` is set explicitly, so the harness injects nothing and the sidecar names no image:
+    # it must inherit the parent's, which is the only place python3 can come from.
+    t.write_file('webcentral.conf', '''
+service {
+  base = webcentral-test-base
+  shutdown_time = 5
+  command = python3 -u -m http.server $PORT
+  service helper {
+    command = python3 -u -c "import time; print('sidecar python works', flush=True); time.sleep(100)"
+  }
+}
+''')
+    t.write_file('index.html', 'inherit')
+
+    t.assert_http('/', check_body='inherit')
+    t.await_log('sidecar python works')
 
 
 @test
@@ -2789,7 +3955,7 @@ def test_websocket_inactivity(t):
     shutil.copy(wstool_src, os.path.join(project_dir, 'wstool.py'))
 
     # Start wstool server in echo mode with short inactivity timeout
-    t.write_file('webcentral.ini', 'command = python3 -u wstool.py server $PORT\n[reload]\ntimeout = 2')
+    t.write_file('webcentral.conf', 'service {\n  command = python3 -u wstool.py server $PORT\n  shutdown_time = 2\n}')
     
     # Wait for webcentral to pick up the files (directory watcher might be slow)
     time.sleep(0.5)
@@ -2820,7 +3986,7 @@ def test_websocket_inactivity(t):
     # Create a dashboard project to verify it shows active websocket
     # Using a different domain for the dashboard
     dashboard_domain = 'dashboard-view.test'
-    t.write_file('webcentral.ini', 'type=dashboard', domain=dashboard_domain)
+    t.write_file('webcentral.conf', 'admin_dashboard', domain=dashboard_domain)
     # Wait for webcentral to pick up the new domain
     time.sleep(0.5)
 
@@ -2887,8 +4053,7 @@ def test_listener_survives_accept_error(t):
         ['./webcentral',
          '--projects', os.path.join(root, 'projects'),
          '--http', str(port), '--https', '0',
-         '--data-dir', os.path.join(root, 'data'),
-         '--firejail', 'false'],
+         '--data-dir', os.path.join(root, 'data')],
         stdout=log_f, stderr=subprocess.STDOUT,
         cwd=os.path.dirname(os.path.abspath(__file__)),
         preexec_fn=limit_fds,
@@ -2959,17 +4124,18 @@ def test_listener_survives_accept_error(t):
 
 # Alpine's own busybox is built without httpd, so it comes from busybox-extras. Serving from /tmp
 # keeps this independent of whether the project directory is mounted.
-PODMAN_PACKAGES = 'packages[] = busybox-extras\n'
+PODMAN_PACKAGES = '  packages = busybox-extras\n'
 PODMAN_SERVE = ('mkdir -p /tmp/srv && echo podman ok > /tmp/srv/index.html '
                 '&& exec /usr/sbin/httpd -f -p $PORT -h /tmp/srv')
 
 
-def _podman_setup(t, ini):
-    """Pull alpine up front (so the per-request timeouts stay sane) and write a podman project"""
+def _podman_setup(t, settings):
+    """Pull alpine up front (so the per-request timeouts stay sane) and write a podman project.
+    `settings` are the lines that go inside the podman block."""
     podman = require_podman()
     subprocess.run([podman, 'pull', 'alpine'], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, timeout=300)
-    t.write_file('webcentral.ini', ini)
+    t.write_file('webcentral.conf', 'service {\n' + settings + '}\n')
     return podman
 
 
@@ -3005,11 +4171,10 @@ def test_podman_runs_as_project_user(t):
     Rootless podman represents the owner as container root; a root-owned project under a root
     webcentral bakes uid 0, so both report root inside."""
     _podman_setup(t,
-        f'command = {{ id -u; id -g; whoami; printenv HOME; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
-        '[podman]\n'
-        'base = alpine\n'
+        f'  command = {{ id -u; id -g; whoami; printenv HOME; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
+        '  base = alpine\n'
         + PODMAN_PACKAGES +
-        'mounts[] = data\n')
+        '  mounts = data\n')
 
     t.assert_http('/', check_body='podman ok', timeout=300)
 
@@ -3026,11 +4191,10 @@ def test_podman_bakes_owner_into_image(t):
         raise SkipTest("needs root to give the project dir to another user")
 
     _podman_setup(t,
-        f'command = {{ id -u; id -g; whoami; printenv HOME; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
-        '[podman]\n'
-        'base = alpine\n'
+        f'  command = {{ id -u; id -g; whoami; printenv HOME; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
+        '  base = alpine\n'
         + PODMAN_PACKAGES +
-        'mounts[] = data\n')
+        '  mounts = data\n')
     project_dir = os.path.join(t.tmpdir, t.current_test_domain)
     for root, dirs, files in os.walk(project_dir):
         for p in dirs + files:
@@ -3048,15 +4212,14 @@ def test_podman_bakes_owner_into_image(t):
 
 @test
 def test_podman_user_override(t):
-    """An explicit [podman] user runs the container as exactly that user inside"""
+    """An explicit podman user runs the container as exactly that user inside"""
     podman = _podman_setup(t,
-        f'command = {{ id -u; id -g; }} > /data/id.txt && {PODMAN_SERVE}\n'
-        '[podman]\n'
-        'base = alpine\n'
-        'mount_app_dir = false\n'
+        f'  command = {{ id -u; id -g; }} > /data/id.txt && {PODMAN_SERVE}\n'
+        '  base = alpine\n'
+        '  mount_app_dir = false\n'
         + PODMAN_PACKAGES +
-        f'user = {os.getuid()}:{os.getgid()}\n'
-        'mounts[] = /data\n')
+        f'  user = {os.getuid()}:{os.getgid()}\n'
+        '  mounts = /data\n')
     require_working_keepid(podman)
 
     t.assert_http('/', check_body='podman ok', timeout=300)
@@ -3070,13 +4233,12 @@ def test_podman_user_override(t):
 def test_podman_foreign_user_mapped_to_owner(t):
     """A container user unrelated to the owner still writes owner-owned files on the host"""
     podman = _podman_setup(t,
-        f'command = mkdir -p /data/sub && {{ id -u; id -g; }} > /data/sub/id.txt && {PODMAN_SERVE}\n'
-        '[podman]\n'
-        'base = alpine\n'
-        'mount_app_dir = false\n'
+        f'  command = mkdir -p /data/sub && {{ id -u; id -g; }} > /data/sub/id.txt && {PODMAN_SERVE}\n'
+        '  base = alpine\n'
+        '  mount_app_dir = false\n'
         + PODMAN_PACKAGES +
-        'user = 4242:4242\n'
-        'mounts[] = /data\n')
+        '  user = 4242:4242\n'
+        '  mounts = /data\n')
     require_working_keepid(podman)
 
     t.assert_http('/', check_body='podman ok', timeout=300)
@@ -3088,15 +4250,13 @@ def test_podman_foreign_user_mapped_to_owner(t):
 
 @test
 def test_podman_user_image_keeps_image_user(t):
-    """user = image keeps the image's own user inside, while host files stay ours.
-    Also covers [docker] as a section alias."""
+    """user = image keeps the image's own user inside, while host files stay ours"""
     _podman_setup(t,
-        f'command = {{ id -u; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
-        '[docker]\n'
-        'base = alpine\n'
+        f'  command = {{ id -u; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
+        '  base = alpine\n'
         + PODMAN_PACKAGES +
-        'user = image\n'
-        'mounts[] = data\n')
+        '  user = image\n'
+        '  mounts = data\n')
 
     t.assert_http('/', check_body='podman ok', timeout=300)
 
@@ -3107,13 +4267,12 @@ def test_podman_user_image_keeps_image_user(t):
 
 @test
 def test_podman_packages_are_installed(t):
-    """[podman] packages are installed into the generated image"""
+    """podman packages are installed into the generated image"""
     _podman_setup(t,
-        f'command = {{ command -v httpd; }} > /app/data/found.txt && {PODMAN_SERVE}\n'
-        '[podman]\n'
-        'base = alpine\n'
+        f'  command = {{ command -v httpd; }} > /app/data/found.txt && {PODMAN_SERVE}\n'
+        '  base = alpine\n'
         + PODMAN_PACKAGES +
-        'mounts[] = data\n')
+        '  mounts = data\n')
 
     t.assert_http('/', check_body='podman ok', timeout=300)
 
@@ -3121,14 +4280,18 @@ def test_podman_packages_are_installed(t):
     assert fields and fields[0].endswith('/httpd'), f"busybox-extras was not installed: {fields}"
 
 
+
 @test
 def test_podman_bare_uid_rejected(t):
-    """A bare numeric [podman] user is rejected as ambiguous at config parse"""
-    t.write_file('webcentral.ini',
-        'command = true\n'
-        '[podman]\n'
-        'base = alpine\n'
-        'user = 1000\n')
+    """A bare numeric podman user is rejected as ambiguous at config parse"""
+    t.write_file('webcentral.conf',
+        '''
+service {
+  command = true
+  base = alpine
+  user = 1000
+}
+''')
 
     # The error is logged when the project is first loaded, triggered by any request;
     # the request itself may fail (podman may not even be installed), which is fine.
@@ -3136,19 +4299,14 @@ def test_podman_bare_uid_rejected(t):
         t.assert_http('/', timeout=10)
     except Exception:
         pass
-    t.await_log("Invalid 'podman.user' value '1000'", timeout=5)
+    t.await_log("Invalid user '1000'", timeout=5)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run webcentral tests')
-    parser.add_argument('--firejail', type=str, choices=['true', 'false'], default='true',
-                        help='Enable or disable Firejail sandboxing (default: true)')
     parser.add_argument('test_names', nargs='*', help='Specific test names to run')
 
     args = parser.parse_args()
-
-    # Convert firejail argument to boolean and update the global runner
-    runner.use_firejail = args.firejail == 'true'
 
     # Run tests
     test_names = args.test_names if args.test_names else None

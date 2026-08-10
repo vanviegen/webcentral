@@ -11,11 +11,27 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 `src/server.rs` - HTTP/HTTPS/HTTP3 listeners, ACME certificate management, domain routing, www/HTTPS redirects, directory watching
 
-`src/project.rs` - Per-domain lifecycle manager supporting: applications (Firejail/podman), static files, redirects, proxies, forwards. Handles file watching, auto-reload, inactivity timeouts, URL rewrites
+`src/project.rs` - Per-domain glue: owns the config, the servers, the file watcher, and the
+request entry point (running the script, then forwarding/proxying/upgrading as it decided)
+
+`src/app_server.rs` - One managed service: lifecycle state machine, image preparation, podman
+command construction, container user/ownership policy
+
+`src/script.rs` - The routing script: statement AST, capture scoping, templates, and the
+interpreter. Also static-file resolution (streamed, with `Range`/`If-Range` support) and the
+`check_auth` secret comparison
+
+`src/config.rs` - The configuration model and the parser for `webcentral.conf`; auto-detection
+from `Procfile`/`package.json` synthesises the same language rather than a separate code path
+
+`src/parser.rs` - Scanner for the configuration language: words, quoting, blocks, diagnostics
+
+(Include/exclude path matching lives in the `include-exclude-watcher` crate's public `Matcher`,
+which webcentral uses to decide which server a changed file belongs to.)
+
+`src/dashboard.rs` - The built-in status page
 
 `src/logger.rs` - Daily-rotated logs with configurable retention
-
-`src/project_config.rs` - Parses `webcentral.ini`, `Procfile`, and `package.json`
 
 `src/streams.rs` - Stream abstraction (AnyConnector/AnyStream) for HTTP/TCP/Unix socket connections
 
@@ -23,31 +39,115 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 `test.py` - Test suite and harness
 
+### Configuration language
+
+`webcentral.conf` is a list of `verb argument... name=value...` statements, some with a `{ ... }`
+block. Which of the two shapes a line has is known from the enclosing block, never from the line
+itself: server/env/settings blocks hold `key = value` settings, everywhere else holds
+statements. That is what keeps `=` an ordinary character in patterns and secrets. Braces are
+structure only when they stand alone as a word, so a `{2}` quantifier needs no quoting.
+
+Declarations (`settings`, `service`) are top-level only and hoisted - except that a
+`service` nested inside another is a *sidecar*, sharing its parent's lifetime (and, when it
+names no `base` of its own, its parent's image - which is how an extra worker process is
+declared; there is no separate worker concept). Everything else forms the script. Errors are collected with line/column and the scanner
+skips to the next line (and its body, so an inline `match /x respond 200 y` that fails to parse
+doesn't leave `respond 200 y` behind), so one parse reports every problem.
+
+Every statement declares a `Signature`: positional parameters, which may also be given as
+`name=value`, then named-only modifiers, each with a `Kind` saying what its word becomes. One
+binder turns a line into those values, so the rules - unknown names reported, values given twice
+refused, required ones checked - are identical everywhere. `Kind` also decides substitution:
+`Word` is rendered as the file is read (so it sees the constants above it), `Template` is kept for
+request time, and `Variable` is a name and so is left alone. Declaration settings are rendered the
+same way through `Builder::expand`; nothing is exempt.
+
+`${name}` is the *only* substitution: a `$` not followed by `{` is an ordinary character, so
+regexes, prices and a shell's `$PORT`/`$HOME`/`$$` pass through with nothing to escape, and a
+literal `${` is single-quoted. A brace only counts as block structure when it *starts* a word,
+which is what lets `${1}` end one and `x{2}` be a quantifier. Every name a template reads is
+collected and checked at the end against everything the file defines, so a typo is reported
+rather than being silently empty.
+
+`env_file <path>` reads `KEY=value` lines into those same constants, in file order like `set`, so
+a secret lives outside `webcentral.conf` and reaches only what names it - nothing is injected into
+any process by itself. The path must be inside the project directory (an absolute one would let a
+project read anything a root webcentral can), it joins `config_files` so editing it reloads the
+project, and nothing it defines is injected anywhere by itself.
+
+**Container environment** is handed over through podman's *own* environment: `add_env_args` sets
+each variable on the `podman run` child and names it with a valueless `-e NAME`. `podman run`
+lives as long as its container and `/proc/<pid>/cmdline` is world-readable, so `-e NAME=value`
+would let any user on the machine read another project's secrets with `ps`; `/proc/<pid>/environ`
+is 0400 instead, and nothing is written to disk. The exception is `PODMAN_READS_ENV` - `HOME`,
+`PATH`, the `XDG_*` and `CONTAINERS_*` names - which configure podman itself and so must stay on
+the command line; they are paths and locales rather than secrets, and `describe()` still hides
+their values in the log.
+
+### Request handling
+
+`script::run` walks the statements against the request, mutating its URI for `rewrite` and
+collecting response headers, and returns a `Terminal` describing what should answer:
+a ready `Response`, or a `ServeApp`/`Forward`/`Proxy` for `project.rs` to perform with the request
+body it still owns. Keeping the body out of the interpreter is what lets the same script drive
+both ordinary requests and protocol upgrades.
+
+Four statements are fallible (`match`, `check_auth`, `try_serve_file`, `try_serve_dir`) and carry
+an optional `else` branch, attached at parse time to the statement it follows. Everything else is
+terminal or a modifier. An implicit tail (`serve` / `serve_dir public` / 404) is appended to every
+script.
+
+Request and response bodies are streamed end to end (`retry_canceled_requests` is off, since a
+partly-sent streamed body can never be replayed). An upstream response carrying
+`X-Accel-Redirect: /path` is discarded and the request re-run through the script as a bodyless GET
+for that path, with `$redirected_from`/`$redirected_by` set and the redirecting response's other
+headers carried onto the final one; one redirect per request, no chains.
+
+Variables are one flat `Vars` map per request, cloned from the constants the file's top-level
+`set` statements defined. `match` writes the groups it captured (only those it has, so a nested
+match that captures nothing leaves its parent's `$1` alone), `set` writes what it is given, and
+`$path`/`$query`/`$method`/`$host` are refreshed after every `rewrite`. Last write wins; there is
+no scope. Single-quoted parts of a word are recorded as literal spans by the scanner, so the
+template parser can leave their `$` alone.
+
 ### State Machine
 
-Application projects use `AppState` enum with explicit state machine in `lifecycle_task`:
+Each server uses the `AppState` enum with an explicit state machine in `AppServer::lifecycle_task`:
 
-- **Stopped** - Waiting for request (triggers startup via `pending_requests` counter)
+- **Stopped** - Waiting for a request (triggers startup via the `pending_requests` counter)
 - **Starting** - Spawning processes, waiting for port ready, detecting process exit
-- **Running** - Processing requests, monitoring for stop triggers (file change, inactivity, process exit, shutdown)
-- **Failed** - After 2 startup failures, deregisters from server
+- **Running** - Serving, monitoring for stop triggers (file change, inactivity, process exit, shutdown)
+- **Failed** - Startup failed; waiting requests get a 502 and a later file change retries
 
-Non-Application types (Static, Proxy, Forward, Redirect) don't have a lifecycle_task but listen for FileChange via `stop_listener`.
+A project with no servers (static, proxy, redirect, forward) has no lifecycle task at all.
 
 ### Concurrency Model
 
 **Runtime:** Tokio async/await with task spawning
 
 **Per-project tasks:**
-1. **File watcher** - Spawned once, aborted on reload, handle stored in `watcher_task` mutex
-2. **Lifecycle task** (Application) - State machine managing Stopped→Starting→Running→Stopped transitions
-3. **Stop listener** (non-Application) - Simple listener for FileChange to trigger deregistration
-4. **Log streamers** - 2 per process (stdout/stderr), plus 2 per worker
+1. **Change debouncer** - Collects file changes from the process-wide watcher until they stop
+   arriving, then acts on the batch. Holds a `Weak<Project>` so it ends with the project
+2. **Lifecycle task** - One per declared server, managing Stopped→Starting→Running→Stopped
+3. **Log streamers** - 2 per process (stdout/stderr), plus 2 per sidecar
 
 **Server-level tasks:**
 - HTTP listener - Spawns connection handler per TCP connection
 - HTTPS listener - TLS handshake then spawns connection handler
 - Directory watcher - Detects new/removed project directories
+- File watcher - **One for every project at once.** An inotify *instance* is a scarce per-user
+  resource (`fs.inotify.max_user_instances`, 128 by default) while the *watches* it holds are not
+  (hundreds of thousands), so one watcher for the whole tree costs the same in watches as one per
+  project and nothing in instances - 60 projects go from 61 instances to 2. Which project, and
+  which of its servers, an event concerns is decided in-process by the
+  `include-exclude-watcher` crate's `Matcher`. It is not
+  debounced at the watcher: a debounce window is global to it, and the crate reports only the
+  first path of a batch, so a busy moment on one project would swallow another's event. Each
+  project debounces its own changes instead. `Project::reload` ignores an event whose file mtime
+  equals the snapshot taken when the project loaded (the watcher runs from before any project
+  exists, so the write that created a project can be reported just after it was built); it
+  compares for *difference* rather than newness because deploy tools like `rsync -a` preserve
+  mtimes
 - Certificate acquisition - One task per domain, stored in `DomainInfo::cert_task` and aborted
   when that is dropped
 
@@ -70,20 +170,20 @@ the listener readable). `main` also raises `RLIMIT_NOFILE` to the hard limit at 
 
 ### Synchronization
 
-**Project-level:**
+**Per-server:**
 - `watch::channel<AppState>` - State broadcasting, requests wait via `wait_for()`
 - `mpsc::channel<StopReason>` - Stop signals (FileChange, Inactivity, ProcessExit, Shutdown)
-- `AtomicUsize` pending_requests - Tracks in-flight requests, triggers startup
-- `AtomicUsize` active_upgrades - Tracks active WebSocket/upgraded connections. Inactivity timeout only triggers when count is 0.
+- `AtomicU64` pending_requests - Tracks in-flight requests, triggers startup
+- `AtomicU64` active_upgrades - Tracks active WebSocket/upgraded connections. Inactivity timeout only triggers when count is 0.
 - `Notify` state_changed - Wakes lifecycle_task when pending_requests changes
 - `Mutex<Option<AppConnection>>` - Dynamic port/client per restart cycle
 - `Mutex<Instant>` last_activity - Tracks for inactivity timeout
-- `Mutex<Option<JoinHandle>>` watcher_task - For aborting file watcher
 
 **Server-level:**
 - `DashMap<String, DomainInfo>` - Concurrent domain → project mapping (lock-free reads)
 - `DomainInfo::project: Option<Arc<Project>>` - Per-domain project instance (None after deregister)
-- `deregister_project()` - Called from the file watcher callback and on Failed, sets project to None, next request creates new
+- `deregister_project_by_dir()` - Called from the config watcher before tearing a project down,
+  sets project to None so requests stop reaching the outgoing instance; next request creates new
 
 **Logger:** Internal mutex for concurrent writes, automatic log rotation on date change
 
@@ -91,20 +191,36 @@ the listener readable). `main` also raises `RLIMIT_NOFILE` to the hard limit at 
 
 **Graceful shutdown:** On stop signal, SIGTERM with 5s grace period then SIGKILL. Processes killed via reference to avoid racing with restart.
 
+**Process shutdown** listens for SIGINT *and* SIGTERM (systemd and `podman stop` send the latter),
+and `stop_all_projects` awaits each server's `wait_finished` - a watch flag the lifecycle task sets
+as it ends - under a 20s cap. Signalling without waiting exits before the lifecycle tasks run,
+which orphans every container permanently: nothing else ever stops them, and `--rm` only fires
+when the container itself exits.
+
 **Dynamic port allocation:** New port allocated on each startup cycle to avoid TIME_WAIT conflicts.
+Published as `127.0.0.1:<host>:<container>` - podman publishes IPv4 only, so anything addressing it
+as `localhost` would reach `::1` and fail.
+
+**Image preparation** happens when the service is declared, not when the first request arrives:
+`ensure_prepared` pulls or builds the image and settles which user the container runs as, caching
+both per service name. A start that lands mid-preparation waits on the same lock. Failures are not
+cached, so the next attempt retries.
+
+**Stopping** issues `podman stop --time 2` for each of the service's containers *before* signalling
+the `podman run` clients. Signalling the client alone is not enough: it forwards the signal and
+then waits for the container's own stop timeout, which outlasts the grace period - so the client
+gets killed and the container keeps running.
 
 **Process exit detection:** `wait_for_port_ready` polls `try_wait()` to detect early process exit during startup.
 
-**Firejail sandboxing** (when enabled, non-container):
-- Private /tmp and /dev
-- Read-only root, read-write project dir
-- Whitelist project directory only
-
-**Podman** (when `[podman]` is configured; `[docker]` is a config alias, docker itself is no longer
-supported), via `get_podman_path()`:
-- Custom Dockerfile generation: packages, build commands, and - for `user = project` - the project
-  owner appended to `/etc/passwd`+`/etc/group` followed by a `USER` directive
-- Image tagged `webcentral-<dir hash>:<hash of Dockerfile + base image ID>`, so an unchanged config
+**Podman** is the only way a service runs; there is no unsandboxed path. Via `get_podman_path()`:
+- Custom Dockerfile generation: packages, `copy`ed project files (into `/webcentral-build`, since
+  `/app` is shadowed by the run-time mount), build commands, and - for `user = project` - the
+  project owner appended to `/etc/passwd`+`/etc/group` followed by a `USER` directive
+- `copy` contents are hashed into the image tag and their paths added to `reload_include`, and a
+  file-change restart clears the `prepared` cache when a service copies anything - otherwise an
+  edited `requirements.txt` would go on running from the image built from the old one
+- Image tagged `webcentral-<hash of dir + server name>:<hash of Dockerfile + base image ID>`, so an unchanged config
   skips the build while a pulled base update still triggers one; after each build the project's
   stale sibling tags are removed (they are named, so `image prune` would never reclaim them)
 - Stale container of the same name force-removed before `run` (a container outliving its webcentral
@@ -112,7 +228,7 @@ supported), via `get_podman_path()`:
 - Port mapping from internal to host
 - Volume mounts for app dir and additional paths
 
-**Container user:** `[podman] user` only decides who the container runs as *inside*, defaulting
+**Container user:** a service's `user` only decides who the container runs as *inside*, defaulting
 (resolved at parse time) to `project` when `mount_app_dir` is on and `image` when it isn't.
 Under a root webcentral, `project` bakes the project owner into the image as a real user; under a
 non-root one it forces `--user 0:0`, since rootless podman's container root *is* the invoking
@@ -136,17 +252,33 @@ other ids to keep working - so an image that switches at runtime to a uid it doe
 (postgres-style root→999 entrypoints) writes as that uid; an explicit `user =` brings it under
 the invariant.
 
-**Workers:** Additional processes spawned alongside main application, share PORT env var
+**Sidecars:** Nested server declarations, spawned before their parent and killed with it. One
+without a `base` of its own inherits the parent's prepared image *and* its `env` (its own entries
+winning), which is what replaced the worker concept. A
+service and its sidecars share a private podman network (created on demand, never removed) on
+which each member carries a `<name>.internal` alias; nothing is published to the host and no
+addresses are injected into the environment - a peer is addressed by that name, and each
+container only learns its own port as `$PORT`. Only the parent's port is probed for readiness
 
 ### File Watching
 
-**Project-level:** Recursive watch on project directory
+Two levels, and which one sees a change decides what happens to the project:
 
-**Default excludes:** `_webcentral_data/**`, `node_modules/**`, `**/*.log`, `**/.*`, `data/**`, `log/**`, `logs/**`
+**Server files** (`reload_include`/`reload_exclude`, per service, defaulting to the project's
+`settings` and then to `DEFAULT_INCLUDES` - a whitelist of source directories, source extensions
+and dependency manifests, rather than everything, since a restart is disruptive and assets are
+re-read from disk anyway): each server is asked whether a changed path is its business, and
+the ones that say yes get `StopReason::FileChange` and restart from the new files on the next
+request. A pattern naming a directory covers its contents; the `include-exclude-watcher` crate's
+`Matcher` decides this, the same matching the watcher itself uses for its excludes.
 
-**Reload triggers:** Configurable includes/excludes, defaults to all files for applications, only config files for static/proxy
+**Default excludes:** `_webcentral_data/**`, `node_modules/**`, `**/*.log`, `**/*.bak`, `**/.*`,
+`data/**`, `log/**`, `logs/**`, plus the project files below.
 
-**On change:** The file watcher callback calls `deregister_project()` itself, then sends `StopReason::FileChange` to lifecycle_task/stop_listener, which tear down the old instance. Deregistering in the callback rather than in the receiving task closes the window in which requests would still be routed to the outgoing project. New project instance created on next request.
+**Project-defining files** (`webcentral.conf`, `Procfile`, `package.json`): watched centrally for
+all projects at once, since the script and the set of servers may both be different afterwards.
+The project is deregistered *before* being torn down, closing the window in which requests would
+still reach the outgoing instance; the next request builds a new one.
 
 **Server-level:** Non-recursive watch on project parent directories for domain additions/removals
 
@@ -154,16 +286,21 @@ the invariant.
 ### Test Infrastructure
 
 **test.py** - Python test harness that:
+- Builds `webcentral-test-base` (alpine + python3) once, and gives every `service` block that
+  names no `base`/`packages` that image plus a 5s `shutdown_time` - appended to the block's own
+  line, so diagnostics' line numbers stay put. Without it each test would build its own image and
+  leave a container running for five minutes
 - Creates temporary project directories
 - Starts webcentral with HTTP-only mode on random port
 - Provides helpers: `write_file`, `assert_http`, `await_log`, `assert_log`, `mark_log_read`
 - Automatically tracks log positions per-project for incremental reading
 - Shows log output on test failure, preserves test directory for inspection
 - Supports running individual tests or full suite
-- Can disable Firejail with `--firejail=false` flag
 
 **Test patterns:**
 - Each test auto-creates domain from test name: `test_foo_bar` → `foo-bar.test`
+- Domains are cheap but not free: each project with servers holds an inotify instance, and the
+  per-user cap is 128, so prefer asserting several things per domain over one domain per assertion
 - Create files: `t.write_file('path', 'content')` (auto-prefixed with test domain)
 - Mark logs read: `t.mark_log_read()` (defaults to test domain)
 - Wait for log: `t.await_log('text', timeout=2)` (defaults to test domain)
@@ -173,7 +310,7 @@ the invariant.
 ## Developers notes
 
 - Keep AGENTS.md up-to-date when making architectural changes. Be succinct—no repetition, no code examples, bullet points over paragraphs.
-- Build and test using `cargo build && ./test.py --firejail false` (or `--firejail true` if Firejail is installed). Builds default to musl target for static linking (configured in `.cargo/config.toml`).
+- Build and test using `cargo build && ./test.py`. Podman is required: every service is a container. Builds are native by default; release artifacts are built for musl by the release workflow.
 - For async task debugging, build with `cargo build --features console` and connect via `~/.cargo/bin/tokio-console` (install with `cargo install tokio-console`).
 - Run `./test.py` to execute the test suite. To run a single test: `./test.py test_name_of_test`. For new features, add tests in `test.py`. Don't create ad-hoc test scripts. When writing tests, you should not need to sleep (except in test-apps being run by webcentral to simulate loading times) - use `await_log` and/or `assert_http` instead. If a test fails, don't just work around it in the test code, but investigate deeply if there may be an actual bug (or unexpected behavior) in webcentral.
 - Add code comments only for explaining non-obvious logic, why things are done a certain way, and how thread-safety is ensured. Don't add comments describing what you're changing and why, as comments should reflect the final code, not the change history.

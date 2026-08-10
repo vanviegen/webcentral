@@ -1,0 +1,64 @@
+# Runs the test suite on every push and pull request.
+#
+# Releasing is a separate workflow that only fires on a version tag, so pushing a branch runs
+# these tests and publishes nothing.
+
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.mode }} podman
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two halves of the container-ownership invariant, neither of which exercises the
+        # other: a non-root webcentral uses rootless podman and `--userns=keep-id`, while a root
+        # one uses rootful podman, maps uids by hand and bakes the project owner into the image.
+        # Three tests skip in each mode, and they are not the same three.
+        mode: [rootless, root]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install podman
+        run: |
+          if ! command -v podman > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y podman
+          fi
+          podman --version
+          # Rootless podman needs a subordinate id range for the user invoking it.
+          user=$(id -un)
+          grep -q "^$user:" /etc/subuid \
+            || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$user"
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: |
+          if [ "${{ matrix.mode }}" = root ]; then
+            sudo --preserve-env=PATH ./test.py
+          else
+            ./test.py
+          fi
+
+      - name: Show logs of a failed run
+        if: failure()
+        run: |
+          for log in .test-tmp/*/_webcentral_data/log/*; do
+            echo "=== $log"
+            sudo tail -50 "$log" || true
+          done

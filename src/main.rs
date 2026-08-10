@@ -1,7 +1,11 @@
 mod acme;
+mod app_server;
+mod config;
+mod dashboard;
 mod logger;
+mod parser;
 mod project;
-mod project_config;
+mod script;
 mod server;
 mod streams;
 
@@ -23,10 +27,10 @@ pub struct Cli {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
-    /// Generate an argon2 password hash for use in [auth] config
-    Hash {
-        /// Password to hash
-        password: String,
+    /// Check a webcentral.conf without running anything, reporting every problem it finds
+    Check {
+        /// Project directory, or the configuration file itself. Defaults to the current directory.
+        path: Option<String>,
     },
 }
 
@@ -61,9 +65,6 @@ pub struct GlobalConfig {
 
     #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value = "true", default_missing_value = "true", help = "Auto-redirect www variants")]
     pub redirect_www: bool,
-
-    #[arg(long, value_parser = clap::value_parser!(bool), num_args = 0..=1, default_value = "true", default_missing_value = "true", help = "Use Firejail sandboxing")]
-    pub firejail: bool,
 
     #[arg(
         long,
@@ -251,20 +252,19 @@ async fn main() -> Result<()> {
     // Handle subcommands
     if let Some(ref command) = cli.command {
         match command {
-            Commands::Hash { password } => {
-                use argon2::{Argon2, PasswordHasher};
-                use argon2::password_hash::SaltString;
-                
-                // Generate random salt bytes and encode as SaltString
-                let mut salt_bytes = [0u8; 16];
-                rand::fill(&mut salt_bytes);
-                let salt = SaltString::encode_b64(&salt_bytes)
-                    .expect("Failed to encode salt");
-                let argon2 = Argon2::default();
-                let hash = argon2.hash_password(password.as_bytes(), &salt)
-                    .expect("Failed to hash password");
-                println!("{}", hash);
-                return Ok(());
+            Commands::Check { path } => {
+                let path = std::path::Path::new(path.as_deref().unwrap_or("."));
+                // Accept either the directory or the file, since both are natural to type.
+                let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+                let config = config::ProjectConfig::load(dir)?;
+                for error in &config.errors {
+                    println!("{}", error);
+                }
+                if config.errors.is_empty() {
+                    println!("{}: ok - {}", dir.display(), config.summary());
+                    return Ok(());
+                }
+                std::process::exit(1);
             }
         }
     }
@@ -288,12 +288,25 @@ async fn main() -> Result<()> {
     let server = Arc::new(server::Server::new(config).await?);
     server.clone().start().await?;
 
-    // Wait for shutdown signal
-    signal::ctrl_c().await?;
+    // SIGTERM is what systemd and `podman stop` send; SIGINT is ctrl-c at a terminal. Handling
+    // only the latter meant a service stop killed webcentral outright, leaving every container
+    // it had started running with nothing left to stop them.
+    let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = signal::ctrl_c() => result?,
+        _ = terminate.recv() => {}
+    }
     println!("\nReceived shutdown signal, stopping...");
 
     server.stop().await;
-    server::stop_all_projects();
+    // Bounded, so a container that refuses to stop cannot keep webcentral alive for ever - but
+    // waited for, because exiting first is what orphans them.
+    if tokio::time::timeout(std::time::Duration::from_secs(20), server::stop_all_projects())
+        .await
+        .is_err()
+    {
+        println!("Some services did not stop in time; their containers may still be running");
+    }
 
     println!("Shutdown complete");
 
