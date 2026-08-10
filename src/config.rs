@@ -187,7 +187,10 @@ pub struct ProjectConfig {
     /// The default reload rules for servers that declare none of their own.
     pub reload_include: Vec<String>,
     pub reload_exclude: Vec<String>,
+    /// Problems that stop something from working, which `webcentral check` fails on.
     pub errors: Vec<String>,
+    /// Things worth saying that the project still runs with, which it does not.
+    pub warnings: Vec<String>,
 }
 
 impl ProjectConfig {
@@ -224,7 +227,8 @@ impl ProjectConfig {
                 let detected = parse(&snippet, Some(dir));
                 config.servers = detected.servers;
                 config.errors.extend(detected.errors);
-                config.errors.extend(warnings);
+                config.warnings.extend(detected.warnings);
+                config.warnings.extend(warnings);
             }
         } else if config.servers.iter().any(|s| s.command.is_empty() && s.app_dir.is_some()) {
             // A declared service with no command and the project directory mounted runs the
@@ -235,7 +239,8 @@ impl ProjectConfig {
             let donor = auto_detect(dir).map(|(snippet, warnings)| {
                 let detected = parse(&snippet, Some(dir));
                 config.errors.extend(detected.errors.iter().cloned());
-                config.errors.extend(warnings);
+                config.warnings.extend(detected.warnings.iter().cloned());
+                config.warnings.extend(warnings);
                 detected.servers.into_iter().next()
             });
             let mut errors = Vec::new();
@@ -504,7 +509,7 @@ fn signature(verb: &str) -> Option<Signature> {
         "check_file" => CHECK_FILE,
         "forward" => FORWARD,
         "proxy" => PROXY,
-        "redirect" | "moved" => REDIRECT,
+        "redirect" => REDIRECT,
         "respond" => RESPOND,
         "check_auth" => CHECK_AUTH,
         "set_header" => SET_HEADER,
@@ -592,6 +597,7 @@ pub fn parse(source: &str, dir: Option<&Path>) -> ProjectConfig {
             reload_include: Vec::new(),
             reload_exclude: Vec::new(),
             errors: Vec::new(),
+            warnings: Vec::new(),
         },
         vars: Vars::default(),
         referenced: Vec::new(),
@@ -660,9 +666,9 @@ impl<'a> Builder<'a> {
         let diagnostics: Vec<Diagnostic> = std::mem::take(&mut self.scanner.errors);
         let mut errors: Vec<String> =
             diagnostics.iter().map(|d| format!("{}: {}", CONFIG_FILE, d)).collect();
-        errors.extend(warnings);
         errors.extend(std::mem::take(&mut self.config.errors));
         self.config.errors = errors;
+        self.config.warnings.extend(warnings);
         self.config
     }
 
@@ -1088,11 +1094,9 @@ impl<'a> Builder<'a> {
             "project_dashboard" => Some(Stmt::Dashboard { admin: false }),
             "admin_dashboard" => Some(Stmt::Dashboard { admin: true }),
 
-            "redirect" | "moved" => Some(Stmt::Redirect {
+            "redirect" => Some(Stmt::Redirect {
                 target: args.template("url")?,
-                status: args
-                    .status("status")
-                    .unwrap_or(if verb.text == "moved" { 301 } else { 302 }),
+                status: args.status("status").unwrap_or(302),
             }),
 
             "respond" => Some(Stmt::Respond {

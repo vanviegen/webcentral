@@ -88,8 +88,8 @@ impl Project {
         let logger = Arc::new(Logger::new(log_dir, uid, gid, prune_logs)?);
 
         logger.write("supervisor", &config.summary());
-        for error in &config.errors {
-            logger.write("supervisor", error);
+        for problem in config.errors.iter().chain(config.warnings.iter()) {
+            logger.write("supervisor", problem);
         }
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

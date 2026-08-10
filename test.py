@@ -672,9 +672,9 @@ else respond 418 "not a file request"
 
 @test
 def test_redirect_and_moved(t):
-    """redirect is a 302, moved a 301, and status= overrides either"""
+    """redirect is a 302 unless status= says otherwise"""
     t.write_file('webcentral.conf', '''
-match /old/(.*) moved https://example.com/new/${1}
+match /old/(.*) redirect https://example.com/new/${1} status=301
 match /tmp/(.*) redirect https://example.com/t/${1}
 match /odd/(.*) redirect https://example.com/o/${1} status=307
 ''')
@@ -1840,7 +1840,7 @@ with socketserver.TCPServer(("", PORT), Handler) as httpd:
 @test
 def test_redirect_configuration(t):
     """Test HTTP redirect configuration"""
-    t.write_file('webcentral.conf', 'match (.*) moved https://example.org${1}')
+    t.write_file('webcentral.conf', 'match (.*) redirect https://example.org${1} status=301')
 
     # Expect 301 redirect
     t.assert_http('/', check_code=301)
@@ -2096,7 +2096,7 @@ service {
     t.await_log('Stopping due to inactivity', timeout=3)
     t.mark_log_read()
     # Change config while idle: turn the project into a redirect
-    t.write_file('webcentral.conf', 'match (.*) moved http://example.com${1}')
+    t.write_file('webcentral.conf', 'match (.*) redirect http://example.com${1} status=301')
     t.await_log('(reloading configuration)', timeout=3)
     time.sleep(0.3)
     # Next request must use the NEW config (a 301 redirect), not restart the old app
@@ -3007,7 +3007,7 @@ def test_redirect_changes_to_app(t):
     # Start as redirect
     t.write_file('webcentral.conf',
                  '''
-match (.*) moved https://example.com${1}
+match (.*) redirect https://example.com${1} status=301
 ''')
     t.write_file('index.html', '<h1>App Content</h1>')
 
@@ -3051,7 +3051,7 @@ service {
     # Change to redirect
     t.write_file('webcentral.conf',
                  '''
-match (.*) moved https://example.org${1}
+match (.*) redirect https://example.org${1} status=301
 ''')
 
     # Should trigger reload

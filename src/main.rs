@@ -257,9 +257,11 @@ async fn main() -> Result<()> {
                 // Accept either the directory or the file, since both are natural to type.
                 let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
                 let config = config::ProjectConfig::load(dir)?;
-                for error in &config.errors {
-                    println!("{}", error);
+                for problem in config.errors.iter().chain(config.warnings.iter()) {
+                    println!("{}", problem);
                 }
+                // A warning is something worth saying about a project that works, so it is
+                // printed and then not held against it.
                 if config.errors.is_empty() {
                     println!("{}: ok - {}", dir.display(), config.summary());
                     return Ok(());

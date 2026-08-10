@@ -322,7 +322,7 @@ instead of a regex, and `anchored=false` matches anywhere in the value rather th
 ```ini
 match /admin/(.*) respond 403 Forbidden
 match POST subject=${method} respond 405 "read only"
-match old.example.com subject=${host} matcher=literal moved https://example.com${path}
+match old.example.com subject=${host} matcher=literal redirect https://example.com${path} status=301
 match /internal/ anchored=false matcher=literal respond 403 "not from outside"
 match .*\.test/health subject=${host}${path} respond 200 OK
 ```
@@ -417,12 +417,14 @@ match /socket/(.*) forward /run/app/app.sock
 match /images/(.*) proxy https://cdn.example.com
 ```
 
-#### redirect, moved
+#### redirect
 
-`redirect <url>` answers 302, `moved <url>` answers 301, and `status=` overrides either.
+`redirect <url>` answers 302 - `status=` names another, and `301` is the one worth reaching for
+deliberately, since browsers cache it indefinitely. `307` and `308` are there too, for a redirect
+that must not turn a POST into a GET.
 
 ```ini
-match /blog/(.*) moved https://blog.example.com/${1}
+match /blog/(.*) redirect https://blog.example.com/${1} status=301
 match /beta redirect /signup status=307
 ```
 
@@ -920,7 +922,7 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 ## Changelog
 
 2026-08-10 (3.0.0):
-  - **`webcentral.ini` is replaced by `webcentral.conf`**, a small configuration language. A project's requests are handled by a routing script run top to bottom - `match`, `serve`, `serve_dir`, `check_file`, `forward`, `proxy`, `respond` and friends - which subsumes what used to be fixed project types: a redirect project is now the one-line script `moved https://example.com`. The old format is not read; see **Configuration** above. Projects that need no configuration file (`public/`, `Procfile`, `package.json`) are unaffected
+  - **`webcentral.ini` is replaced by `webcentral.conf`**, a small configuration language. A project's requests are handled by a routing script run top to bottom - `match`, `serve`, `serve_dir`, `check_file`, `forward`, `proxy`, `respond` and friends - which subsumes what used to be fixed project types: a redirect project is now the one-line script `redirect https://example.com status=301`. The old format is not read; see **Configuration** above. Projects that need no configuration file (`public/`, `Procfile`, `package.json`) are unaffected
   - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. `webcentral check` parses a project without starting anything
   - **Everything runs in a container.** Firejail support is gone and with it the choice: one keyword, `service`, and podman as the only external dependency. A project can declare several, each with its own image, port, lifecycle and reload rules, each started only when a request is routed to it. A nested `service` is a *sidecar* sharing its parent's lifetime, image and environment - which is what replaced workers
   - **Authentication belongs to the application.** Basic auth, password hashes and the auth cookie are gone. What remains is `check_auth <secret>` for guarding a dashboard, and `X-Accel-Redirect`, which lets an application authorise a request and hand the delivery back to webcentral
