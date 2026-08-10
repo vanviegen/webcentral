@@ -979,7 +979,7 @@ impl AppServer {
             .await?;
 
         if !output.status.success() {
-            self.logger.write("podman", &String::from_utf8_lossy(&output.stderr));
+            self.log_build_output(&output);
             anyhow::bail!("Image build failed");
         }
 
@@ -1037,10 +1037,23 @@ impl AppServer {
             .output()
             .await?;
         if !output.status.success() {
-            self.logger.write("podman", &String::from_utf8_lossy(&output.stderr));
+            self.log_build_output(&output);
             anyhow::bail!("building {} failed", dockerfile);
         }
         Ok(image)
+    }
+
+    /// Everything a failed build said. The reason usually comes from the command that failed -
+    /// a package manager that could not reach its mirror, a compiler error - which podman writes
+    /// to stdout, while stderr carries only its own summary of which step failed. Logging just
+    /// the summary leaves the log saying that a step failed and never why.
+    fn log_build_output(&self, output: &std::process::Output) {
+        for stream in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(stream);
+            if !text.trim().is_empty() {
+                self.logger.write("podman", text.trim_end());
+            }
+        }
     }
 
     /// Home directory for the baked-in user. It lives in the project directory when that is
