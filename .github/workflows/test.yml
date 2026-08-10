@@ -49,19 +49,28 @@ jobs:
 
       - name: Test
         run: |
+          set -o pipefail
           # --require turns a skip into a failure, so a green run is proof the mode covered what
           # it exists to cover rather than quietly skipping it as the developer machine does.
           keepid=test_podman_user_override,test_podman_foreign_user_mapped_to_owner
           if [ "${{ matrix.mode }}" = root ]; then
-            sudo --preserve-env=PATH ./test.py --require "test_podman_bakes_owner_into_image,$keepid"
+            sudo --preserve-env=PATH ./test.py \
+              --require "test_podman_bakes_owner_into_image,$keepid" 2>&1 | tee test-output.log
           else
-            ./test.py --require "$keepid"
+            ./test.py --require "$keepid" 2>&1 | tee test-output.log
           fi
 
-      - name: Show logs of a failed run
+      - name: Report what failed
         if: failure()
         run: |
+          # As annotations, not just log lines: the API serves these without a token, so a failure
+          # is legible to anything that can reach the repository rather than only in the web UI.
+          sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\r//g' test-output.log \
+            | grep -aE '✗|Error:|At:|Required tests were skipped|assert' \
+            | tail -25 \
+            | while IFS= read -r line; do echo "::error::$line"; done
           for log in .test-tmp/*/_webcentral_data/log/*; do
-            echo "=== $log"
-            sudo tail -50 "$log" || true
+            [ -f "$log" ] || continue
+            echo "::error::--- $(basename "$(dirname "$(dirname "$log")")")"
+            sudo tail -15 "$log" | while IFS= read -r line; do echo "::error::$line"; done
           done
