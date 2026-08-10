@@ -235,23 +235,23 @@ These are always there, describing the request as it stands *now*:
 |---|---|
 | `${path}` | the request path, percent-encoded as it arrived |
 | `${query}` | everything after the `?`, without it |
-| `${uri}` | the two together, which is what a client asked for |
 | `${method}` | `GET`, `POST`, ... |
 | `${host}` | the `Host` header - what the client asked for |
 
-**The first three are the request, not a copy of it.** Reading `${path}` gives the path being
+**The first two are the request, not a copy of it.** Reading `${path}` gives the path being
 served; assigning it changes what gets served or forwarded, which is how a request is re-pointed:
 
 ```ini
 match /old/(.*) {
-  set path /new/${1}      # the query is left alone
+  set path /new/${1}                  # the query is left alone
   serve_dir public
 }
-match /legacy set uri /v2/index.html?legacy=1   # or replace both at once
+match /legacy set path /v2/index.html?legacy=1   # a path may carry its own query
+match /bare set path /clean?                     # ...and a lone `?` drops it
 ```
 
-`set query ""` drops a query string. The other request variables describe what arrived and cannot
-be assigned; `set` says so rather than pretending.
+`set query` changes the query on its own. The other request variables describe what arrived and
+cannot be assigned; `set` says so rather than pretending.
 | `${domain}` | the domain this project is registered under - what it really is |
 
 `set` names anything else. At the top of the file it doubles as a constant: the rest of the file

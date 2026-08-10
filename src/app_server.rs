@@ -37,6 +37,14 @@ pub enum AppState {
     Failed,
 }
 
+/// How an attempt to start ended: serving, given up on, or thrown away because the files moved
+/// under it.
+enum Startup {
+    Ready,
+    Failed,
+    Aborted,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum StopReason {
     FileChange,
@@ -328,45 +336,57 @@ impl AppServer {
 
                     let deadline =
                         tokio::time::Instant::now() + Duration::from_secs(self.config.startup_time);
-                    let ready = loop {
+                    let outcome = loop {
                         tokio::select! {
                             reason = stop_rx.recv() => {
                                 self.kill_processes(&mut children).await;
                                 match reason {
-                                    Some(StopReason::Shutdown) => {
+                                    Some(StopReason::Shutdown) | None => {
                                         self.log("Shutdown during startup");
                                         return;
                                     }
-                                    Some(StopReason::FileChange) => {
-                                        self.log("File change during startup");
-                                        return;
-                                    }
-                                    _ => break false,
+                                    // Not a failure and not the end of this server: the files it
+                                    // was starting from are stale, so go back to Stopped and let
+                                    // the next request start it from the new ones. Returning here
+                                    // ended the lifecycle task, which left the service unable to
+                                    // start ever again - and a change landing during startup is
+                                    // ordinary, since a deploy writes the files that triggered
+                                    // the project to load in the first place.
+                                    Some(StopReason::FileChange) => break Startup::Aborted,
+                                    _ => break Startup::Failed,
                                 }
                             }
                             status = async { children.first_mut().unwrap().wait().await } => {
                                 self.log(&format!("Process exited during startup: {:?}", status));
-                                break false;
+                                break Startup::Failed;
                             }
                             ready = self.probe_port() => {
                                 if ready {
-                                    break true;
+                                    break Startup::Ready;
                                 } else if tokio::time::Instant::now() >= deadline {
                                     self.log(&format!(
                                         "Port did not become ready within {}s",
                                         self.config.startup_time));
-                                    break false;
+                                    break Startup::Failed;
                                 }
                                 sleep(Duration::from_millis(50)).await;
                             }
                         }
                     };
 
-                    if !ready {
-                        self.log("Startup failed; terminating and giving up");
-                        self.kill_processes(&mut children).await;
-                        let _ = self.state_tx.send(AppState::Failed);
-                        continue;
+                    match outcome {
+                        Startup::Ready => {}
+                        Startup::Aborted => {
+                            self.log("File change during startup; starting again on the next request");
+                            let _ = self.state_tx.send(AppState::Stopped);
+                            continue;
+                        }
+                        Startup::Failed => {
+                            self.log("Startup failed; terminating and giving up");
+                            self.kill_processes(&mut children).await;
+                            let _ = self.state_tx.send(AppState::Failed);
+                            continue;
+                        }
                     }
 
                     let port = self.port().unwrap_or(0);

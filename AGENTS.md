@@ -86,7 +86,7 @@ their values in the log.
 
 ### Request handling
 
-`script::run` walks the statements against the request, mutating its URI when `path`/`query`/`uri`
+`script::run` walks the statements against the request, mutating its URI when `path` or `query`
 are assigned and collecting response headers, and returns a `Terminal` describing what should
 answer:
 a ready `Response`, or a `ServeApp`/`Forward`/`Proxy` for `project.rs` to perform with the request
@@ -108,9 +108,10 @@ headers carried onto the final one; one redirect per request, no chains.
 Variables are one flat `Vars` map per request, cloned from the constants the file's top-level
 `set` statements defined. `match` writes the groups it captured (only those it has, so a nested
 match that captures nothing leaves its parent's `$1` alone), `set` writes what it is given, and
-`path`/`query`/`uri`/`method`/`host` are refreshed whenever the request changes. Those first three
-*are* the request: `set path`, `set query` and `set uri` re-point what is served or forwarded
-(`script::set_target`), while the rest are read-only and `set` refuses them. Last write wins; there
+`path`/`query`/`method`/`host` are refreshed whenever the request changes. The first two *are* the
+request: `set path` and `set query` re-point what is served or forwarded (`script::set_target`),
+and a path may carry its own `?query` - a lone `?` drops it. The rest are read-only and `set`
+refuses them. Last write wins; there
 is no scope. Single-quoted parts of a word are recorded as literal spans by the scanner, so the
 template parser can leave their `$` alone.
 

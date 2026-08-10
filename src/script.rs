@@ -9,9 +9,9 @@
 //!
 //! Variables are one flat map per request, seeded with the constants the file's top-level `set`
 //! statements defined. `match` writes the groups it captured into it, and the request's own
-//! `path`, `query`, `uri`, `method` and `host` are there from the start. The first three *are* the
-//! request rather than a copy: assigning one re-points what gets served or forwarded, which is
-//! what `set_target` does. Last write wins; there is no scope to reason about.
+//! `path`, `query`, `method` and `host` are there from the start. The first two *are* the request
+//! rather than a copy: assigning one re-points what gets served or forwarded, which is what
+//! `set_target` does, and a path may carry its own `?query`. Last write wins; there is no scope to reason about.
 
 use crate::logger::Logger;
 use crate::parser::Word;
@@ -231,11 +231,6 @@ impl Vars {
     fn set_request<B>(&mut self, req: &Request<B>) {
         self.set("path", req.uri().path());
         self.set("query", req.uri().query().unwrap_or(""));
-        // The request target as one string, which is what `${uri}` reads and writes.
-        self.set(
-            "uri",
-            req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"),
-        );
         self.set("method", req.method().as_str());
         // The URI's authority, not the Host header: HTTP/2 and HTTP/3 carry the name in
         // `:authority` and send no Host header at all, and the listener folds the HTTP/1.1 Host
@@ -357,7 +352,7 @@ impl<'a> Run<'a> {
                 // request, so assigning one changes what gets served or forwarded. Everything
                 // else is an ordinary variable.
                 match name.as_str() {
-                    "path" | "query" | "uri" => {
+                    "path" | "query" => {
                         set_target(req, name, &rendered)?;
                         self.vars.set_request(req);
                     }
@@ -702,28 +697,26 @@ pub fn resolve_request_path(base: &Path, path: &str, index: &str) -> Option<Path
     Some(resolved)
 }
 
-/// Assign one of the request's own variables, which changes the request itself. `path` and
-/// `query` each leave the other alone; `uri` is the two together, for when a whole target is
-/// being replaced at once.
+/// Assign one of the request's own variables, which changes the request itself. A path may carry
+/// its own `?query`, the way a link does - `set path /x` leaves the query alone, `set path /x?a=b`
+/// replaces it, and `set path /x?` drops it. `set query` changes only that.
 fn set_target<B>(req: &mut Request<B>, name: &str, value: &str) -> Result<()> {
     let path_and_query = match name {
         "path" => {
-            check_target(name, value, &['?', '#'])?;
-            match req.uri().query() {
-                Some(query) => format!("{}?{}", value, query),
-                None => value.to_string(),
+            check_target(name, value)?;
+            match (value.split_once('?'), req.uri().query()) {
+                // A query written into the path replaces whatever was there, empty included.
+                (Some(_), _) => value.to_string(),
+                (None, Some(query)) => format!("{}?{}", value, query),
+                (None, None) => value.to_string(),
             }
         }
-        "query" => {
-            check_target(name, value, &['#'])?;
+        _ => {
+            check_target(name, value)?;
             match value.is_empty() {
                 true => req.uri().path().to_string(),
                 false => format!("{}?{}", req.uri().path(), value),
             }
-        }
-        _ => {
-            check_target(name, value, &['#'])?;
-            value.to_string()
         }
     };
     let mut parts = req.uri().clone().into_parts();
@@ -734,19 +727,14 @@ fn set_target<B>(req: &mut Request<B>, name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// What a request target may not contain, checked before the URI parser sees something it would
-/// accept for the wrong reason - a `?` in a path would silently become a query, not a path.
-fn check_target(name: &str, value: &str, forbidden: &[char]) -> Result<()> {
-    if name != "query" && !value.starts_with('/') {
-        anyhow::bail!("'set {} {}' must start with '/'", name, value);
+/// A fragment never reaches a server, so one in a target can only be a mistake, and a path has to
+/// start at the root to be one at all.
+fn check_target(name: &str, value: &str) -> Result<()> {
+    if name == "path" && !value.starts_with('/') {
+        anyhow::bail!("'set path {}' must start with '/'", value);
     }
-    if let Some(bad) = forbidden.iter().find(|c| value.contains(**c)) {
-        anyhow::bail!(
-            "'set {} {}' must not contain '{}' - set the parts separately, or assign to 'uri'",
-            name,
-            value,
-            bad
-        );
+    if value.contains('#') {
+        anyhow::bail!("'set {} {}' must not contain '#'", name, value);
     }
     Ok(())
 }

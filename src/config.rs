@@ -24,8 +24,8 @@ use std::path::Path;
 
 pub const CONFIG_FILE: &str = "webcentral.conf";
 
-/// Request variables that only ever describe what arrived, so `set` refuses them. `path`, `query`
-/// and `uri` are deliberately absent: assigning those is how a request is re-pointed.
+/// Request variables that only ever describe what arrived, so `set` refuses them. `path` and
+/// `query` are deliberately absent: assigning those is how a request is re-pointed.
 const READ_ONLY_VARS: &[&str] =
     &["method", "host", "domain", "redirected_from", "redirected_by"];
 
@@ -598,7 +598,6 @@ pub fn parse(source: &str, dir: Option<&Path>) -> ProjectConfig {
         defined: [
             "path",
             "query",
-            "uri",
             "method",
             "host",
             "domain",
@@ -1044,23 +1043,12 @@ impl<'a> Builder<'a> {
                 }
                 let value = args.template("value")?;
                 // A literal target can be checked now rather than on every request.
-                if matches!(name.text.as_str(), "path" | "uri") {
+                if name.text == "path" {
                     if let Some(literal) = value.as_literal() {
                         if !literal.starts_with('/') {
                             self.scanner.error_at(
                                 name.pos,
-                                format!("'set {} {}' must start with '/'", name.text, literal),
-                            );
-                            return None;
-                        }
-                        if name.text == "path" && literal.contains('?') {
-                            self.scanner.error_at(
-                                name.pos,
-                                format!(
-                                    "'set path {}' must not contain '?' - set 'query' as well, \
-                                     or assign the whole target to 'uri'",
-                                    literal
-                                ),
+                                format!("'set path {}' must start with '/'", literal),
                             );
                             return None;
                         }

@@ -1153,6 +1153,48 @@ service {
 
 
 @test
+def test_file_change_during_startup_restarts_rather_than_dies(t):
+    """A change landing mid-startup must leave the service startable, not end its lifecycle.
+
+    This is ordinary rather than exotic: the very writes that make webcentral notice a project
+    are reported by the file watcher just after it loads, so a service can be stopped while it
+    is still coming up. Ending the lifecycle task there left it unable to ever start again, and
+    the next request hung until the client gave up.
+    """
+    t.write_file('app.py', _echo_server('app'))
+    t.write_file('webcentral.conf',
+                 'service {\n  command = python3 -u app.py --port $PORT\n}')
+    t.assert_http('/', check_body='app says /')
+    t.mark_log_read()
+
+    # Stop it, then change a source file the instant it starts coming up again
+    import threading
+    started = threading.Event()
+
+    def touch_when_starting():
+        for _ in range(100):
+            if 'Starting' in t.get_log_content(t.current_test_domain,
+                                               t.log_positions[t.current_test_domain]):
+                t.write_file('app.py', _echo_server('app v2'))
+                started.set()
+                return
+            time.sleep(0.05)
+
+    t.write_file('app.py', _echo_server('app'))
+    t.await_log('Stopping due to file changes')
+    watcher = threading.Thread(target=touch_when_starting)
+    watcher.start()
+    # This request restarts it, and the thread above changes a file while it does
+    t.assert_http('/', check_code=None, timeout=30)
+    watcher.join(timeout=10)
+
+    # Whatever the interleaving, the service must still answer: either the first start won the
+    # race, or it was thrown away and the next request started it again. Which version answers
+    # depends on that timing, so only the answering matters here.
+    t.assert_http('/', check_body='says /', timeout=30)
+
+
+@test
 def test_check_file(t):
     """check_file commits to a file before serving it, so headers can be set only when it exists"""
     t.write_file('static/app.js', 'console.log(1)')
@@ -1205,20 +1247,26 @@ match /drop {
   respond 200 "query is now '${query}'"
 }
 match /whole {
-  set uri /elsewhere?a=b
+  set path /elsewhere?a=b
   respond 200 "${path} and ${query}"
 }
-respond 200 "uri is ${uri}"
+match /clear {
+  set path /bare?
+  respond 200 "${path} and '${query}'"
+}
+respond 200 "${path} and '${query}'"
 """)
 
     # Assigning the path changes what serve_dir resolves
     t.assert_http('/old/target', check_body='the target')
     # The query survives a path assignment, and can be cleared on its own
     t.assert_http('/drop?a=1', check_body="query is now ''")
-    # uri sets both at once
+    # A path that carries its own query replaces both at once
     t.assert_http('/whole?keep=me', check_body='/elsewhere and a=b')
-    # ...and reads back as the whole target
-    t.assert_http('/plain?x=1', check_body='uri is /plain?x=1')
+    # ...and a bare `?` drops the query while changing the path
+    t.assert_http('/clear?keep=me', check_body="/bare and ''")
+    # Untouched, they are what arrived
+    t.assert_http('/plain?x=1', check_body="/plain and 'x=1'")
 
 
 @test
@@ -1228,13 +1276,11 @@ def test_request_variables_are_guarded(t):
     t.write_file('webcentral.conf', """
 set method POST
 set path no-leading-slash
-set path /has?query=here
 serve_dir public
 """)
     t.assert_http('/', check_body='shell')
     t.await_log("'method' describes the request as it arrived and cannot be set")
     t.assert_log("'set path no-leading-slash' must start with '/'", count=1)
-    t.assert_log("'set path /has?query=here' must not contain '?'", count=1)
 
 
 @test
@@ -1726,7 +1772,7 @@ while True:
     t.mark_log_read()
     t.write_file('trigger.py', '# trigger reload')
     
-    # Should see the file change stop and deregister
+    # The startup is thrown away rather than finished with stale files...
     t.await_log('Stopping due to file changes', timeout=3)
     t.await_log('File change during startup', timeout=3)
     
@@ -3318,11 +3364,12 @@ def test_websocket_proxy(t):
         client.close()
 
     # Verify that the backend received and echoed all messages by checking logs
-    t.await_log(f"Echoed: {message1}", timeout=2)
-    t.assert_log(f"Echoed: {message2}", count=1)
-    t.assert_log(f"Echoed: {message3}", count=1)
-    t.assert_log(f"Echoed: {message4}", count=1)
-    t.assert_log(f"Echoed: {message5}", count=1)
+    # The client already has every reply, but the app's stdout reaches the log through a
+    # streaming task, so wait for the last line rather than assuming they have all landed.
+    # They share one stream, so the earlier ones are there once the last one is.
+    t.await_log(f"Echoed: {message5}", timeout=5)
+    for message in (message1, message2, message3, message4):
+        t.assert_log(f"Echoed: {message}", count=1)
 
 
 @test
