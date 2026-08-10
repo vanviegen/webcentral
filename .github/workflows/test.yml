@@ -69,8 +69,12 @@ jobs:
             | grep -aE '✗|Error:|At:|Required tests were skipped|assert' \
             | tail -25 \
             | while IFS= read -r line; do echo "::error::$line"; done
+          # Only the logs that actually say something went wrong, and enough of them to see what:
+          # a build failure puts the package manager's own output here, which is the part worth
+          # reading and the first thing a 15-line tail loses.
           for log in .test-tmp/*/_webcentral_data/log/*; do
             [ -f "$log" ] || continue
+            sudo grep -qiE 'error|failed|not found' "$log" || continue
             echo "::error::--- $(basename "$(dirname "$(dirname "$log")")")"
-            sudo tail -15 "$log" | while IFS= read -r line; do echo "::error::$line"; done
+            sudo tail -60 "$log" | cut -c1-400 | while IFS= read -r line; do echo "::error::$line"; done
           done
