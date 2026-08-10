@@ -410,8 +410,15 @@ class TestRunner:
         self.tests.append(func)
         return func
 
-    def run(self, test_names=None):
-        """Run all registered tests or specific ones if test_names provided"""
+    def run(self, test_names=None, required=()):
+        """Run all registered tests or specific ones if test_names provided.
+
+        `required` names tests that must actually run: a skip there means the environment cannot
+        exercise something we expect it to, which is a failure rather than a note. It is how CI
+        proves it covered the paths this machine cannot.
+        """
+        required = set(required)
+        skipped_names = []
         # Filter tests if specific names provided
         tests_to_run = self.tests
         if test_names:
@@ -462,6 +469,7 @@ class TestRunner:
                     print(f"{CLEAR_LINE}{GREEN}{CHECKMARK}{RESET} {test_name}")
                 except SkipTest as e:
                     skipped += 1
+                    skipped_names.append(test_name)
                     print(f"{CLEAR_LINE}{YELLOW}-{RESET} {test_name} {GRAY}(skipped: {e}){RESET}")
                 except Exception as e:
                     print(f"{CLEAR_LINE}{RED}{CROSSMARK}{RESET} {test_name}")
@@ -483,6 +491,10 @@ class TestRunner:
                     failed = True
                     break
 
+            missing = sorted(required.intersection(skipped_names))
+            if missing:
+                failed = True
+                print(f"\n{RED}Required tests were skipped:{RESET} {', '.join(missing)}")
             if not failed:
                 suffix = f" ({skipped} skipped)" if skipped else ""
                 print(f"\n{GREEN}All {len(tests_to_run) - skipped} tests passed!{RESET}{suffix}")
@@ -4305,9 +4317,12 @@ service {
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run webcentral tests')
     parser.add_argument('test_names', nargs='*', help='Specific test names to run')
+    parser.add_argument('--require', default='',
+                        help='Comma-separated tests that must run; skipping one fails the run')
 
     args = parser.parse_args()
 
     # Run tests
     test_names = args.test_names if args.test_names else None
-    runner.run(test_names)
+    required = [name for name in args.require.split(',') if name]
+    runner.run(test_names, required)
