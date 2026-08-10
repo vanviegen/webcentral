@@ -86,16 +86,18 @@ their values in the log.
 
 ### Request handling
 
-`script::run` walks the statements against the request, mutating its URI for `rewrite` and
-collecting response headers, and returns a `Terminal` describing what should answer:
+`script::run` walks the statements against the request, mutating its URI when `path`/`query`/`uri`
+are assigned and collecting response headers, and returns a `Terminal` describing what should
+answer:
 a ready `Response`, or a `ServeApp`/`Forward`/`Proxy` for `project.rs` to perform with the request
 body it still owns. Keeping the body out of the interpreter is what lets the same script drive
 both ordinary requests and protocol upgrades.
 
-Four statements are fallible (`match`, `check_auth`, `try_serve_file`, `try_serve_dir`) and carry
-an optional `else` branch, attached at parse time to the statement it follows. Everything else is
-terminal or a modifier. An implicit tail (`serve` / `serve_dir public` / 404) is appended to every
-script.
+Three statements are conditionals (`match`, `check_auth`, `check_file`) and carry an optional
+`else` branch, attached at parse time to the statement it follows. `serve_file`/`serve_dir` take
+`fallthrough=true` instead of declining into an `else`, so what a statement does is legible from
+the statement rather than from a branch below it. Everything else is terminal or a modifier. An
+implicit tail (`serve` / `serve_dir public` / 404) is appended to every script.
 
 Request and response bodies are streamed end to end (`retry_canceled_requests` is off, since a
 partly-sent streamed body can never be replayed). An upstream response carrying
@@ -106,8 +108,10 @@ headers carried onto the final one; one redirect per request, no chains.
 Variables are one flat `Vars` map per request, cloned from the constants the file's top-level
 `set` statements defined. `match` writes the groups it captured (only those it has, so a nested
 match that captures nothing leaves its parent's `$1` alone), `set` writes what it is given, and
-`$path`/`$query`/`$method`/`$host` are refreshed after every `rewrite`. Last write wins; there is
-no scope. Single-quoted parts of a word are recorded as literal spans by the scanner, so the
+`path`/`query`/`uri`/`method`/`host` are refreshed whenever the request changes. Those first three
+*are* the request: `set path`, `set query` and `set uri` re-point what is served or forwarded
+(`script::set_target`), while the rest are read-only and `set` refuses them. Last write wins; there
+is no scope. Single-quoted parts of a word are recorded as literal spans by the scanner, so the
 template parser can leave their `$` alone.
 
 ### State Machine
@@ -229,7 +233,8 @@ gets killed and the container keeps running.
 - Volume mounts for app dir and additional paths
 
 **Container user:** a service's `user` only decides who the container runs as *inside*, defaulting
-(resolved at parse time) to `project` when `mount_app_dir` is on and `image` when it isn't.
+(resolved at parse time) to `project` when the project directory is mounted (`app_dir` is not
+`none`) and `image` when it isn't.
 Under a root webcentral, `project` bakes the project owner into the image as a real user; under a
 non-root one it forces `--user 0:0`, since rootless podman's container root *is* the invoking
 user (and a base image's own USER must not sneak in an unmapped uid). `image` keeps what the

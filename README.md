@@ -111,7 +111,7 @@ That still applies when a `webcentral.conf` is present but never says how to ans
 a file that only sets `log_requests` doesn't stop a `Procfile` from being picked up.
 
 It even applies to a declared `service` that names no `command` (while the project directory is
-mounted, the default): the command - and any `worker:` lines - are taken from the `Procfile` or
+mounted, the default): the command (and any `worker:` lines) are taken from the `Procfile` or
 `package.json`, so detection can be *tuned* rather than given up:
 
 ```
@@ -121,7 +121,7 @@ service {                # next to a Procfile with a `web:` line
 ```
 
 A mounted service with no command and nothing to detect one from is reported as an error; set
-`mount_app_dir = false` if the image's own entrypoint is what should run.
+`app_dir = none` if the image's own entrypoint is what should run.
 
 Run `webcentral check` in a project directory to parse its configuration and print every problem
 found, without starting anything.
@@ -146,35 +146,58 @@ There are two kinds of statement:
   request.
 
 ```ini
-service {
+service {  # defines the 'default' service
   packages = nodejs npm
   command = npm start
 }
 
 match /api/(.*) {
-  rewrite /v2/${1}
-  serve
+  set path /v2/${1}
+  serve  # handled by the 'default' service
 }
-try_serve_dir public
-else serve
+serve_dir public fallthrough=true
+serve  # handled by the 'default' service
 ```
 
 ### Words and quoting
 
-A word runs until whitespace. Every character is ordinary - `$`, `=`, `{2}`, `#` mid-word - so
-regexes, URLs and version constraints need no quoting at all. Two kinds of quote exist for the cases
-that do:
+A word runs until whitespace. Almost every character is ordinary - `$`, `{`, `#` mid-word, and a
+backslash - so regexes, URLs and version constraints need no quoting at all. Two kinds of quote
+exist for the cases that do:
 
-| | Use it for | `${...}` inside |
-|---|---|---|
-| `"double"` | whitespace, a leading `#`, a `=` that isn't an argument separator | substituted |
-| `'single'` | the same, when the text must survive exactly as written | left alone |
+| | Use it for | `${...}` inside | Backslash inside |
+|---|---|---|---|
+| `"double"` | whitespace, a leading `#`, an `=` that isn't an argument separator | substituted | escapes `\n` `\t` `\r` `\"` `\\`; anything else is an error |
+| `'single'` | the same, when the text must survive exactly as written | left alone | an ordinary character |
 
-Quotes glue onto the rest of the word, like a shell: `header="Bearer ${token}"` is one word.
+Quotes glue onto the rest of the word, like a shell, so a word can be part bare and part quoted.
+**Where the quotes fall decides what the word means**, because only an `=` written *outside* them
+separates a name from a value:
 
 ```ini
-match /search/(.*) respond 200 "you searched for ${1}" type=text/plain
-match /help respond 200 'costs ${5}, literally'
+set token whatever-the-upstream-wants
+
+set_header Authorization "Bearer ${token}"      # a value with a space in it
+match /html respond 200 body type=text/html     # `type` is a named argument
+match /text respond 200 "type=text/html"        # the body is the text `type=text/html`
+```
+
+To put a quote inside a word, either switch quote style or escape it:
+
+```ini
+match /a respond 200 'say "hi"'          # double quotes inside single ones
+match /b respond 200 "she said \"hi\""    # or escaped inside double ones
+match /c respond 200 "it's fine"         # an apostrophe inside double quotes
+match /d respond 200 'it'"'"'s'          # ...and glued segments in a single-quoted word
+```
+
+Single quotes have no escapes at all, which is what makes them right for regexes and hashes -
+and why **a regex should never be double-quoted**: `"\.css$"` fails, because `\.` is not an
+escape webcentral knows. Leave it bare, or use single quotes:
+
+```ini
+match \.css$ anchored=false set_header Cache-Control immutable
+match '\.(png|jpg)$' anchored=false set_header Cache-Control immutable
 ```
 
 ### Arguments
@@ -206,15 +229,29 @@ regex end in `$`, a price be `$5`, and a `command` keep `$PORT`, `$HOME` and `$$
 is handed to - with nothing to escape anywhere. To write a literal `${`, single-quote it:
 `respond 200 'costs ${5}'`.
 
-These are always there. The first four describe the request as it stands *now*, after any
-`rewrite`:
+These are always there, describing the request as it stands *now*:
 
 | | |
 |---|---|
 | `${path}` | the request path, percent-encoded as it arrived |
 | `${query}` | everything after the `?`, without it |
+| `${uri}` | the two together, which is what a client asked for |
 | `${method}` | `GET`, `POST`, ... |
 | `${host}` | the `Host` header - what the client asked for |
+
+**The first three are the request, not a copy of it.** Reading `${path}` gives the path being
+served; assigning it changes what gets served or forwarded, which is how a request is re-pointed:
+
+```ini
+match /old/(.*) {
+  set path /new/${1}      # the query is left alone
+  serve_dir public
+}
+match /legacy set uri /v2/index.html?legacy=1   # or replace both at once
+```
+
+`set query ""` drops a query string. The other request variables describe what arrived and cannot
+be assigned; `set` says so rather than pretending.
 | `${domain}` | the domain this project is registered under - what it really is |
 
 `set` names anything else. At the top of the file it doubles as a constant: the rest of the file
@@ -266,8 +303,10 @@ otherwise silently be empty, which is a typo far more often than it is intent.
 ### Routing statements
 
 Each of these decides something about the request. Most are **terminal** - they answer, and the
-script stops. `match`, `try_serve_file` and `try_serve_dir` may instead *decline*, in which case
-the script carries on with the next statement, or with an `else` branch if there is one.
+script stops. The three *conditionals* - `match`, `check_auth` and `check_file` - run their body
+when they hold and otherwise take an `else` branch, if one follows, or carry on with the next
+statement. `serve_file` and `serve_dir` answer 404 when they find nothing, unless
+`fallthrough=true` tells them to leave the request to the statements below instead.
 
 An implicit tail is appended to every script: `serve` if a service named `default` exists,
 otherwise `serve_dir public` if that directory exists, otherwise a 404.
@@ -295,19 +334,17 @@ inline body belongs to the `match`, and a block is how you attach it to somethin
 
 ```ini
 match /files/(.*) {
-  try_serve_file uploads/${1}
-  else respond 404 "no such upload"
+  serve_file uploads/${1} fallthrough=true
+  respond 404 "no such upload"
 }
 else respond 400 "not a file request"
 ```
 
-#### rewrite
-
-`rewrite <path>` changes the request path. Everything after it - including `${path}` - sees the new
+#### set path `set path <path>` changes the request path. Everything after it - including `${path}` - sees the new
 one, and the query string is kept unless the new path brings its own.
 
 ```ini
-match /v1/(.*) rewrite /api/${1}
+match /v1/(.*) set path /api/${1}
 ```
 
 #### serve
@@ -323,23 +360,42 @@ service {
 serve
 ```
 
-#### serve_dir, try_serve_dir
+#### serve_dir
 
 `serve_dir <dir>` serves the request path from below `<dir>`. A directory serves its `index.html`
-(`index=` names another) and, reached without a trailing slash, redirects to one. `try_serve_dir`
-declines instead of answering 404 - which is the whole single-page-application idiom:
+(`index=` names another) and, reached without a trailing slash, redirects to one. With
+`fallthrough=true` a missing file leaves the request to whatever follows instead of answering
+404 - which is the whole single-page-application idiom:
 
 ```ini
-try_serve_dir public
+serve_dir public fallthrough=true
 serve_file public/index.html
 ```
 
-#### serve_file, try_serve_file
+#### serve_file
 
-`serve_file <file>` serves exactly that file, whatever the request path was.
+`serve_file <file>` serves exactly that file, whatever the request path was, and takes the same
+`fallthrough=true`.
 
 ```ini
 match /robots.txt serve_file config/robots-production.txt
+```
+
+#### check_file
+
+`check_file <path>` runs its body only when that file exists, which is how a decision is made
+once and then acted on - setting a header that should not be left behind when the file turns out
+to be missing:
+
+```ini
+match /static/(.*) {
+  set candidate static/${1}.br
+  check_file ${candidate} {
+    set_header Content-Encoding br
+    serve_file ${candidate}
+  }
+  serve_file static/${1}
+}
 ```
 
 #### forward
@@ -503,8 +559,7 @@ service {                         # no name, so it is called "default"
 | `copy` | Project files to put in the image before `build` runs, so it can use them (`copy = requirements.txt`). Paths are relative to the project and may not leave it. Editing one rebuilds the image and restarts the service. |
 | `port` | The port the command listens on inside the container. Default `8000`. |
 | `mounts` | Directories that outlive the container, kept in `_webcentral_data/mounts/`. Relative paths are under `app_dir`. |
-| `app_dir` | Where the project directory is mounted. Default `/app`. |
-| `mount_app_dir` | Set `false` to not mount the project directory at all. |
+| `app_dir` | Where the project directory is mounted. Default `/app`; `none` mounts nothing, for images that carry the application themselves. |
 | `user` | Who the container runs as *inside* - see **Container user** below. |
 | `shutdown_time` | Idle time before stopping again. `0` keeps it running. Default `300` (seconds; `90s`, `5m` and `2h` also work). |
 | `startup_time` | How long to wait for the port to answer before giving up. Default `60`. |
@@ -670,7 +725,7 @@ service { command = ./app }
 
 match /files/(.*) {
   # Only reachable via the app, which checks who is asking before redirecting here
-  match default subject=${redirected_by} matcher=literal try_serve_dir storage
+  match default subject=${redirected_by} matcher=literal serve_dir storage fallthrough=true
   respond 403
 }
 serve
@@ -698,7 +753,7 @@ service {
     base = postgres:16
     port = 5432
     user = 999:999
-    mount_app_dir = false
+    app_dir = none
     mounts = /var/lib/postgresql/data
     env {
       POSTGRES_PASSWORD = ${DB_PASSWORD}
@@ -769,7 +824,7 @@ service app {
     base = postgres:16
     port = 5432
     user = 999:999          # what the postgres image switches to at run time
-    mount_app_dir = false
+    app_dir = none
     mounts = /var/lib/postgresql/data
     env { POSTGRES_PASSWORD = ${DB_PASSWORD} }
   }
@@ -865,41 +920,15 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 ## Changelog
 
 2026-08-10 (3.0.0):
-  - **Everything runs in a container now.** Firejail support is gone and so is the choice: one keyword, `service`, and podman as the only external dependency. The base image is `alpine`, with `packages` adding to it in a layer podman caches across projects
-  - A service's image is prepared - pulled or built, and its user resolved - as soon as the file is read, rather than when the first request is waiting on it. A request that does arrive mid-build waits for that same build instead of starting another
-  - Fix services being unreachable on hosts with IPv6: published ports are IPv4-only, while `localhost` resolves to `::1` first. Ports are now published on `127.0.0.1` and addressed that way
-  - Fix containers being left running when a service stopped: signalling the `podman run` client makes it wait for the container's own stop timeout, which outlasted the grace period, so the client was killed and the container went on running
-  - **`webcentral.ini` is replaced by `webcentral.conf`**, a small configuration language rather than a set of typed keys. The old format is not read; see **Configuration** above for the new one. Projects that need no configuration file (`public/`, `Procfile`, `package.json`) are unaffected
-  - A project can declare **any number of servers**, each with its own name, sandbox, port, idle timeout and workers. Each starts on demand the first time a request is routed to it, so a project can front several applications without paying for the ones nobody asked for
-  - Requests are handled by a **routing script** run top to bottom: `match` on path, method or host, then `rewrite`, `serve`, `serve_dir`, `serve_file`, `forward`, `proxy`, `redirect`, `moved`, `respond`, `check_auth`, `set_header`, `log`, `project_dashboard` or `admin_dashboard`. This subsumes what used to be fixed project types - a redirect project is now the one-line script `moved https://example.com`
-  - `match`, `try_serve_file` and `try_serve_dir` may decline, in which case the script continues with the next statement or with an `else` branch. Everything else is terminal, so a request can never quietly end up somewhere unrelated. `try_serve_dir public` followed by `serve_file public/index.html` is the whole single-page-application idiom
-  - Patterns match the whole path, and captures resolve innermost-first through nested `match`es. `${1}` and `${name}` are available alongside `${1}`; a `$` followed by a letter is no longer a silently-empty group reference
-  - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. Unknown settings and statements, unparsable patterns, references to servers or auth blocks that don't exist, an `else` that could never run, an `auth` block nothing requires, and a pattern carrying a redundant `^`/`$` are all called out
-  - Basic auth, password hashes and the auth cookie are **gone** - authentication belongs to the application layer. What remains is `check_auth <secret>`, guarding things like dashboards behind one shared secret (`Authorization: Bearer` or `?secret=`), and the `X-Accel-Redirect` internal redirect (the nginx convention), which lets an application do its own auth and still hand a file back to webcentral to deliver
-  - Fix every container being orphaned on shutdown: webcentral handled only SIGINT, so the SIGTERM systemd and `podman stop` send killed it outright - and even on ctrl-c it asked its services to stop and then exited without waiting, so the requests never ran. It now handles both signals and waits (bounded) for the containers to actually be gone
-  - Static files support **`Range` requests**, so video seeks, audio scrubbing and resumed downloads work; an `ETag` accompanies them, and `If-Range` makes sure a resumed download is never spliced together from two different versions of a file
-  - A service can **`copy`** project files into its image for `build` to use, which is what makes installing dependencies at image-build time possible at all. Editing a copied file rebuilds and restarts
-  - **Reload rules default to a whitelist** of things that plausibly serve requests (source directories, source extensions, dependency manifests) rather than to everything. Editing an asset or writing an upload no longer restarts an application that would have re-read it from disk anyway
-  - A sidecar without a `base` of its own now inherits its parent's **environment** as well as its image, its own `env` winning - so an extra worker process needs nothing repeated
-  - Request bodies and static files are **streamed**, not buffered: an upload or download costs one chunk of memory, whatever its size. (Responses from services already streamed.) The trade: a request whose body was already partly sent can never be silently retried on a stale pooled connection - such failures 502 and restart the service
-  - `workers { }` is gone as a concept: a nested `service` without a `base` of its own runs in its parent's image, which is the same thing with one less thing to learn. Procfile `worker:` lines become exactly that
-  - Each server has its own `reload_include`/`reload_exclude`, defaulting to the project's `settings`, so a change to a PHP file can restart the PHP server and leave the others running
-  - Servers can nest **sidecars** - a database, a cache, a queue runner - which start and stop with the server they belong to and are published to it as `<NAME>_HOST` and `<NAME>_PORT`. Settings a sidecar cannot have (its own lifecycle timing, reload rules, workers) are parse errors rather than silently ignored
-  - A declared `service` without a `command` gets one from the `Procfile` or `package.json`, so auto-detection can be tuned (add `packages`, reload rules) instead of given up; without anything to detect, the missing command is a reported error
-  - The status page split in two: `project_dashboard` shows a project its own servers, while `admin_dashboard` shows every domain on the server and only answers from a project owned by the user running webcentral
-  - The whole projects tree is now watched with **one** inotify instance rather than one per project (60 projects went from 61 instances to 2), which matters because the per-user cap is 128 by default while the watches themselves are effectively unlimited. Which project and which server an event concerns is worked out by webcentral, so per-server rules cost nothing extra
-  - Named arguments: every positional argument can also be given as `name=value`, and a name a statement doesn't have is reported instead of being taken as a positional value that happens to contain an `=`
-  - Variables: `${name}` anywhere in a routing statement's arguments, `${1}`..`${9}` for the last match's groups, `${path}`/`${query}`/`${method}`/`${host}` for the request, and `set` to name anything else. A top-level `set` is a constant the rest of the file is read with, so a backend URL or a path prefix can be stated once
-  - `match` names what it tests with `subject=` - an ordinary argument, so `subject=${host}${path}` works - and how with `matcher=` (`regex` or `literal`) and `anchored=` (whether the pattern describes the whole value or just part of it)
-  - A `${name}` nothing ever sets is reported when the file is read, rather than silently being empty
-  - `${name}` is the only substitution webcentral performs: a `$` not followed by `{` is an ordinary character, so regexes, prices and a shell's `$PORT`/`$HOME`/`$$` pass through with nothing to escape
-  - New `env_file`, reading `KEY=value` lines into constants so secrets can live outside `webcentral.conf`; values reach only what names them, are redacted from the log, and reach the container through podman's own environment rather than its command line - whose argv any user on the machine can read with `ps` for as long as the container runs
-  - `${domain}` is the domain a project is registered under, as opposed to `${host}`, which is whatever the client asked for
-  - `'single quotes'` take their contents exactly as written, where `"double quotes"` substitute
-  - Fix a config change being missed when it arrived in the same batch of file events as a source change, which left the old configuration running
-  - Podman's `http_port` is now `port`, which is what it always was once a sidecar can be a database
-  - New `webcentral check [path]`, which parses a project's configuration and reports every problem without starting anything
-  - The dashboard lists each project's servers separately, with their own state, port and request counts, and escapes the directory and domain names it prints
+  - **`webcentral.ini` is replaced by `webcentral.conf`**, a small configuration language. A project's requests are handled by a routing script run top to bottom - `match`, `serve`, `serve_dir`, `check_file`, `forward`, `proxy`, `respond` and friends - which subsumes what used to be fixed project types: a redirect project is now the one-line script `moved https://example.com`. The old format is not read; see **Configuration** above. Projects that need no configuration file (`public/`, `Procfile`, `package.json`) are unaffected
+  - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. `webcentral check` parses a project without starting anything
+  - **Everything runs in a container.** Firejail support is gone and with it the choice: one keyword, `service`, and podman as the only external dependency. A project can declare several, each with its own image, port, lifecycle and reload rules, each started only when a request is routed to it. A nested `service` is a *sidecar* sharing its parent's lifetime, image and environment - which is what replaced workers
+  - **Authentication belongs to the application.** Basic auth, password hashes and the auth cookie are gone. What remains is `check_auth <secret>` for guarding a dashboard, and `X-Accel-Redirect`, which lets an application authorise a request and hand the delivery back to webcentral
+  - `env_file` keeps secrets out of the configuration, and they reach a container through podman's environment rather than its command line, which `ps` exposes to every user on the machine
+  - Request bodies and static files are **streamed**, and static files support `Range`, so uploads and video seeking work at any size
+  - The whole projects tree is watched with **one** inotify instance rather than one per project (60 projects went from 61 to 2), and reload rules default to a whitelist of program text rather than to everything
+  - Fix containers being orphaned on shutdown, both because only SIGINT was handled - not the SIGTERM systemd sends - and because the stop was never waited for
+  - Fix services being unreachable on IPv6 hosts: ports are published on `127.0.0.1` and addressed that way
 
 2026-08-05 (2.6.1):
   - **Security:** fix a path traversal in static file serving. `GET /../../etc/passwd` escaped the project's `public/` directory and served any file readable by webcentral (root, in the usual setup). The containment check compared path components without resolving `..`, which the kernel then resolved on open. Request paths are now percent-decoded and normalized before the filesystem is touched. Only projects serving static files were affected

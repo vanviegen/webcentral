@@ -1,4 +1,0 @@
-- Make the URL to check if the service is running configurable in webcentral.ini
-- Do a periodic check on the check URL after the project has started, forcing a shutdown if it's no longer responding
-
-For each of the above: update README.md (and add to its Changelog section) if needed.

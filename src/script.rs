@@ -1,17 +1,17 @@
 //! The per-request routing script: its statements, capture scoping, and the interpreter.
 //!
 //! A script is a flat sequence of statements run top to bottom for every request. Statements are
-//! either *terminal* (they decide the response and stop the script) or not. Four of them are
-//! *fallible* - `match`, `check_auth`, `try_serve_file` and `try_serve_dir` - meaning they may
-//! decline, in which case the script simply carries on with the next statement, or with their
-//! `else` branch if they have one. Nothing else can decline: a `serve_file` that finds nothing
-//! answers 404 rather than falling through, which is what keeps "why did my request end up
-//! somewhere else" from being a question anyone has to ask.
+//! either *terminal* (they decide the response and stop the script) or not. Three of them are
+//! *conditionals* - `match`, `check_auth` and `check_file` - running their body when they hold and
+//! otherwise taking an `else` branch, if one follows, or carrying on. `serve_file` and `serve_dir`
+//! answer 404 when they find nothing, unless `fallthrough` leaves the request to the statements
+//! below - which is the only way a serve declines, and it is written on the statement itself.
 //!
 //! Variables are one flat map per request, seeded with the constants the file's top-level `set`
-//! statements defined. `match` writes the groups it captured into it, `set` writes whatever it is
-//! given, and the request's own `$path`, `$query`, `$method` and `$host` are there from the start.
-//! Last write wins; there is no scope to reason about.
+//! statements defined. `match` writes the groups it captured into it, and the request's own
+//! `path`, `query`, `uri`, `method` and `host` are there from the start. The first three *are* the
+//! request rather than a copy: assigning one re-points what gets served or forwarded, which is
+//! what `set_target` does. Last write wins; there is no scope to reason about.
 
 use crate::logger::Logger;
 use crate::parser::Word;
@@ -45,19 +45,15 @@ pub enum Stmt {
     },
     /// Assign a variable, for a constant at the top of the file or a value worth naming.
     Set { name: String, value: Template },
-    /// `serve_file` / `try_serve_file`
-    ServeFile {
-        path: Template,
-        fallible: bool,
-        otherwise: Option<Vec<Stmt>>,
-    },
-    /// `serve_dir` / `try_serve_dir`: the request path is resolved below `dir`.
+    /// `serve_file`, which answers 404 when the file is missing unless `fallthrough` lets the
+    /// script carry on to the next statement instead.
+    ServeFile { path: Template, fallthrough: bool },
+    /// `serve_dir`: the request path is resolved below `dir`.
     ServeDir {
         dir: Template,
         /// File served for a directory; `index=` overrides it.
         index: String,
-        fallible: bool,
-        otherwise: Option<Vec<Stmt>>,
+        fallthrough: bool,
     },
     /// Hand the request to a managed server, starting it if needed.
     ServeApp(String),
@@ -73,8 +69,14 @@ pub enum Stmt {
         body: Vec<Stmt>,
         otherwise: Option<Vec<Stmt>>,
     },
+    /// Run the body only when `path` names a file that exists, so headers and other decisions can
+    /// be made once, before committing to serve it.
+    CheckFile {
+        path: Template,
+        body: Vec<Stmt>,
+        otherwise: Option<Vec<Stmt>>,
+    },
     SetHeader(String, Template),
-    Rewrite(Template),
     Log(Template),
     /// The status page: the whole server's for `admin_dashboard`, this project's own slice for
     /// `project_dashboard`.
@@ -83,23 +85,16 @@ pub enum Stmt {
 
 impl Stmt {
     pub fn is_fallible(&self) -> bool {
-        matches!(
-            self,
-            Stmt::Match { .. }
-                | Stmt::CheckAuth { .. }
-                | Stmt::ServeFile { fallible: true, .. }
-                | Stmt::ServeDir { fallible: true, .. }
-        )
+        matches!(self, Stmt::Match { .. } | Stmt::CheckAuth { .. } | Stmt::CheckFile { .. })
     }
 
     /// Attach an `else` branch. Fails for statements that can never decline, which would make the
     /// branch dead code.
     pub fn set_otherwise(&mut self, branch: Vec<Stmt>) -> bool {
         match self {
-            Stmt::Match { otherwise, .. } => *otherwise = Some(branch),
-            Stmt::CheckAuth { otherwise, .. } => *otherwise = Some(branch),
-            Stmt::ServeFile { fallible: true, otherwise, .. } => *otherwise = Some(branch),
-            Stmt::ServeDir { fallible: true, otherwise, .. } => *otherwise = Some(branch),
+            Stmt::Match { otherwise, .. }
+            | Stmt::CheckAuth { otherwise, .. }
+            | Stmt::CheckFile { otherwise, .. } => *otherwise = Some(branch),
             _ => return false,
         }
         true
@@ -184,6 +179,16 @@ impl Template {
         })
     }
 
+    /// The text of a template that reads no variables, so the parser can check a constant target
+    /// once instead of leaving it to fail on every request.
+    pub fn as_literal(&self) -> Option<&str> {
+        match self.0.as_slice() {
+            [] => Some(""),
+            [Part::Literal(text)] => Some(text),
+            _ => None,
+        }
+    }
+
     /// A template with no references, for defaults the parser synthesises.
     pub fn literal(text: &str) -> Template {
         Template(vec![Part::Literal(text.to_string())])
@@ -226,6 +231,11 @@ impl Vars {
     fn set_request<B>(&mut self, req: &Request<B>) {
         self.set("path", req.uri().path());
         self.set("query", req.uri().query().unwrap_or(""));
+        // The request target as one string, which is what `${uri}` reads and writes.
+        self.set(
+            "uri",
+            req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/"),
+        );
         self.set("method", req.method().as_str());
         // The URI's authority, not the Host header: HTTP/2 and HTTP/3 carry the name in
         // `:authority` and send no Host header at all, and the listener folds the HTTP/1.1 Host
@@ -343,30 +353,39 @@ impl<'a> Run<'a> {
 
             Stmt::Set { name, value } => {
                 let rendered = value.render(&self.vars);
-                self.vars.set(name.clone(), rendered);
+                // `path`, `query` and `uri` are not copies of the request - they *are* the
+                // request, so assigning one changes what gets served or forwarded. Everything
+                // else is an ordinary variable.
+                match name.as_str() {
+                    "path" | "query" | "uri" => {
+                        set_target(req, name, &rendered)?;
+                        self.vars.set_request(req);
+                    }
+                    _ => self.vars.set(name.clone(), rendered),
+                }
                 Ok(None)
             }
 
-            Stmt::ServeFile { path, fallible, otherwise } => {
+            Stmt::ServeFile { path, fallthrough } => {
                 let rendered = path.render(&self.vars);
                 let file = match resolve_below(self.env.dir, &rendered) {
                     Some(file) => file,
-                    None => return self.not_found(*fallible, otherwise, req).await,
+                    None => return self.not_found(*fallthrough),
                 };
                 match read_file(&file, req).await? {
                     Some(response) => Ok(Some(Terminal::Response(response))),
-                    None => self.not_found(*fallible, otherwise, req).await,
+                    None => self.not_found(*fallthrough),
                 }
             }
 
-            Stmt::ServeDir { dir, index, fallible, otherwise } => {
+            Stmt::ServeDir { dir, index, fallthrough } => {
                 let rendered = dir.render(&self.vars);
                 let Some(base) = resolve_below(self.env.dir, &rendered) else {
-                    return self.not_found(*fallible, otherwise, req).await;
+                    return self.not_found(*fallthrough);
                 };
                 let request_path = req.uri().path().to_string();
                 let Some(file) = resolve_request_path(&base, &request_path, index) else {
-                    return self.not_found(*fallible, otherwise, req).await;
+                    return self.not_found(*fallthrough);
                 };
 
                 // A directory reached without a trailing slash is redirected rather than served,
@@ -381,7 +400,7 @@ impl<'a> Run<'a> {
 
                 match read_file(&file, req).await? {
                     Some(response) => Ok(Some(Terminal::Response(response))),
-                    None => self.not_found(*fallible, otherwise, req).await,
+                    None => self.not_found(*fallthrough),
                 }
             }
 
@@ -422,6 +441,25 @@ impl<'a> Run<'a> {
                 }
             }
 
+            Stmt::CheckFile { path, body, otherwise } => {
+                let rendered = path.render(&self.vars);
+                let exists = match resolve_below(self.env.dir, &rendered) {
+                    Some(file) => tokio::fs::metadata(&file)
+                        .await
+                        .map(|meta| meta.is_file())
+                        .unwrap_or(false),
+                    None => false,
+                };
+                if exists {
+                    self.block(body, req).await
+                } else {
+                    match otherwise {
+                        Some(branch) => self.block(branch, req).await,
+                        None => Ok(None),
+                    }
+                }
+            }
+
             Stmt::SetHeader(name, value) => {
                 let rendered = value.render(&self.vars);
                 match (HeaderName::try_from(name.as_str()), HeaderValue::from_str(&rendered)) {
@@ -431,13 +469,6 @@ impl<'a> Run<'a> {
                         .logger
                         .write("supervisor", &format!("Ignoring invalid header '{}: {}'", name, rendered)),
                 }
-                Ok(None)
-            }
-
-            Stmt::Rewrite(target) => {
-                let rendered = target.render(&self.vars);
-                rewrite_uri(req, &rendered)?;
-                self.vars.set_request(req);
                 Ok(None)
             }
 
@@ -459,19 +490,13 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// Shared tail for the `serve_file`/`serve_dir` pair: decline if we may, else answer 404.
-    async fn not_found<B>(
-        &mut self,
-        fallible: bool,
-        otherwise: &Option<Vec<Stmt>>,
-        req: &mut Request<B>,
-    ) -> Result<Option<Terminal>> {
-        if !fallible {
-            return Ok(Some(Terminal::Response(status_response(404, "Not Found")?)));
-        }
-        match otherwise {
-            Some(branch) => self.block(branch, req).await,
-            None => Ok(None),
+    /// Shared tail for the `serve_file`/`serve_dir` pair: carry on with the next statement when
+    /// `fallthrough` allows it, and answer 404 otherwise.
+    fn not_found(&mut self, fallthrough: bool) -> Result<Option<Terminal>> {
+        if fallthrough {
+            Ok(None)
+        } else {
+            Ok(Some(Terminal::Response(status_response(404, "Not Found")?)))
         }
     }
 }
@@ -627,7 +652,7 @@ async fn read_file<B>(path: &Path, req: &Request<B>) -> Result<Option<Response<S
 }
 
 /// Resolve a configured, capture-interpolated path below the project directory. Captures come from
-/// the request, so a rule like `try_serve_file images/$1` must not be able to reach outside.
+/// the request, so a rule like `serve_file images/${1}` must not be able to reach outside.
 ///
 /// Segments are percent-decoded, exactly as `resolve_request_path` decodes the request's own path:
 /// a capture is a slice of the raw URI, so `/files/my%20file.txt` has to find `my file.txt` here
@@ -677,19 +702,52 @@ pub fn resolve_request_path(base: &Path, path: &str, index: &str) -> Option<Path
     Some(resolved)
 }
 
-/// Replace the request's path, keeping the original query string unless the target brings its own.
-fn rewrite_uri<B>(req: &mut Request<B>, target: &str) -> Result<()> {
-    let path_and_query = match (target.contains('?'), req.uri().query()) {
-        (false, Some(query)) => format!("{}?{}", target, query),
-        _ => target.to_string(),
+/// Assign one of the request's own variables, which changes the request itself. `path` and
+/// `query` each leave the other alone; `uri` is the two together, for when a whole target is
+/// being replaced at once.
+fn set_target<B>(req: &mut Request<B>, name: &str, value: &str) -> Result<()> {
+    let path_and_query = match name {
+        "path" => {
+            check_target(name, value, &['?', '#'])?;
+            match req.uri().query() {
+                Some(query) => format!("{}?{}", value, query),
+                None => value.to_string(),
+            }
+        }
+        "query" => {
+            check_target(name, value, &['#'])?;
+            match value.is_empty() {
+                true => req.uri().path().to_string(),
+                false => format!("{}?{}", req.uri().path(), value),
+            }
+        }
+        _ => {
+            check_target(name, value, &['#'])?;
+            value.to_string()
+        }
     };
     let mut parts = req.uri().clone().into_parts();
-    parts.path_and_query = Some(
-        path_and_query
-            .parse()
-            .map_err(|e| anyhow::anyhow!("rewrite to '{}' is not a valid path: {}", path_and_query, e))?,
-    );
+    parts.path_and_query = Some(path_and_query.parse().map_err(|e| {
+        anyhow::anyhow!("'set {} {}' is not a valid request target: {}", name, value, e)
+    })?);
     *req.uri_mut() = http::Uri::from_parts(parts)?;
+    Ok(())
+}
+
+/// What a request target may not contain, checked before the URI parser sees something it would
+/// accept for the wrong reason - a `?` in a path would silently become a query, not a path.
+fn check_target(name: &str, value: &str, forbidden: &[char]) -> Result<()> {
+    if name != "query" && !value.starts_with('/') {
+        anyhow::bail!("'set {} {}' must start with '/'", name, value);
+    }
+    if let Some(bad) = forbidden.iter().find(|c| value.contains(**c)) {
+        anyhow::bail!(
+            "'set {} {}' must not contain '{}' - set the parts separately, or assign to 'uri'",
+            name,
+            value,
+            bad
+        );
+    }
     Ok(())
 }
 

@@ -591,12 +591,12 @@ def test_static_file_nested(t):
 
 @test
 def test_rewrite_static(t):
-    """rewrite changes which static file is served"""
+    """set path changes which static file is served"""
     t.write_file('public/index.html', '<h1>App Shell</h1>')
     t.write_file('public/articles/hello.html', '<h1>Hello Article</h1>')
     t.write_file('webcentral.conf', '''
-match /blog/(.*) rewrite /articles/${1}.html
-match /deep/link rewrite /index.html
+match /blog/(.*) set path /articles/${1}.html
+match /deep/link set path /index.html
 ''')
 
     t.assert_http('/blog/hello', check_body='Hello Article')
@@ -626,12 +626,12 @@ serve_file public/index.html
 
 
 @test
-def test_try_serve_dir_falls_through(t):
-    """try_serve_dir declines when there is no such file, serve_dir answers 404"""
+def test_serve_dir_fallthrough(t):
+    """serve_dir declines fallthrough=true when there is no such file, serve_dir answers 404"""
     t.write_file('public/index.html', '<h1>Shell</h1>')
     t.write_file('public/real.txt', 'real file')
     t.write_file('webcentral.conf', '''
-try_serve_dir public
+serve_dir public fallthrough=true
 serve_file public/index.html
 ''')
 
@@ -659,8 +659,8 @@ def test_else_branch(t):
     t.write_file('public/real.txt', 'real file')
     t.write_file('webcentral.conf', '''
 match /files/(.*) {
-  try_serve_file public/${1}
-  else respond 404 "no file called ${1}"
+  serve_file public/${1} fallthrough=true
+  respond 404 "no file called ${1}"
 }
 else respond 418 "not a file request"
 ''')
@@ -715,7 +715,7 @@ service web {
 }
 
 match /api/(.*) {
-  rewrite /${1}
+  set path /${1}
   serve api
 }
 serve web
@@ -726,7 +726,7 @@ serve web
     t.await_log('web starting')
     t.assert_log('api starting', count=0)
 
-    # The /api route starts the other one, and the rewrite reaches it
+    # The /api route starts the other one, and the set path reaches it
     t.assert_http('/api/thing', check_body='api says /thing')
     t.await_log('api starting')
 
@@ -907,7 +907,8 @@ def test_else_pairs_with_the_preceding_statement(t):
     """else always pairs with the statement right before it, inline body or not"""
     t.write_file('public/real.txt', 'real file')
     t.write_file('webcentral.conf', '''
-match /files/(.*) try_serve_file public/${1} else respond 418 "not a files request"
+match /files/(.*) check_file public/${1} serve_file public/${1}
+else respond 418 "not a files request"
 respond 200 fell-through
 ''')
 
@@ -920,7 +921,7 @@ respond 200 fell-through
     # Pairing it with the inner statement instead is what the block form is for
     t.write_file('webcentral.conf', '''
 match /files/(.*) {
-  try_serve_file public/${1}
+  check_file public/${1} serve_file public/${1}
   else respond 404 "no ${1} here"
 }
 respond 200 fell-through
@@ -1006,7 +1007,7 @@ def test_request_variables(t):
     t.write_file('public/deep/file.txt', 'deep file')
     t.write_file('webcentral.conf', '''
 match /echo respond 200 "${method} ${path}?${query} via ${host}"
-match /files/(.*) try_serve_file public/${path}
+match /files/(.*) serve_file public/${path} fallthrough=true
 match /shadow/(?<path>.*) respond 200 "shadowed ${path}"
 respond 200 "no match"
 ''')
@@ -1020,9 +1021,9 @@ respond 200 "no match"
 
 @test
 def test_request_variables_follow_rewrite(t):
-    """${path} describes the request as it stands now, so a rewrite updates it"""
+    """${path} describes the request as it stands now, so a set path updates it"""
     t.write_file('webcentral.conf', '''
-match /old/(.*) rewrite /new/${1}
+match /old/(.*) set path /new/${1}
 respond 200 "path is ${path}"
 ''')
 
@@ -1076,7 +1077,7 @@ def test_set_from_any_variable(t):
     t.write_file('webcentral.conf', '''
 match /copy/(.*) {
   set original ${path}
-  rewrite /${1}
+  set path /${1}
   respond 200 "was ${original}, now ${path}"
 }
 respond 200 other
@@ -1149,6 +1150,145 @@ service {
     t.assert_log('serve.py --port $PORT', count=1)
     # ${idle} really was substituted, not parsed as a literal duration and defaulted away
     t.assert_log('Expected a duration', count=0)
+
+
+@test
+def test_check_file(t):
+    """check_file commits to a file before serving it, so headers can be set only when it exists"""
+    t.write_file('static/app.js', 'console.log(1)')
+    t.write_file('static/app.js.br', 'brotli-ish')
+    t.write_file('public/index.html', 'the app')
+    t.write_file('webcentral.conf', """
+match /static/(.*) {
+  # Named once and reused, rather than a path repeated in two statements
+  set candidate static/${1}.br
+  check_file ${candidate} {
+    set_header Content-Encoding br
+    serve_file ${candidate}
+  }
+  serve_file static/${1}
+}
+serve_dir public
+""")
+
+    # The precompressed file exists, so it is served with the header
+    body, headers = t.assert_http('/static/app.js', check_body='brotli-ish', return_headers=True)
+    assert headers.get('content-encoding') == 'br', headers
+
+    # It doesn't for this one, so the plain file is served - and crucially without the header,
+    # which a plain set_header before the serve would have left behind
+    t.write_file('static/plain.js', 'console.log(2)')
+    body, headers = t.assert_http('/static/plain.js', check_body='console.log(2)',
+                                  return_headers=True)
+    assert 'content-encoding' not in headers, headers
+
+    # An else branch runs when the file is absent
+    t.write_file('webcentral.conf', """
+check_file nothing/here.txt respond 200 found
+else respond 404 "no such thing"
+""")
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_code=404, check_body='no such thing')
+
+
+@test
+def test_set_path_and_query(t):
+    """path, query and uri are the request itself: assigning one re-points it"""
+    t.write_file('public/target.html', 'the target')
+    t.write_file('webcentral.conf', """
+match /old/(.*) {
+  set path /${1}.html
+  serve_dir public
+}
+match /drop {
+  set query ""
+  respond 200 "query is now '${query}'"
+}
+match /whole {
+  set uri /elsewhere?a=b
+  respond 200 "${path} and ${query}"
+}
+respond 200 "uri is ${uri}"
+""")
+
+    # Assigning the path changes what serve_dir resolves
+    t.assert_http('/old/target', check_body='the target')
+    # The query survives a path assignment, and can be cleared on its own
+    t.assert_http('/drop?a=1', check_body="query is now ''")
+    # uri sets both at once
+    t.assert_http('/whole?keep=me', check_body='/elsewhere and a=b')
+    # ...and reads back as the whole target
+    t.assert_http('/plain?x=1', check_body='uri is /plain?x=1')
+
+
+@test
+def test_request_variables_are_guarded(t):
+    """The variables that describe what arrived cannot be assigned, and targets are checked"""
+    t.write_file('public/index.html', 'shell')
+    t.write_file('webcentral.conf', """
+set method POST
+set path no-leading-slash
+set path /has?query=here
+serve_dir public
+""")
+    t.assert_http('/', check_body='shell')
+    t.await_log("'method' describes the request as it arrived and cannot be set")
+    t.assert_log("'set path no-leading-slash' must start with '/'", count=1)
+    t.assert_log("'set path /has?query=here' must not contain '?'", count=1)
+
+
+@test
+def test_app_dir_none(t):
+    """app_dir = none mounts nothing and its diagnostics catch the ways to get it wrong"""
+    t.write_file('public/index.html', 'shell')
+    t.write_file('webcentral.conf', """
+service {
+  app_dir = none
+  mounts = relative/path
+  command = ls /app || echo "no app dir"; python3 -u -m http.server $PORT
+}
+service other {
+  app_dir = not-absolute
+  command = true
+}
+serve_dir public
+""")
+
+    t.assert_http('/', check_body='shell')
+    # A relative mount has nowhere to hang without a mounted project directory
+    t.await_log("mount 'relative/path' is relative")
+    # And a non-absolute app_dir is refused rather than mounted at garbage
+    t.assert_log("app_dir must be an absolute path", count=1)
+
+
+@test
+def test_quoting_rules(t):
+    """What quotes do to a word: gluing, `=`, and quoting a quote"""
+    t.write_file('webcentral.conf', """
+match /named respond 200 body type=text/html
+match /quoted respond 200 "type=text/html"
+match /dq respond 200 "she said \\"hi\\""
+match /sq respond 200 "it's fine"
+match /ds respond 200 'say "hi"'
+match /glue respond 200 'it'"'"'s'
+match /backslash respond 200 a\\.b
+respond 404 no
+""")
+
+    # An unquoted `=` makes a named argument; quoting any part of it does not
+    body, headers = t.assert_http('/named', check_body='body', return_headers=True)
+    assert headers['content-type'] == 'text/html', headers
+    body, headers = t.assert_http('/quoted', check_body='type=text/html', return_headers=True)
+    assert headers['content-type'].startswith('text/plain'), headers
+
+    # A double quote inside double quotes is escaped; inside single quotes it is not special
+    t.assert_http('/dq', check_body='she said "hi"')
+    t.assert_http('/sq', check_body="it's fine")
+    t.assert_http('/ds', check_body='say "hi"')
+    # Segments glue, which is the only way to put a single quote in a single-quoted word
+    t.assert_http('/glue', check_body="it's")
+    # A backslash outside quotes is an ordinary character, so regexes need no doubling
+    t.assert_http('/backslash', check_body='a\\.b')
 
 
 @test
@@ -1337,7 +1477,7 @@ def test_rewrite_application(t):
 service {
   command = python3 -u -m http.server $PORT
 }
-match /pretty/(.*) rewrite /${1}.txt
+match /pretty/(.*) set path /${1}.txt
 ''')
     t.write_file('real.txt', 'the real file')
 
@@ -2167,7 +2307,7 @@ def test_config_diagnostics(t):
     t.write_file('public/index.html', '<h1>Shell</h1>')
     t.write_file('webcentral.conf', f'''
 invalid_statement key value
-match /broken( rewrite /index.html
+match /broken( set path /index.html
 match \\.css$ respond 200 css
 service api {{
   command = python3 -u -m http.server $PORT
@@ -3915,7 +4055,7 @@ service { command = python3 -u app.py }
 
 match /protected/(.*) {
   # Only reachable through an internal redirect from the app, never directly
-  match default subject=${redirected_by} matcher=literal try_serve_dir .
+  match default subject=${redirected_by} matcher=literal serve_dir . fallthrough=true
   respond 403 "no direct access"
 }
 serve
@@ -4228,7 +4368,7 @@ def test_podman_user_override(t):
     podman = _podman_setup(t,
         f'  command = {{ id -u; id -g; }} > /data/id.txt && {PODMAN_SERVE}\n'
         '  base = alpine\n'
-        '  mount_app_dir = false\n'
+        '  app_dir = none\n'
         + PODMAN_PACKAGES +
         f'  user = {os.getuid()}:{os.getgid()}\n'
         '  mounts = /data\n')
@@ -4247,7 +4387,7 @@ def test_podman_foreign_user_mapped_to_owner(t):
     podman = _podman_setup(t,
         f'  command = mkdir -p /data/sub && {{ id -u; id -g; }} > /data/sub/id.txt && {PODMAN_SERVE}\n'
         '  base = alpine\n'
-        '  mount_app_dir = false\n'
+        '  app_dir = none\n'
         + PODMAN_PACKAGES +
         '  user = 4242:4242\n'
         '  mounts = /data\n')

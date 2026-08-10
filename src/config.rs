@@ -24,6 +24,11 @@ use std::path::Path;
 
 pub const CONFIG_FILE: &str = "webcentral.conf";
 
+/// Request variables that only ever describe what arrived, so `set` refuses them. `path`, `query`
+/// and `uri` are deliberately absent: assigning those is how a request is re-pointed.
+const READ_ONLY_VARS: &[&str] =
+    &["method", "host", "domain", "redirected_from", "redirected_by"];
+
 /// The image a service is built from unless it says otherwise: small, and `packages` adds to it
 /// quickly enough that carrying a language runtime by default would not pay for itself.
 pub const DEFAULT_BASE_IMAGE: &str = "alpine";
@@ -131,8 +136,9 @@ pub struct ServerConfig {
     pub copy: Vec<String>,
     /// The port the command listens on inside the container.
     pub port: u16,
-    pub app_dir: String,
-    pub mount_app_dir: bool,
+    /// Where the project directory is mounted inside the container; `None` (written
+    /// `app_dir = none`) mounts nothing, for images that carry the application themselves.
+    pub app_dir: Option<String>,
     /// Persistent directories, kept on the host under `_webcentral_data/mounts`.
     pub mounts: Vec<String>,
     /// Who the container runs as *inside*. Either `project` (add the project owner to the image
@@ -159,8 +165,7 @@ impl ServerConfig {
             build: Vec::new(),
             copy: Vec::new(),
             port: 8000,
-            app_dir: "/app".to_string(),
-            mount_app_dir: true,
+            app_dir: Some("/app".to_string()),
             mounts: Vec::new(),
             user: String::new(),
         }
@@ -221,7 +226,7 @@ impl ProjectConfig {
                 config.errors.extend(detected.errors);
                 config.errors.extend(warnings);
             }
-        } else if config.servers.iter().any(|s| s.command.is_empty() && s.mount_app_dir) {
+        } else if config.servers.iter().any(|s| s.command.is_empty() && s.app_dir.is_some()) {
             // A declared service with no command and the project directory mounted runs the
             // project's own code, so its command is auto-detected too - that is how a Procfile
             // project adds `packages` or reload rules without giving up detection. Without the
@@ -235,7 +240,7 @@ impl ProjectConfig {
             });
             let mut errors = Vec::new();
             for server in
-                config.servers.iter_mut().filter(|s| s.command.is_empty() && s.mount_app_dir)
+                config.servers.iter_mut().filter(|s| s.command.is_empty() && s.app_dir.is_some())
             {
                 match donor.as_ref().and_then(|d| d.as_ref()) {
                     Some(donor) => {
@@ -253,8 +258,8 @@ impl ProjectConfig {
                     }
                     None => errors.push(format!(
                         "service '{}' has no command, and no Procfile or package.json to detect \
-                         one from - add 'command =', or 'mount_app_dir = false' to run the \
-                         image's own entrypoint",
+                         one from - add 'command =', or 'app_dir = none' to run the image's \
+                         own entrypoint",
                         server.name
                     )),
                 }
@@ -312,6 +317,7 @@ fn serves_anything(stmts: &[Stmt]) -> bool {
                 | Stmt::Redirect { .. }
                 | Stmt::Respond { .. }
                 | Stmt::Dashboard { .. }
+                | Stmt::CheckFile { .. }
         )
     })
 }
@@ -327,8 +333,7 @@ fn add_implicit_tail(config: &mut ProjectConfig, dir: &Path) {
         config.script.push(Stmt::ServeDir {
             dir: Template::literal("public"),
             index: "index.html".to_string(),
-            fallible: false,
-            otherwise: None,
+            fallthrough: false,
         });
     }
 }
@@ -457,10 +462,18 @@ const MATCH: Signature = Signature {
 };
 const SET: Signature = sig(&[req("name", Kind::Variable), req("value", Kind::Template)], &[]);
 const SERVE: Signature = sig(&[opt("server", Kind::Word)], &[]);
-const SERVE_FILE: Signature = sig(&[req("path", Kind::Template)], &[]);
-const SERVE_DIR: Signature =
-    sig(&[req("dir", Kind::Template)], &[opt("index", Kind::Word)]);
-const REWRITE: Signature = sig(&[req("path", Kind::Template)], &[]);
+const SERVE_FILE: Signature =
+    sig(&[req("path", Kind::Template)], &[opt("fallthrough", Kind::Word)]);
+const SERVE_DIR: Signature = sig(
+    &[req("dir", Kind::Template)],
+    &[opt("index", Kind::Word), opt("fallthrough", Kind::Word)],
+);
+// `check_file` guards its body the way `check_auth` does: what follows runs either way.
+const CHECK_FILE: Signature = Signature {
+    positional: &[req("path", Kind::Template)],
+    named: &[],
+    body: true,
+};
 const FORWARD: Signature = sig(&[req("target", Kind::Template)], &[]);
 const PROXY: Signature = sig(&[req("url", Kind::Template)], &[]);
 const REDIRECT: Signature =
@@ -486,9 +499,9 @@ fn signature(verb: &str) -> Option<Signature> {
         "match" => MATCH,
         "set" => SET,
         "serve" => SERVE,
-        "serve_file" | "try_serve_file" => SERVE_FILE,
-        "serve_dir" | "try_serve_dir" => SERVE_DIR,
-        "rewrite" => REWRITE,
+        "serve_file" => SERVE_FILE,
+        "serve_dir" => SERVE_DIR,
+        "check_file" => CHECK_FILE,
         "forward" => FORWARD,
         "proxy" => PROXY,
         "redirect" | "moved" => REDIRECT,
@@ -582,7 +595,16 @@ pub fn parse(source: &str, dir: Option<&Path>) -> ProjectConfig {
         },
         vars: Vars::default(),
         referenced: Vec::new(),
-        defined: ["path", "query", "method", "host", "domain", "redirected_from", "redirected_by"]
+        defined: [
+            "path",
+            "query",
+            "uri",
+            "method",
+            "host",
+            "domain",
+            "redirected_from",
+            "redirected_by",
+        ]
             .iter()
             .map(|s| s.to_string())
             .collect(),
@@ -866,8 +888,9 @@ impl<'a> Builder<'a> {
                     }
                     Some(_) => self.scanner.error_at(
                         verb.pos,
-                        "'else' can only follow 'match', 'try_serve_file' or 'try_serve_dir' - \
-                         anything else always succeeds, so the branch could never run"
+                        "'else' can only follow 'match', 'check_auth' or 'check_file' - anything \
+                         else either answers or carries on by itself, so the branch could never \
+                         run"
                             .to_string(),
                     ),
                     None => self
@@ -1005,9 +1028,46 @@ impl<'a> Builder<'a> {
             "match" => self.match_statement(verb, args),
 
             "set" => {
-                let name = args.text("name")?;
-                self.defined.insert(name.clone());
-                Some(Stmt::Set { name, value: args.template("value")? })
+                let name = args.word("name")?;
+                // `path`, `query` and `uri` are the request itself, so assigning one changes what
+                // is served or forwarded. The rest of the request's variables describe what
+                // arrived and cannot be rewritten into something else.
+                if READ_ONLY_VARS.contains(&name.text.as_str()) {
+                    self.scanner.error_at(
+                        name.pos,
+                        format!(
+                            "'{}' describes the request as it arrived and cannot be set",
+                            name.text
+                        ),
+                    );
+                    return None;
+                }
+                let value = args.template("value")?;
+                // A literal target can be checked now rather than on every request.
+                if matches!(name.text.as_str(), "path" | "uri") {
+                    if let Some(literal) = value.as_literal() {
+                        if !literal.starts_with('/') {
+                            self.scanner.error_at(
+                                name.pos,
+                                format!("'set {} {}' must start with '/'", name.text, literal),
+                            );
+                            return None;
+                        }
+                        if name.text == "path" && literal.contains('?') {
+                            self.scanner.error_at(
+                                name.pos,
+                                format!(
+                                    "'set path {}' must not contain '?' - set 'query' as well, \
+                                     or assign the whole target to 'uri'",
+                                    literal
+                                ),
+                            );
+                            return None;
+                        }
+                    }
+                }
+                self.defined.insert(name.text.clone());
+                Some(Stmt::Set { name: name.text, value })
             }
 
             "serve" => {
@@ -1017,20 +1077,23 @@ impl<'a> Builder<'a> {
                 Some(Stmt::ServeApp(name.text))
             }
 
-            "serve_file" | "try_serve_file" => Some(Stmt::ServeFile {
+            "serve_file" => Some(Stmt::ServeFile {
                 path: args.template("path")?,
-                fallible: verb.text.starts_with("try_"),
-                otherwise: None,
+                fallthrough: self.flag(&mut args, "fallthrough")?,
             }),
 
-            "serve_dir" | "try_serve_dir" => Some(Stmt::ServeDir {
+            "serve_dir" => Some(Stmt::ServeDir {
                 dir: args.template("dir")?,
                 index: args.text("index").unwrap_or_else(|| "index.html".to_string()),
-                fallible: verb.text.starts_with("try_"),
-                otherwise: None,
+                fallthrough: self.flag(&mut args, "fallthrough")?,
             }),
 
-            "rewrite" => Some(Stmt::Rewrite(args.template("path")?)),
+            "check_file" => {
+                let path = args.template("path")?;
+                let body = self.body(verb)?;
+                Some(Stmt::CheckFile { path, body, otherwise: None })
+            }
+
             "forward" => Some(Stmt::Forward(args.template("target")?)),
             "proxy" => Some(Stmt::Proxy(args.template("url")?)),
             "log" => Some(Stmt::Log(args.template("message")?)),
@@ -1070,6 +1133,22 @@ impl<'a> Builder<'a> {
             }
 
             other => unreachable!("no handler for '{}', which has a signature", other),
+        }
+    }
+
+    /// A `true`/`false` modifier on a statement, defaulting to false when it is absent.
+    fn flag(&mut self, args: &mut Args, name: &str) -> Option<bool> {
+        let Some(word) = args.word(name) else { return Some(false) };
+        match word.text.as_str() {
+            "true" | "yes" | "on" | "1" => Some(true),
+            "false" | "no" | "off" | "0" => Some(false),
+            other => {
+                self.scanner.error_at(
+                    word.pos,
+                    format!("Expected {}=true or {}=false, got '{}'", name, name, other),
+                );
+                None
+            }
         }
     }
 
@@ -1440,8 +1519,9 @@ impl<'a> Builder<'a> {
                 server.reload_exclude.extend(list);
             }
 
-            "base" | "packages" | "build" | "copy" | "mounts" | "port" | "app_dir"
-            | "mount_app_dir" | "user" => self.container_setting(server, key),
+            "base" | "packages" | "build" | "copy" | "mounts" | "port" | "app_dir" | "user" => {
+                self.container_setting(server, key)
+            }
 
             other => {
                 self.scanner
@@ -1461,10 +1541,25 @@ impl<'a> Builder<'a> {
                 }
             }
             "app_dir" => {
-                let value = self.scanner.read_word().map(|w| self.expand(&w));
-                if let Some(value) = value {
-                    server.app_dir = value;
-                }
+                let Some(word) = self.scanner.read_word() else { return };
+                let text = self.expand(&word);
+                // `none` means the project directory is not mounted at all: the image carries
+                // the application itself, so there is nothing of the project to run from.
+                server.app_dir = match text.as_str() {
+                    "none" => None,
+                    path if path.starts_with('/') => Some(text),
+                    _ => {
+                        self.scanner.error_at(
+                            word.pos,
+                            format!(
+                                "app_dir must be an absolute path, or 'none' to not mount the \
+                                 project directory - got '{}'",
+                                text
+                            ),
+                        );
+                        return;
+                    }
+                };
             }
             "packages" => {
                 let list = self.word_list();
@@ -1498,12 +1593,6 @@ impl<'a> Builder<'a> {
                         continue;
                     }
                     server.copy.push(path);
-                }
-            }
-            "mount_app_dir" => {
-                let value = self.bool_value();
-                if let Some(value) = value {
-                    server.mount_app_dir = value;
                 }
             }
             "port" => {
@@ -1549,11 +1638,23 @@ impl<'a> Builder<'a> {
     }
 
     fn finish_server(&mut self, server: &mut ServerConfig) {
+        if server.app_dir.is_none() {
+            for mount in &server.mounts {
+                if !mount.starts_with('/') {
+                    self.scanner.error(format!(
+                        "mount '{}' is relative, which needs a mounted project directory - use \
+                         an absolute container path, or drop 'app_dir = none'",
+                        mount
+                    ));
+                }
+            }
+        }
         if server.user.is_empty() {
             // Mounting the project directory means webcentral owns the image, and an application
             // writing into the user's own directory has to write as them. A complete third-party
             // image instead knows which user it needs.
-            server.user = if server.mount_app_dir { "project" } else { "image" }.to_string();
+            server.user =
+                if server.app_dir.is_some() { "project" } else { "image" }.to_string();
         }
     }
 }
@@ -1583,10 +1684,9 @@ fn walk(stmts: &[Stmt], predicate: &mut impl FnMut(&Stmt) -> bool) -> bool {
             return true;
         }
         let (body, otherwise) = match stmt {
-            Stmt::Match { body, otherwise, .. } | Stmt::CheckAuth { body, otherwise, .. } => {
-                (Some(body), otherwise)
-            }
-            Stmt::ServeFile { otherwise, .. } | Stmt::ServeDir { otherwise, .. } => (None, otherwise),
+            Stmt::Match { body, otherwise, .. }
+            | Stmt::CheckAuth { body, otherwise, .. }
+            | Stmt::CheckFile { body, otherwise, .. } => (Some(body), otherwise),
             _ => (None, &None),
         };
         if let Some(body) = body {

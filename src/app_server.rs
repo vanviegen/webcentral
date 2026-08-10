@@ -878,7 +878,10 @@ impl AppServer {
         // project directory is mounted, but an unmounted service should still start where its
         // image expects to.
         if !config.copy.is_empty() {
-            dockerfile.push_str(&format!("WORKDIR {}\n", config.app_dir));
+            dockerfile.push_str(&format!(
+                "WORKDIR {}\n",
+                config.app_dir.as_deref().unwrap_or("/")
+            ));
         }
 
         // Added last, so the build itself still runs as root. Appending to passwd/group only when
@@ -993,10 +996,9 @@ impl AppServer {
     /// Home directory for the baked-in user. It lives in the project directory when that is
     /// mounted, so it persists; otherwise there is nowhere to put it that outlives the container.
     fn container_home(&self, config: &ServerConfig) -> String {
-        if config.mount_app_dir {
-            format!("{}/_webcentral_data/home", config.app_dir)
-        } else {
-            "/tmp".to_string()
+        match &config.app_dir {
+            Some(app_dir) => format!("{}/_webcentral_data/home", app_dir),
+            None => "/tmp".to_string(),
         }
     }
 
@@ -1165,9 +1167,9 @@ impl AppServer {
             cmd.args(["--user", user]);
         }
 
-        if config.mount_app_dir {
-            cmd.args(["-v", &format!("{}:{}", self.dir.display(), config.app_dir)]);
-            cmd.args(["-w", &config.app_dir]);
+        if let Some(app_dir) = &config.app_dir {
+            cmd.args(["-v", &format!("{}:{}", self.dir.display(), app_dir)]);
+            cmd.args(["-w", app_dir]);
         }
 
         // A persistent home for `project` containers, whether the owner is baked in (rootful,
@@ -1175,7 +1177,7 @@ impl AppServer {
         // environment variable explicitly rather than trusting podman to resolve it from passwd.
         let mut env: Vec<(String, String)> = Vec::new();
         if config.user == "project" {
-            if config.mount_app_dir {
+            if config.app_dir.is_some() {
                 self.create_dir_for_container(&self.dir.join("_webcentral_data/home"))?;
             }
             env.push(("HOME".to_string(), self.container_home(config)));
@@ -1184,10 +1186,11 @@ impl AppServer {
         // Additional mounts. These live on the host but are written by the container; owner
         // ownership is exactly where the container's writes land through the userns mapping.
         for mount in &config.mounts {
-            let container_path = if mount.starts_with('/') {
-                mount.clone()
-            } else {
-                format!("{}/{}", config.app_dir, mount)
+            let container_path = match (&config.app_dir, mount.starts_with('/')) {
+                (_, true) => mount.clone(),
+                (Some(app_dir), false) => format!("{}/{}", app_dir, mount),
+                // Refused at parse time; skipping keeps a stray one from mounting at garbage.
+                (None, false) => continue,
             };
             let host_path = self
                 .dir
