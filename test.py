@@ -46,7 +46,7 @@ def require_podman():
 # than on `apk add` per project. Tests that are *about* image building set their own base.
 TEST_BASE_IMAGE = 'webcentral-test-base'
 
-# Auto-detected projects (Procfile, package.json) get the real default base image, which is bare
+# Auto-detected projects (package.json) get the real default base image, which is bare
 # alpine - so their test commands have to make do with busybox. This serves one connection at a
 # time, which is enough to be found ready; the tests around it check detection, not serving.
 BUSYBOX_SERVER = "while true; do printf 'HTTP/1.0 200 OK\\r\\n\\r\\nok' | nc -l -p $PORT; done"
@@ -2485,118 +2485,31 @@ service {
 
 
 @test
-def test_procfile_unsupported_type(t):
-    """Unsupported Procfile process types are logged as errors"""
-    t.write_file('Procfile', f'web: {BUSYBOX_SERVER}\nclock: sleep 100')
-
-    t.poke()
-    t.await_log("Procfile process type 'clock' is not supported", timeout=30)
-    t.await_log('Ready on port', timeout=30)
-
-
-@test
-def test_procfile_web_only(t):
-    """Procfile with only web process starts successfully"""
-    t.write_file('Procfile', f'web: {BUSYBOX_SERVER}')
-
-    t.poke()
-    t.await_log('Ready on port', timeout=30)
-
-
-@test
-def test_procfile_with_worker(t):
-    """Procfile with web + worker processes"""
-    worker = ('echo "I am a starting test worker..." ; '
-              'echo "Worker was here" > worker_output.txt ; '
-              'echo "I am a finished little worker" ; sleep 100')
-
-    t.write_file('Procfile', f'web: {BUSYBOX_SERVER}\nworker: {worker}')
-
-    t.poke()
-    t.await_log('Ready on port', timeout=30)
-
-    # Verify the worker follower started, as a sidecar in the parent's image
-    t.assert_log('Started sidecar w0', count=1)
-    t.await_log('I am a starting test worker...')
-    t.await_log('I am a finished little worker')
-
-    # Verify the worker really ran, by what it left behind
-    worker_output = os.path.join(t.tmpdir, f'{t.current_test_domain}/worker_output.txt')
-    for _ in range(50):
-        if os.path.exists(worker_output):
-            break
-        time.sleep(0.1)
-    else:
-        raise AssertionError("Worker output file was not created")
-
-
-@test
-def test_procfile_multiple_workers(t):
-    """Procfile with multiple worker processes"""
-    t.write_file('Procfile',
-                 f'web: {BUSYBOX_SERVER}\n'
-                 'worker: echo "Worker 1 starting" ; sleep 100\n'
-                 'urgentworker: echo "Worker 2 starting" ; sleep 100')
-
-    t.poke()
-    t.await_log('Ready on port', timeout=30)
-
-    # Verify both worker followers started
-    t.assert_log('Started sidecar w0', count=1)
-    t.assert_log('Started sidecar w1', count=1)
-    t.await_log('Worker 1 starting')
-    t.await_log('Worker 2 starting')
-
-
-@test
-def test_procfile_runtime_is_detected(t):
-    """A Procfile says how to start an app, not what to start it with: the manifest beside it does
-
-    Heroku picks the runtime from these files through a buildpack. Webcentral has none, so it
-    reads the same ones - and gets the binary names right, which `packages = python3` on alpine
-    would not: a Procfile says `python`.
-    """
+def test_detection_merges_into_declared_service(t):
+    """A command-less service is completed by detection, so a node project can still be tuned"""
+    # Written directly rather than through write_file: the harness injects its own base image
+    # into service blocks, which is the very thing being tested here.
     root = os.path.dirname(os.path.abspath(__file__))
-    checks = [
-        ('requirements.txt', 'flask\n', 'python:3-alpine'),
-        ('Gemfile', "source 'https://rubygems.org'\n", 'ruby:3-alpine'),
-        ('go.mod', 'module example\n', 'golang:alpine'),
-        ('package.json', '{"name":"x"}', 'node:22-alpine'),
-    ]
-    for i, (manifest, content, expected) in enumerate(checks):
-        d = os.path.join(t.tmpdir, f'runtime-{i}')
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, 'Procfile'), 'w') as f:
-            f.write('web: start-my-app\n')
-        with open(os.path.join(d, manifest), 'w') as f:
-            f.write(content)
-        result = subprocess.run(['./webcentral', 'check', d], capture_output=True, text=True,
-                                cwd=root, timeout=10)
-        assert expected in result.stdout, f"{manifest}: expected {expected}, got {result.stdout}"
-
-    # With nothing to go on it stays alpine, and says so rather than failing later
-    d = os.path.join(t.tmpdir, 'runtime-bare')
+    d = os.path.join(t.tmpdir, 'detect-merge')
     os.makedirs(d, exist_ok=True)
-    with open(os.path.join(d, 'Procfile'), 'w') as f:
-        f.write('web: sh -c true\n')
+    with open(os.path.join(d, 'package.json'), 'w') as f:
+        f.write('{"name":"x","scripts":{"start":"node server.js"}}')
+    with open(os.path.join(d, 'webcentral.conf'), 'w') as f:
+        f.write('service {\n  packages = imagemagick\n  shutdown_time = 5\n}\n')
+
     result = subprocess.run(['./webcentral', 'check', d], capture_output=True, text=True,
                             cwd=root, timeout=10)
-    assert 'bare alpine image' in result.stdout, result.stdout
-    assert result.returncode == 0, "a warning must not fail the check"
+    # The command and the node image both come from package.json; what the service said stays
+    assert 'node:22-alpine' in result.stdout, result.stdout
+    assert 'has no command' not in result.stdout, result.stdout
+    assert result.returncode == 0, result.stdout
 
-
-@test
-def test_procfile_merges_into_declared_service(t):
-    """A command-less service is completed by auto-detection, so a Procfile project can be tuned"""
-    t.write_file('Procfile',
-                 'web: python3 -u -m http.server $PORT\n'
-                 'worker: echo "merged worker ran" ; sleep 100')
-    # The service tunes a setting but names no command: the Procfile supplies it (and the worker)
-    t.write_file('webcentral.conf', 'service {\n  shutdown_time = 5\n}')
-
-    t.assert_http('/', check_code=200)
-    t.await_log('merged worker ran')
-    t.assert_log('has no command', count=0)
+    # A service that names its own image keeps it, and still gets the command
+    with open(os.path.join(d, 'webcentral.conf'), 'w') as f:
+        f.write('service {\n  base = node:20-alpine\n}\n')
+    result = subprocess.run(['./webcentral', 'check', d], capture_output=True, text=True,
+                            cwd=root, timeout=10)
+    assert 'node:20-alpine' in result.stdout, result.stdout
 
 
 @test

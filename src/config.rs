@@ -33,13 +33,13 @@ const READ_ONLY_VARS: &[&str] =
 /// quickly enough that carrying a language runtime by default would not pay for itself.
 pub const DEFAULT_BASE_IMAGE: &str = "alpine";
 /// Consulted only when the configuration doesn't say how to serve anything.
-const AUTO_DETECT_FILES: &[&str] = &["Procfile", "package.json"];
+const AUTO_DETECT_FILES: &[&str] = &["package.json"];
 
 /// The files that *define* a project, as opposed to the ones its servers run from. A change to any
 /// of them replaces the project wholesale, since the script and the set of servers may both be
 /// different. They are watched centrally for every project at once (see the config watcher in `server.rs`),
 /// because one inotify instance per project is what runs into the per-user cap first.
-pub const PROJECT_FILES: &[&str] = &[CONFIG_FILE, "Procfile", "package.json"];
+pub const PROJECT_FILES: &[&str] = &[CONFIG_FILE, "package.json"];
 
 /// What a service restarts for when it names no `reload_include` of its own: the code that
 /// plausibly *serves* the requests, rather than everything. Restarting is disruptive and most
@@ -217,34 +217,29 @@ impl ProjectConfig {
         let source = if config_path.exists() { fs::read_to_string(&config_path)? } else { String::new() };
 
         let mut config = parse(&source, Some(dir));
-        let mut detected = false;
 
         // A configuration that declares no server and never says how to answer a request leaves
         // room for the directory to speak for itself, whether or not a webcentral.conf exists.
         // The detected server is called `default`, so the implicit tail picks it up.
         if config.servers.is_empty() && !serves_anything(&config.script) {
             config.config_files.extend(AUTO_DETECT_FILES.iter().map(|f| f.to_string()));
-            if let Some((snippet, warnings)) = auto_detect(dir) {
+            if let Some(snippet) = auto_detect(dir) {
                 let parsed = parse(&snippet, Some(dir));
                 config.servers = parsed.servers;
                 config.errors.extend(parsed.errors);
                 config.warnings.extend(parsed.warnings);
-                config.warnings.extend(warnings);
-                detected = true;
             }
         } else if config.servers.iter().any(|s| s.command.is_empty() && s.app_dir.is_some()) {
             // A declared service with no command and the project directory mounted runs the
-            // project's own code, so its command is auto-detected too - that is how a Procfile
-            // project adds `packages` or reload rules without giving up detection. Without the
-            // mount there is nothing of the project to run, so the image's entrypoint stands.
+            // project's own code, so its command is detected too - that is how a node project
+            // adds `packages` or reload rules without giving up detection. Without the mount
+            // there is nothing of the project to run, so the image's entrypoint stands.
             config.config_files.extend(AUTO_DETECT_FILES.iter().map(|f| f.to_string()));
-            detected = true;
-            let donor = auto_detect(dir).map(|(snippet, warnings)| {
-                let detected = parse(&snippet, Some(dir));
-                config.errors.extend(detected.errors.iter().cloned());
-                config.warnings.extend(detected.warnings.iter().cloned());
-                config.warnings.extend(warnings);
-                detected.servers.into_iter().next()
+            let donor = auto_detect(dir).map(|snippet| {
+                let parsed = parse(&snippet, Some(dir));
+                config.errors.extend(parsed.errors.iter().cloned());
+                config.warnings.extend(parsed.warnings.iter().cloned());
+                parsed.servers.into_iter().next()
             });
             let mut errors = Vec::new();
             for server in
@@ -261,25 +256,13 @@ impl ProjectConfig {
                         }
                     }
                     None => errors.push(format!(
-                        "service '{}' has no command, and no Procfile or package.json to detect \
-                         one from - add 'command =', or 'app_dir = none' to run the image's \
-                         own entrypoint",
+                        "service '{}' has no command, and no package.json to detect one from - \
+                         add 'command =', or 'app_dir = none' to run the image's own entrypoint",
                         server.name
                     )),
                 }
             }
             config.errors.extend(errors);
-        }
-
-        // Said once the image is actually settled: a service declared in the file may have
-        // supplied the base that detection could not find.
-        if detected && config.servers.iter().any(|server| server.base.is_none()) {
-            config.warnings.push(
-                "No requirements.txt, Gemfile, go.mod or package.json next to the Procfile, so \
-                 its commands run on a bare alpine image - name a 'base' or 'packages' if they \
-                 need a runtime"
-                    .to_string(),
-            );
         }
 
         add_implicit_tail(&mut config, dir);
@@ -353,98 +336,20 @@ fn add_implicit_tail(config: &mut ProjectConfig, dir: &Path) {
     }
 }
 
-/// Synthesise a server declaration for a project that doesn't configure one, from Procfile or
-/// package.json. The generated source is what gets parsed, so there is one code path for both.
-/// The image a `Procfile` project needs, guessed from the manifest files beside it.
+/// Synthesise a server declaration for a project that doesn't configure one, from its
+/// `package.json`. The generated source is what gets parsed, so there is one code path for both.
 ///
-/// A Procfile says how to *start* an application but never what to start it with: on Heroku a
-/// buildpack decides that from exactly these files. Webcentral has no buildpacks, so it reads the
-/// same ones and picks an official image, which also gets the binary names right - a Procfile
-/// says `python`, and alpine's python3 package provides only `python3`.
-///
-/// The runtime, not the dependencies: nothing here runs `pip install`, because what that takes
-/// varies too much to guess. `copy` plus `build` is how a project says it (see the README).
-fn detected_base(dir: &Path) -> Option<&'static str> {
-    // package.json is last: plenty of Python and Ruby projects carry one for their front-end
-    // tooling, while the reverse is rare.
-    for (marker, image) in [
-        ("requirements.txt", "python:3-alpine"),
-        ("Pipfile", "python:3-alpine"),
-        ("pyproject.toml", "python:3-alpine"),
-        ("Gemfile", "ruby:3-alpine"),
-        ("go.mod", "golang:alpine"),
-        ("composer.json", "php:8-cli-alpine"),
-        ("package.json", "node:22-alpine"),
-    ] {
-        if dir.join(marker).exists() {
-            return Some(image);
-        }
+/// Only `package.json`, because `scripts.start` is the one widespread convention that says how to
+/// *start* an application. Manifests like `requirements.txt` or `Gemfile` say what to install,
+/// which is not the same question - guessing a command from them would be guessing.
+fn auto_detect(dir: &Path) -> Option<String> {
+    let content = fs::read_to_string(dir.join("package.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let start = value.get("scripts")?.get("start")?.as_str()?;
+    if start.is_empty() {
+        return None;
     }
-    None
-}
-
-fn auto_detect(dir: &Path) -> Option<(String, Vec<String>)> {
-    let procfile = dir.join("Procfile");
-    if procfile.exists() {
-        if let Ok(content) = fs::read_to_string(&procfile) {
-            let mut command = String::new();
-            let mut workers = String::new();
-            let mut warnings = Vec::new();
-            let mut worker_index = 0;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let Some((name, value)) = line.split_once(':') else { continue };
-                match name.trim() {
-                    "web" => command = value.trim().to_string(),
-                    "worker" | "urgentworker" => {
-                        // A nested service with no image settings of its own runs in the
-                        // parent's image, which is exactly what a Procfile worker is.
-                        workers.push_str(&format!(
-                            "  service w{} {{ command = {} }}\n",
-                            worker_index,
-                            value.trim()
-                        ));
-                        worker_index += 1;
-                    }
-                    other => warnings.push(format!(
-                        "Procfile process type '{}' is not supported and will be ignored",
-                        other
-                    )),
-                }
-            }
-            if !command.is_empty() {
-                let mut source = String::from("service {\n");
-                if let Some(base) = detected_base(dir) {
-                    source.push_str(&format!("  base = {}\n", base));
-                }
-                source.push_str(&format!("  command = {}\n", command));
-                source.push_str(&workers);
-                source.push_str("}\n");
-                return Some((source, warnings));
-            }
-        }
-    }
-
-    let package_json = dir.join("package.json");
-    if package_json.exists() {
-        if let Ok(content) = fs::read_to_string(&package_json) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
-                let start = value.get("scripts").and_then(|s| s.get("start")).and_then(|s| s.as_str());
-                if start.map(|s| !s.is_empty()).unwrap_or(false) {
-                    return Some((
-                        "service {\n  base = node:22-alpine\n  command = npm start\n}\n"
-                            .to_string(),
-                        Vec::new(),
-                    ));
-                }
-            }
-        }
-    }
-
-    None
+    Some("service {\n  base = node:22-alpine\n  command = npm start\n}\n".to_string())
 }
 
 // --- Statement signatures ---

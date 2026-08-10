@@ -274,6 +274,17 @@ impl AppServer {
         let _ = self.stop_tx.try_send(reason);
     }
 
+    /// Stop for a file change, and say so *now* rather than when the lifecycle task gets round to
+    /// it. The stop travels through a channel, so between a change being noticed and the task
+    /// acting on it there is a window in which the state still reads Running - and a request
+    /// arriving in it would be served by the very process that is about to be replaced, which is
+    /// exactly what someone who just edited a file will not expect. Marking it Stopped here makes
+    /// that request wait for the restart instead.
+    pub fn request_restart(&self) {
+        let _ = self.state_tx.send(AppState::Stopped);
+        self.request_stop(StopReason::FileChange);
+    }
+
     pub fn shutdown(&self) {
         self.request_stop(StopReason::Shutdown);
     }

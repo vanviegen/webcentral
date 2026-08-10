@@ -640,11 +640,13 @@ async fn apply_file_changes(
             let Some(path) = paths.iter().find(|p| server.wants(&p.to_string_lossy())) else {
                 continue;
             };
+            // Marked stale before the line is logged, so that anything reacting to the log -
+            // a person hitting reload, a test - cannot slip a request in ahead of the restart.
+            server.request_restart();
             project.logger.write(
                 &format!("server:{}", server.name()),
                 &format!("Stopping due to file changes: {}", path.display()),
             );
-            server.request_stop(StopReason::FileChange);
         }
     }
 }

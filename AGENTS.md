@@ -22,9 +22,9 @@ interpreter. Also static-file resolution (streamed, with `Range`/`If-Range` supp
 `check_auth` secret comparison
 
 `src/config.rs` - The configuration model and the parser for `webcentral.conf`; auto-detection
-from `Procfile`/`package.json` synthesises the same language rather than a separate code path,
-picking a runtime image from the manifests beside a `Procfile` the way a buildpack would (the
-runtime only - installing dependencies is left to `copy`/`build`)
+from `package.json` synthesises the same language rather than a separate code path. Only
+`package.json`, because `scripts.start` is the one convention that says how to *start* something -
+other manifests say what to install, which is a different question
 
 `src/parser.rs` - Scanner for the configuration language: words, quoting, blocks, diagnostics
 
@@ -283,7 +283,7 @@ request. A pattern naming a directory covers its contents; the `include-exclude-
 **Default excludes:** `_webcentral_data/**`, `node_modules/**`, `**/*.log`, `**/*.bak`, `**/.*`,
 `data/**`, `log/**`, `logs/**`, plus the project files below.
 
-**Project-defining files** (`webcentral.conf`, `Procfile`, `package.json`): watched centrally for
+**Project-defining files** (`webcentral.conf`, `package.json`): watched centrally for
 all projects at once, since the script and the set of servers may both be different afterwards.
 The project is deregistered *before* being torn down, closing the window in which requests would
 still reach the outgoing instance; the next request builds a new one.

@@ -10,7 +10,7 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
   to an application, forward, proxy, redirect or answer directly
 - Run any number of services per project, each in its own container with its own lifecycle,
   started only when a request is actually routed to it
-- Config file not always needed (detects `Procfile`, `package.json`, `public/`)
+- Config file not always needed (detects `package.json` and `public/`)
 
 ### Application lifecycle
 - On-demand startup when first accessed
@@ -54,8 +54,7 @@ sudo webcentral --email you@example.com --systemd
 The `email` flag is mandatory, as it's needed for Let's Encrypt. Alternatively you can disable HTTPS (`webcentral --https 0`). See `webcentral --help` for more options.
 
 Create a directory at `~/webcentral-projects/someapp.yourdomain.com/` with either:
-- A `Procfile` for Heroku-style applications
-- A `package.json` for Node.js apps (`npm run` should start a webserver on `$PORT`)
+- A `package.json` for Node.js apps (`npm start` should start a webserver on `$PORT`)
 - A `public/` folder for static files
 - A `webcentral.conf` for custom configuration (see below)
 
@@ -101,7 +100,9 @@ below, and run `webcentral check` - it names every line it doesn't understand. W
 
 - **Everything runs in a container**, so a project that used the host's `python`, `node` or `ruby`
   has to say which image has it: `base = python:3-alpine`, or `packages = ...` on top of alpine.
-  Projects detected from a `Procfile` or `package.json` pick a matching image themselves.
+- **`Procfile` is no longer read.** It only ever supplied a command line, while the runtime and the
+  dependencies it assumes came from Heroku's buildpacks - so write the `web:` line as `command =`,
+  and its `worker:` lines as nested services.
 - **Dependencies are not installed for you.** Heroku's buildpacks do that; webcentral does not.
   Use `copy` and `build` (see **Services**), or install them in the `command`.
 - **There are no accounts or passwords.** `[auth]` and its hashes are gone. `check_auth <secret>`
@@ -124,18 +125,21 @@ With **no configuration file at all**, webcentral looks at what the directory ho
 | The directory contains | What happens |
 |------------------------|--------------|
 | `public/` | its files are served |
-| `Procfile` with a `web:` line | that command is run as a service, with its `worker:` lines alongside, on an image chosen from the manifest beside it (`requirements.txt` → python, `Gemfile` → ruby, `go.mod` → go, ...) |
 | `package.json` with a `start` script | `npm start` is run as a service, on a node image |
 
 That still applies when a `webcentral.conf` is present but never says how to answer a request - so
-a file that only sets `log_requests` doesn't stop a `Procfile` from being picked up.
+a file that only sets `log_requests` doesn't stop a `package.json` from being picked up.
+
+Nothing else is guessed at. `requirements.txt` and `Gemfile` say what to *install*, not what to
+run, and inventing a start command from them would be inventing - so every other language says it
+in three lines, which is what the rest of this chapter is about.
 
 It even applies to a declared `service` that names no `command` (while the project directory is
-mounted, the default): the command (and any `worker:` lines) are taken from the `Procfile` or
-`package.json`, so detection can be *tuned* rather than given up:
+mounted, the default): the command is taken from `package.json`, so detection can be *tuned*
+rather than given up:
 
 ```
-service {                # next to a Procfile with a `web:` line
+service {                # next to a package.json with a `start` script
   packages = imagemagick
 }
 ```
@@ -942,6 +946,7 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 ## Changelog
 
 2026-08-10 (3.0.0):
+  - `Procfile` is no longer detected: it supplied a command but never the runtime or the dependencies its commands assume, so the compatibility was partial in a way that failed at run time rather than at parse time. `package.json` with a `start` script still is
   - **`webcentral.ini` is replaced by `webcentral.conf`**, a small configuration language. A project's requests are handled by a routing script run top to bottom - `match`, `serve`, `serve_dir`, `check_file`, `forward`, `proxy`, `respond` and friends - which subsumes what used to be fixed project types: a redirect project is now the one-line script `redirect https://example.com status=301`. The old format is not read; see **Configuration** above. Projects that need no configuration file (`public/`, `Procfile`, `package.json`) are unaffected
   - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. `webcentral check` parses a project without starting anything
   - **Everything runs in a container.** Firejail support is gone and with it the choice: one keyword, `service`, and podman as the only external dependency. A project can declare several, each with its own image, port, lifecycle and reload rules, each started only when a request is routed to it. A nested `service` is a *sidecar* sharing its parent's lifetime, image and environment - which is what replaced workers
