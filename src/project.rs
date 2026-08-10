@@ -6,7 +6,8 @@
 //! servers share: a change to the config replaces the project wholesale, any other watched change
 //! stops the servers so they restart from the new files on the next request.
 
-use crate::app_server::{get_ownership, AppServer, AppState, StopReason};
+use crate::app_server::{AppServer, AppState, StopReason};
+use crate::owner::Owner;
 use crate::config::ProjectConfig;
 use crate::dashboard::ServerStatus;
 use crate::logger::Logger;
@@ -82,7 +83,8 @@ impl Project {
             })
             .collect();
         let config = ProjectConfig::load(dir)?;
-        let (uid, gid) = get_ownership(dir);
+        let owner = Owner::of(dir);
+        let (uid, gid) = (owner.uid, owner.gid);
 
         let log_dir = dir.join("_webcentral_data/log");
         let logger = Arc::new(Logger::new(log_dir, uid, gid, prune_logs)?);
@@ -91,6 +93,13 @@ impl Project {
         for problem in config.errors.iter().chain(config.warnings.iter()) {
             logger.write("supervisor", problem);
         }
+        // Said where both audiences look: the owner reads their project's log, whoever runs
+        // webcentral reads its output. A project with an unusable owner is still registered - its
+        // services will fail to start, and by then this has already explained why.
+        for problem in &owner.problems {
+            logger.write("supervisor", problem);
+            eprintln!("{}: {}", domain, problem);
+        }
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -98,9 +107,7 @@ impl Project {
         let servers = config
             .servers
             .iter()
-            .map(|server| {
-                AppServer::new(server.clone(), dir, uid, gid, logger.clone())
-            })
+            .map(|server| AppServer::new(server.clone(), dir, owner.clone(), logger.clone()))
             .collect();
 
         // The project's own domain, as opposed to `$host` - which is whatever the client asked for.

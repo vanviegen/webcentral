@@ -55,7 +55,7 @@ jobs:
           keepid=test_podman_user_override,test_podman_foreign_user_mapped_to_owner
           if [ "${{ matrix.mode }}" = root ]; then
             sudo --preserve-env=PATH ./test.py \
-              --require "test_podman_bakes_owner_into_image,$keepid" 2>&1 | tee test-output.log
+              --require "test_podman_runs_as_the_project_owner,$keepid" 2>&1 | tee test-output.log
           else
             ./test.py --require "$keepid" 2>&1 | tee test-output.log
           fi

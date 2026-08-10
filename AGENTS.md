@@ -31,6 +31,9 @@ other manifests say what to install, which is a different question
 (Include/exclude path matching lives in the `include-exclude-watcher` crate's public `Matcher`,
 which webcentral uses to decide which server a changed file belongs to.)
 
+`src/owner.rs` - Who a project belongs to: resolves the owner, checks the host can run rootless
+podman as them, and hands out a `Command` that will
+
 `src/dashboard.rs` - The built-in status page
 
 `src/logger.rs` - Daily-rotated logs with configurable retention
@@ -221,7 +224,11 @@ gets killed and the container keeps running.
 **Process exit detection:** `wait_for_port_ready` polls `try_wait()` to detect early process exit during startup.
 
 **Podman** is the only way a service runs; there is no unsandboxed path. Via `get_podman_path()`:
-- Custom Dockerfile generation: packages, `copy`ed project files (into `/webcentral-build`, since
+- A project's own `Dockerfile` is built with the project directory as context, which podman
+  confines - `COPY ../x` is refused and symlinks resolve inside it. Its tag is fixed and the build
+  is re-run whenever the image is prepared, since podman's cache makes an unchanged one cheap and
+  nothing else would notice a changed context
+- Otherwise, custom Dockerfile generation: packages, `copy`ed project files (into `/webcentral-build`, since
   `/app` is shadowed by the run-time mount), build commands, and - for `user = project` - the
   project owner appended to `/etc/passwd`+`/etc/group` followed by a `USER` directive
 - `copy` contents are hashed into the image tag and their paths added to `reload_include`, and a
@@ -235,6 +242,16 @@ gets killed and the container keeps running.
 - Port mapping from internal to host
 - Volume mounts for app dir and additional paths
 
+**Podman always runs as the project's owner.** `Owner::podman()` is the only place a podman
+command is made: when webcentral is root it drops to the owner in a `pre_exec` hook - setgroups,
+setgid, setuid in that order, because `Command::uid` would apply too late to shed root's
+supplementary groups - and passes `--root`/`--runroot` for a store of webcentral's own under that
+user's home. That store cannot be the user's own: podman records the run root in the store's
+database, so a second one fails with a configuration mismatch, and webcentral claiming theirs first
+would break their `podman`. When webcentral already *is* the owner, podman's defaults are right and
+nothing is set. Owners are resolved once and cached per uid, with subuid/subgid and
+`newuidmap`/`newgidmap` checked then - reported to both webcentral's output and the project's log.
+
 **Container user:** a service's `user` only decides who the container runs as *inside*, defaulting
 (resolved at parse time) to `project` when the project directory is mounted (`app_dir` is not
 `none`) and `image` when it isn't.
@@ -245,20 +262,12 @@ image declares (forcing a user breaks image-baked directories). Bare numeric uid
 parse - the gid they pair with depends on the image's passwd. Unknown ids are resolved by
 `container_user_ids()` (runs `id` in the image, cached per image+user, assumes root on failure).
 
-**Host-side ownership is a single invariant:** whatever the container runs as, everything it
-writes into the project dir or `mounts[]` lands owned by the project owner. `add_userns_args` is
-the one place implementing it: a root webcentral (rootful podman) passes an identity
-`--uidmap`/`--gidmap` with the container ids and owner swapped (no namespace when they already
-match); a non-root webcentral (rootless podman) can only map onto its own user, which is the owner
-exactly when the project is its own - container root needs no flags, only explicitly requested
-other uids get `--userns=keep-id:uid=,gid=` (podman >= 4.3, and broken on some podman/kernel
-combos - containers/podman#27785 - where such containers fail at start rather than leak) - and
-any other owner is warned about. `mounts[]`/home directories are created owned by the project
-owner accordingly; existing directories are never touched. The mapping only covers the *resolved*
-user - other ids stay identity, since uid maps are injective and images need setuid/chown to
-other ids to keep working - so an image that switches at runtime to a uid it doesn't declare
-(postgres-style root→999 entrypoints) writes as that uid; an explicit `user =` brings it under
-the invariant.
+**Host-side ownership is structural, not maintained:** podman runs as the owner, so container
+root - which is what `user = project` resolves to - is that owner, and what it writes is theirs
+without any mapping. Only an explicitly requested *other* uid needs `--userns=keep-id` (podman >=
+4.3, and broken on some podman/kernel combinations, containers/podman#27785), which is why the
+mapping only covers the resolved user: an image that switches at runtime to a uid it does not
+declare writes as that uid.
 
 **Sidecars:** Nested server declarations, spawned before their parent and killed with it. One
 without a `base` of its own inherits the parent's prepared image *and* its `env` (its own entries

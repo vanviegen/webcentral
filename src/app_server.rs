@@ -12,6 +12,7 @@
 
 use crate::config::{ServerConfig, DEFAULT_BASE_IMAGE};
 use crate::logger::Logger;
+use crate::owner::Owner;
 use crate::project::StreamBody;
 use crate::server::SHARED_EXECUTOR;
 use crate::streams::AnyConnector;
@@ -85,8 +86,8 @@ pub struct AppServer {
     /// starting a second one.
     prepared: Mutex<std::collections::HashMap<String, Prepared>>,
     dir: PathBuf,
-    uid: u32,
-    gid: u32,
+    /// Whose project this is: podman runs as them, so what a container writes is already theirs.
+    owner: Arc<Owner>,
     connection: Mutex<Option<AppConnection>>,
     state_tx: watch::Sender<AppState>,
     state_rx: watch::Receiver<AppState>,
@@ -106,8 +107,7 @@ impl AppServer {
     pub fn new(
         config: ServerConfig,
         dir: &Path,
-        uid: u32,
-        gid: u32,
+        owner: Arc<Owner>,
         logger: Arc<Logger>,
     ) -> Arc<AppServer> {
         let (state_tx, state_rx) = watch::channel(AppState::Stopped);
@@ -120,8 +120,7 @@ impl AppServer {
             config,
             logger,
             dir: dir.to_path_buf(),
-            uid,
-            gid,
+            owner,
             connection: Mutex::new(None),
             state_tx,
             state_rx,
@@ -445,13 +444,15 @@ impl AppServer {
         }
     }
 
-    /// Forget what was prepared, so the next start derives the image afresh. Only needed when a
-    /// service copies project files into its image: everything else the image is built from comes
-    /// from `webcentral.conf`, and a change to that replaces the whole project anyway.
+    /// Forget what was prepared, so the next start derives the image afresh. Only needed when the
+    /// image is built from project files - `copy`, or a Dockerfile of the project's own: anything
+    /// else it is built from comes from `webcentral.conf`, and a change to that replaces the whole
+    /// project anyway.
     async fn forget_prepared_if_copying(&self) {
-        let copies = !self.config.copy.is_empty()
-            || self.config.sidecars.iter().any(|sidecar| !sidecar.copy.is_empty());
-        if copies {
+        let from_project = |config: &ServerConfig| {
+            !config.copy.is_empty() || config.dockerfile.is_some()
+        };
+        if from_project(&self.config) || self.config.sidecars.iter().any(from_project) {
             self.prepared.lock().await.clear();
         }
     }
@@ -557,14 +558,12 @@ impl AppServer {
             .container_names()
             .into_iter()
             .map(|name| {
-                tokio::spawn(async move {
-                    let _ = Command::new(get_podman_path())
-                        .args(["stop", "--time", "2", &name])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await;
-                })
+                // Built here, run there: the command carries the owner's identity with it.
+                let mut stop = self.owner.podman();
+                stop.args(["stop", "--time", "2", &name])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                tokio::spawn(async move { let _ = stop.status().await; })
             })
             .collect();
         for stop in stops {
@@ -663,7 +662,7 @@ impl AppServer {
 
     async fn ensure_network(&self) -> Result<()> {
         let name = self.network_name();
-        let exists = Command::new(get_podman_path())
+        let exists = self.owner.podman()
             .args(["network", "exists", &name])
             .status()
             .await
@@ -672,7 +671,7 @@ impl AppServer {
         if exists {
             return Ok(());
         }
-        let out = Command::new(get_podman_path())
+        let out = self.owner.podman()
             .args(["network", "create", &name])
             .output()
             .await?;
@@ -788,11 +787,13 @@ impl AppServer {
             return Ok(());
         }
         fs::create_dir_all(path)?;
-        if get_ownership(path) != (self.uid, self.gid) {
-            if let Err(e) = std::os::unix::fs::chown(path, Some(self.uid), Some(self.gid)) {
+        if crate::owner::ownership(path) != (self.owner.uid, self.owner.gid) {
+            if let Err(e) =
+                std::os::unix::fs::chown(path, Some(self.owner.uid), Some(self.owner.gid))
+            {
                 self.logger.write("podman", &format!(
                     "Could not give {} to {}:{} ({}); the container may not be able to write there.",
-                    path.display(), self.uid, self.gid, e));
+                    path.display(), self.owner.uid, self.owner.gid, e));
             }
         }
         Ok(())
@@ -814,7 +815,7 @@ impl AppServer {
 
         // Asking `id` inside the container resolves names and an absent USER uniformly, and pulls
         // the image if it isn't local yet - which `run` would do moments later anyway.
-        let mut probe = Command::new(get_podman_path());
+        let mut probe = self.owner.podman();
         probe.args(["run", "--rm", "--entrypoint", "/bin/sh"]);
         if let Some(user) = user_arg {
             probe.args(["--user", user]);
@@ -841,7 +842,7 @@ impl AppServer {
         // image's passwd to resolve.
         let ids = match (ids, user_arg) {
             (None, None) => {
-                let out = Command::new(get_podman_path())
+                let out = self.owner.podman()
                     .args(["image", "inspect", "--format", "{{.Config.User}}", image])
                     .output()
                     .await;
@@ -868,12 +869,7 @@ impl AppServer {
 
     /// Build (or reuse) an image derived from the configured base, optionally with `uid:gid` added
     /// as a real user that the image then runs as.
-    async fn build_image(
-        &self,
-        config: &ServerConfig,
-        build_user: Option<(u32, u32)>,
-        base: &str,
-    ) -> Result<String> {
+    async fn build_image(&self, config: &ServerConfig, base: &str) -> Result<String> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -915,26 +911,12 @@ impl AppServer {
             ));
         }
 
-        // Added last, so the build itself still runs as root. Appending to passwd/group only when
-        // the ids are absent keeps this additive: unlike bind-mounting the host's passwd over the
-        // image's at runtime, it can't break users the image defines for itself. A real entry
-        // matters because a uid without one has no name and no home, which trips up git, npm and
-        // anything else calling getpwuid().
-        if let Some((uid, gid)) = build_user {
-            dockerfile.push_str(&format!(
-                "RUN grep -q \"^[^:]*:[^:]*:{gid}:\" /etc/group || echo \"webcentral:x:{gid}:\" >> /etc/group ; \
-                grep -q \"^[^:]*:[^:]*:{uid}:\" /etc/passwd || echo \"webcentral:x:{uid}:{gid}::{home}:/bin/sh\" >> /etc/passwd\n\
-                USER {uid}:{gid}\n",
-                uid = uid, gid = gid, home = self.container_home(config)
-            ));
-        }
-
         // Tag by what goes into the image rather than by project directory alone, so an unchanged
         // configuration can skip the build entirely. Even a fully cached build costs about a
         // second, and servers are started on demand while a request is waiting. The base image's
         // local ID is part of the hash, so a pulled base update triggers one (cached) rebuild. A
         // base that isn't local yet hashes as empty and self-corrects once the first build pulls it.
-        let base_id = Command::new(get_podman_path())
+        let base_id = self.owner.podman()
             .args(["image", "inspect", "--format", "{{.Id}}", base])
             .output()
             .await
@@ -970,7 +952,7 @@ impl AppServer {
         let repo = format!("webcentral-{:x}", self.dir_hash(&config.name));
         let image_name = format!("{}:{:x}", repo, hasher.finish());
 
-        let exists = Command::new(get_podman_path())
+        let exists = self.owner.podman()
             .args(["image", "inspect", &image_name])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -989,7 +971,7 @@ impl AppServer {
         fs::create_dir_all(dockerfile_path.parent().unwrap())?;
         fs::write(&dockerfile_path, &dockerfile)?;
 
-        let output = Command::new(get_podman_path())
+        let output = self.owner.podman()
             .args(["build", "-t", &image_name, "-f"])
             .arg(&dockerfile_path)
             .arg(&self.dir)
@@ -1003,7 +985,7 @@ impl AppServer {
 
         // Remove this server's images for older configs. They are named tags, which
         // `podman image prune` never touches, so they would otherwise pile up forever.
-        if let Ok(out) = Command::new(get_podman_path())
+        if let Ok(out) = self.owner.podman()
             .args(["images", &repo, "--format", "{{.Tag}}"])
             .output()
             .await
@@ -1011,7 +993,7 @@ impl AppServer {
             for tag in String::from_utf8_lossy(&out.stdout).split_whitespace() {
                 let stale = format!("{}:{}", repo, tag);
                 if stale != image_name {
-                    let _ = Command::new(get_podman_path())
+                    let _ = self.owner.podman()
                         .args(["rmi", &stale])
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
@@ -1024,6 +1006,43 @@ impl AppServer {
         Ok(image_name)
     }
 
+    /// Build the project's own Dockerfile, with the project directory as the build context.
+    ///
+    /// Nothing of ours goes into it: the file says what the image is. Podman confines the context
+    /// to that directory - `COPY ../x` is refused, and a symlink out of it resolves *inside* it
+    /// and so finds nothing - which is what makes it safe to build somebody else's Dockerfile on a
+    /// shared host. The build runs as the project's owner like everything else, so what its `RUN`
+    /// steps can reach is what that person can reach.
+    ///
+    /// The tag is fixed and the build is run every time the image is prepared: podman's layer
+    /// cache makes that cheap when nothing changed, and it is the only way to notice that
+    /// something did without hashing the whole project.
+    async fn build_from_dockerfile(&self, config: &ServerConfig, dockerfile: &str) -> Result<String> {
+        let base = self.dir.canonicalize()?;
+        let path = base.join(dockerfile).canonicalize().map_err(|e| {
+            anyhow::anyhow!("dockerfile {}: {}", dockerfile, e)
+        })?;
+        if !path.starts_with(&base) {
+            anyhow::bail!("dockerfile {} leads outside the project directory", dockerfile);
+        }
+
+        let image = format!("webcentral-{:x}:dockerfile", self.dir_hash(&config.name));
+        self.log(&format!("Building {} from {}", image, dockerfile));
+        let output = self
+            .owner
+            .podman()
+            .args(["build", "-t", &image, "-f"])
+            .arg(&path)
+            .arg(&base)
+            .output()
+            .await?;
+        if !output.status.success() {
+            self.logger.write("podman", &String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!("building {} failed", dockerfile);
+        }
+        Ok(image)
+    }
+
     /// Home directory for the baked-in user. It lives in the project directory when that is
     /// mounted, so it persists; otherwise there is nowhere to put it that outlives the container.
     fn container_home(&self, config: &ServerConfig) -> String {
@@ -1033,36 +1052,24 @@ impl AppServer {
         }
     }
 
-    /// The one place uid policy lives: whatever user the container runs as inside, everything it
-    /// writes into the project directory or `mounts` must land on the host owned by the project
-    /// owner. Rootful podman maps host ids straight through, so when the container user differs
-    /// from the owner, an identity mapping with the two swapped puts the container's writes on the
-    /// owner - and shows it the owner's files as its own. A non-root webcentral means rootless
-    /// podman, where the only host user a container can write as is webcentral's own: that's the
-    /// owner precisely when the project is ours, and unsupported otherwise. Container root already
-    /// is us under rootless podman (`user = project` resolves to it for that reason), so only an
-    /// explicitly requested other uid needs keep-id - which fails at start, loudly rather than by
-    /// leaking ownership, on setups where custom rootless mappings are broken (podman#27785).
+    /// Which user the container runs as *inside*.
+    ///
+    /// Podman is already the project's owner, and rootless podman maps container root onto the
+    /// invoking user - so a container that runs as root writes as the owner with no help from us.
+    /// That is why `project` resolves to root rather than to the owner's own id. Anything else the
+    /// image or the configuration asks for is a different id inside, which only lands on the owner
+    /// if podman is told to map it: `keep-id` does that, and is skipped for root, where it would
+    /// be a no-op that some podman/kernel combinations refuse anyway (containers/podman#27785).
     fn add_userns_args(&self, cmd: &mut Command, run_uid: u32, run_gid: u32) {
-        let euid = nix::unistd::geteuid().as_raw();
-        if euid == 0 {
-            if (run_uid, run_gid) != (self.uid, self.gid) {
-                cmd.args(swap_map_args("--uidmap", run_uid, self.uid));
-                cmd.args(swap_map_args("--gidmap", run_gid, self.gid));
-            }
-        } else if self.uid != euid {
-            self.logger.write("podman", &format!(
-                "This project is owned by uid {} but webcentral runs as uid {}; a non-root \
-                 webcentral can only keep container-written files owned by its own user. Files \
-                 this container writes may end up owned by a meaningless subuid.",
-                self.uid, euid));
-        } else if run_uid == 0 {
-            // Rootless podman maps container root to us all by itself.
-        } else if (run_uid, run_gid) == (euid, nix::unistd::getegid().as_raw()) {
+        if run_uid == 0 && run_gid == 0 {
+            return;
+        }
+        let (euid, egid) = (nix::unistd::geteuid().as_raw(), nix::unistd::getegid().as_raw());
+        if (run_uid, run_gid) == (euid, egid) {
             // The plain form works on any podman version, unlike the uid=/gid= form below.
             cmd.args(["--userns", "keep-id"]);
         } else {
-            // Map us to whatever the container runs as (needs podman >= 4.3).
+            // Map the owner to whatever the container runs as (needs podman >= 4.3).
             cmd.args(["--userns", &format!("keep-id:uid={},gid={}", run_uid, run_gid)]);
         }
     }
@@ -1077,16 +1084,11 @@ impl AppServer {
 
         let image = self.prepare_image(config, parent_image).await?;
 
-        // `user` only decides who the container runs as *inside* - host-side, add_userns_args
-        // makes its writes land owned by the project owner regardless. Under a root webcentral,
-        // `project` bakes the owner into the image as a real user and lets the image declare it.
-        // Under a non-root webcentral (rootless podman) the owner is container root - that is how
-        // rootless podman represents the invoking user - so there is nothing to bake and nothing
-        // to map. `known` skips asking podman when the config already tells us, and must always
-        // agree with what podman would report.
-        let rootful = nix::unistd::geteuid().is_root();
+        // `user` only decides who the container runs as *inside*; the owner's writes land as
+        // theirs either way. `project` is container root, which is how rootless podman represents
+        // the user it runs as. `known` skips asking podman when the configuration already tells
+        // us, and must always agree with what podman would report.
         let (user_arg, known): (Option<String>, Option<(u32, u32)>) = match config.user.as_str() {
-            "project" if rootful => (None, Some((self.uid, self.gid))),
             "project" => (Some("0:0".to_string()), Some((0, 0))),
             "image" => (None, None),
             spec => (Some(spec.to_string()), parse_numeric_user(spec)),
@@ -1121,10 +1123,12 @@ impl AppServer {
             (None, Some(parent)) => parent.to_string(),
             (None, None) => DEFAULT_BASE_IMAGE.to_string(),
         };
-        let build_user = self.build_user(config);
-        if build_user.is_none() && config.packages.is_empty() && config.build.is_empty() {
+        if let Some(dockerfile) = &config.dockerfile {
+            return self.build_from_dockerfile(config, dockerfile).await;
+        }
+        if config.packages.is_empty() && config.build.is_empty() {
             // Nothing to add, so the base image is the image - but it still has to be here.
-            let present = Command::new(get_podman_path())
+            let present = self.owner.podman()
                 .args(["image", "exists", &base])
                 .status()
                 .await
@@ -1132,7 +1136,7 @@ impl AppServer {
                 .unwrap_or(false);
             if !present {
                 self.log(&format!("Pulling {}", base));
-                let out = Command::new(get_podman_path())
+                let out = self.owner.podman()
                     .args(["pull", &base])
                     .output()
                     .await?;
@@ -1146,15 +1150,7 @@ impl AppServer {
             }
             return Ok(base);
         }
-        self.build_image(config, build_user, &base).await
-    }
-
-    /// Whether the project owner has to be baked into the image as a real user.
-    fn build_user(&self, config: &ServerConfig) -> Option<(u32, u32)> {
-        match config.user.as_str() {
-            "project" if nix::unistd::geteuid().is_root() => Some((self.uid, self.gid)),
-            _ => None,
-        }
+        self.build_image(config, &base).await
     }
 
     async fn build_podman_command(
@@ -1172,14 +1168,14 @@ impl AppServer {
         // name, so anything still answering to it is a leftover of ours. `--time 2`: without it a
         // still-running leftover gets podman's default 10s SIGTERM grace, all of it spent in this
         // start's critical path while a request waits.
-        let _ = Command::new(get_podman_path())
+        let _ = self.owner.podman()
             .args(["rm", "--force", "--time", "2", &container_name])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .await;
 
-        let mut cmd = Command::new(get_podman_path());
+        let mut cmd = self.owner.podman();
         cmd.args(["run", "--rm", "--name", &container_name]);
 
         self.add_userns_args(&mut cmd, run_uid, run_gid);
@@ -1295,11 +1291,6 @@ fn internal_host(name: &str) -> String {
     format!("{}.internal", name)
 }
 
-pub fn get_ownership(path: &Path) -> (u32, u32) {
-    use std::os::unix::fs::MetadataExt;
-    fs::metadata(path).ok().map(|m| (m.uid(), m.gid())).unwrap_or((0, 0))
-}
-
 fn get_free_port() -> Result<u16> {
     use std::os::unix::io::AsRawFd;
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -1316,27 +1307,6 @@ fn get_free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-/// Returns the podman installation to use, checking PATH on first call.
-fn get_podman_path() -> &'static str {
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::OnceLock;
-    static PODMAN_PATH: OnceLock<String> = OnceLock::new();
-
-    PODMAN_PATH.get_or_init(|| {
-        let path_var = std::env::var("PATH").unwrap_or_default();
-        for dir in path_var.split(':') {
-            let full_path = PathBuf::from(dir).join("podman");
-            if let Ok(meta) = fs::metadata(&full_path) {
-                if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 {
-                    return full_path.to_string_lossy().to_string();
-                }
-            }
-        }
-        println!("Warning: podman not found in PATH");
-        "podman".to_string()
-    })
-}
-
 /// Parse a numeric `uid:gid` pair. Anything else - including a bare uid, whose gid would depend on
 /// the image's /etc/passwd - returns None.
 fn parse_numeric_user(spec: &str) -> Option<(u32, u32)> {
@@ -1344,28 +1314,3 @@ fn parse_numeric_user(spec: &str) -> Option<(u32, u32)> {
     Some((uid.parse().ok()?, gid.parse().ok()?))
 }
 
-/// Podman `--uidmap`/`--gidmap` arguments for an identity mapping over 0..max(65536, ids+1) with
-/// `container_id` and `host_id` swapped (a mapping must be a bijection, so the displaced id has to
-/// land somewhere). Under rootful podman host ids map directly, so this makes everything the
-/// container writes as `container_id` land on the host as `host_id` and vice versa, while every
-/// other id stays put, keeping the rest of the image's ownership intact. Equal ids degenerate to a
-/// plain identity map.
-fn swap_map_args(flag: &str, container_id: u32, host_id: u32) -> Vec<String> {
-    let (lo, hi) = (container_id.min(host_id), container_id.max(host_id));
-    let top = 65536.max(hi.saturating_add(1));
-    let mut args = Vec::new();
-    let mut push = |from: u32, to: u32, amount: u32| {
-        if amount > 0 {
-            args.push(flag.to_string());
-            args.push(format!("{}:{}:{}", from, to, amount));
-        }
-    };
-    push(0, 0, lo);
-    push(lo, hi, 1);
-    push(lo + 1, lo + 1, hi.saturating_sub(lo + 1));
-    if hi != lo {
-        push(hi, lo, 1);
-    }
-    push(hi.saturating_add(1), hi.saturating_add(1), top.saturating_sub(hi.saturating_add(1)));
-    args
-}

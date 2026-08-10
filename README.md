@@ -104,7 +104,7 @@ below, and run `webcentral check` - it names every line it doesn't understand. W
   dependencies it assumes came from Heroku's buildpacks - so write the `web:` line as `command =`,
   and its `worker:` lines as nested services.
 - **Dependencies are not installed for you.** Heroku's buildpacks do that; webcentral does not.
-  Use `copy` and `build` (see **Services**), or install them in the `command`.
+  Use `copy` and `build` (see **Services**), a `Dockerfile`, or install them in the `command`.
 - **There are no accounts or passwords.** `[auth]` and its hashes are gone. `check_auth <secret>`
   guards a dashboard with one shared secret; real logins belong to the application.
 - `[rewrite] /a = /b` becomes `match /a set path /b`, and a rewrite target that was a URL becomes
@@ -125,6 +125,7 @@ With **no configuration file at all**, webcentral looks at what the directory ho
 | The directory contains | What happens |
 |------------------------|--------------|
 | `public/` | its files are served |
+| `Dockerfile` | it is built, and its `CMD` is run - whatever language the project is in |
 | `package.json` with a `start` script | `npm start` is run as a service, on a node image |
 
 That still applies when a `webcentral.conf` is present but never says how to answer a request - so
@@ -583,6 +584,7 @@ service {                         # no name, so it is called "default"
 | `packages` | Packages to add to it (auto-detects `apk`, `apt-get`, `dnf`, `yum`). |
 | `build` | A command to run when the image is built. Repeat for more. |
 | `copy` | Project files to put in the image before `build` runs, so it can use them (`copy = requirements.txt`). Paths are relative to the project and may not leave it. Editing one rebuilds the image and restarts the service. |
+| `dockerfile` | Build the image from a Dockerfile of the project's own - see **Dockerfiles** below. Replaces `base`, `packages`, `build` and `copy`. |
 | `port` | The port the command listens on inside the container. Default `8000`. |
 | `mounts` | Directories that outlive the container, kept in `_webcentral_data/mounts/`. Relative paths are under `app_dir`. |
 | `app_dir` | Where the project directory is mounted. Default `/app`; `none` mounts nothing, for images that carry the application themselves. |
@@ -637,6 +639,41 @@ service web {
 match /api/(.*) serve api
 serve web
 ```
+
+### Dockerfiles
+
+A project that ships a `Dockerfile` has already answered every question webcentral would otherwise
+ask - which runtime, which dependencies, which command - in whatever language it is written in. It
+needs no configuration at all:
+
+```
+project/
+  Dockerfile        # built with the project directory as its context
+  ...
+```
+
+Or named explicitly, when it is not the whole story:
+
+```ini
+service {
+  dockerfile = Dockerfile
+  port = 3000
+}
+```
+
+The image carries the application, so **the project directory is not mounted** and `app_dir`
+defaults to `none`. That has a consequence worth knowing before you choose: a file change means a
+**rebuild**, not a restart - so the edit-and-refresh loop that mounted services get does not apply.
+Everything in the directory is watched, since anything in the build context can change what the
+image is, and podman's layer cache keeps an unchanged rebuild to about a second.
+
+`dockerfile` and `base`/`packages`/`build`/`copy` are alternatives, and saying both is an error:
+the Dockerfile is already the answer to how the image gets built.
+
+A Dockerfile can only reach what is inside the project directory. `COPY ../elsewhere` is refused,
+and a symlink pointing out of the project resolves *inside* it and so finds nothing - podman
+confines the build context, which is what makes it safe to build one user's Dockerfile on a
+machine shared with others. Its `RUN` steps execute as the project's owner, like everything else.
 
 ### Sidecars
 
@@ -862,10 +899,17 @@ serve app
 (also 999) and Redis need the same treatment; an image that runs as the user it declares does not.
 
 Whatever it runs as, **everything the container writes into the project directory or its `mounts`
-lands on the host owned by the project owner.** A root webcentral maps the container's user onto
-the owner; a non-root one can only write as itself, which is the owner exactly when the project is
-yours (and warns when it isn't). An image that switches at runtime to a uid it doesn't declare
-writes as that uid instead - naming it in `user` brings it back under the guarantee.
+lands on the host owned by the project owner** - because podman itself runs as that owner.
+Webcentral never runs a container as root: when it runs as root it becomes the project's owner
+before calling podman, and rootless podman maps container root onto whoever invoked it. An image
+that switches at runtime to a uid it doesn't declare writes as that uid instead; naming it in
+`user` brings it back under the guarantee.
+
+Each owner gets a podman image store of its own, under their home directory. It is separate from
+whatever they use podman for themselves, which means webcentral's images do not appear in their
+`podman images` - and equally that their `podman system prune` cannot take webcentral's away.
+Rootless podman needs a subordinate id range per user (`/etc/subuid` and `/etc/subgid`); webcentral
+checks for one when it first sees a project and says exactly what to run if it is missing.
 
 ---
 
@@ -949,6 +993,8 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
   - `Procfile` is no longer detected: it supplied a command but never the runtime or the dependencies its commands assume, so the compatibility was partial in a way that failed at run time rather than at parse time. `package.json` with a `start` script still is
   - **`webcentral.ini` is replaced by `webcentral.conf`**, a small configuration language. A project's requests are handled by a routing script run top to bottom - `match`, `serve`, `serve_dir`, `check_file`, `forward`, `proxy`, `respond` and friends - which subsumes what used to be fixed project types: a redirect project is now the one-line script `redirect https://example.com status=301`. The old format is not read; see **Configuration** above. Projects that need no configuration file (`public/`, `Procfile`, `package.json`) are unaffected
   - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. `webcentral check` parses a project without starting anything
+  - **Containers always run as the project's owner**, through rootless podman, whether webcentral itself runs as root or not. A container - and more sharply a `build` command, which is arbitrary code from the project - therefore has at worst that person's privileges, and "what a container writes is owned by the project owner" stops being a hand-built uid mapping and becomes what podman does by itself. Each owner gets an image store of their own, so nothing is shared with, or prunable by, their own podman
+  - A project with a **`Dockerfile`** is built and run from it, in any language and with no configuration - the file already says which runtime, which dependencies and which command. Its build context cannot reach outside the project directory
   - **Everything runs in a container.** Firejail support is gone and with it the choice: one keyword, `service`, and podman as the only external dependency. A project can declare several, each with its own image, port, lifecycle and reload rules, each started only when a request is routed to it. A nested `service` is a *sidecar* sharing its parent's lifetime, image and environment - which is what replaced workers
   - **Authentication belongs to the application.** Basic auth, password hashes and the auth cookie are gone. What remains is `check_auth <secret>` for guarding a dashboard, and `X-Accel-Redirect`, which lets an application authorise a request and hand the delivery back to webcentral
   - `env_file` keeps secrets out of the configuration, and they reach a container through podman's environment rather than its command line, which `ps` exposes to every user on the machine

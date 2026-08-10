@@ -33,13 +33,13 @@ const READ_ONLY_VARS: &[&str] =
 /// quickly enough that carrying a language runtime by default would not pay for itself.
 pub const DEFAULT_BASE_IMAGE: &str = "alpine";
 /// Consulted only when the configuration doesn't say how to serve anything.
-const AUTO_DETECT_FILES: &[&str] = &["package.json"];
+const AUTO_DETECT_FILES: &[&str] = &["Dockerfile", "package.json"];
 
 /// The files that *define* a project, as opposed to the ones its servers run from. A change to any
 /// of them replaces the project wholesale, since the script and the set of servers may both be
 /// different. They are watched centrally for every project at once (see the config watcher in `server.rs`),
 /// because one inotify instance per project is what runs into the per-user cap first.
-pub const PROJECT_FILES: &[&str] = &[CONFIG_FILE, "package.json"];
+pub const PROJECT_FILES: &[&str] = &[CONFIG_FILE, "Dockerfile", "package.json"];
 
 /// What a service restarts for when it names no `reload_include` of its own: the code that
 /// plausibly *serves* the requests, rather than everything. Restarting is disruptive and most
@@ -134,6 +134,10 @@ pub struct ServerConfig {
     /// Files copied into the image before `build` runs, so a build command can see them. Paths
     /// are relative to the project directory and may not leave it.
     pub copy: Vec<String>,
+    /// A Dockerfile of the project's own, which answers every question about how to run it -
+    /// runtime, dependencies and command - for any language, without webcentral guessing. Set,
+    /// it replaces `base`/`packages`/`build`/`copy` entirely.
+    pub dockerfile: Option<String>,
     /// The port the command listens on inside the container.
     pub port: u16,
     /// Where the project directory is mounted inside the container; `None` (written
@@ -141,6 +145,9 @@ pub struct ServerConfig {
     pub app_dir: Option<String>,
     /// Persistent directories, kept on the host under `_webcentral_data/mounts`.
     pub mounts: Vec<String>,
+    /// Whether `app_dir` came from the file, so that `dockerfile` can change the default without
+    /// overruling someone who asked for a mount.
+    pub app_dir_set: bool,
     /// Who the container runs as *inside*. Either `project` (add the project owner to the image
     /// and run as them), `image` (keep whatever the image declares), an explicit numeric `uid:gid`
     /// pair, or a name defined in the image. Defaults to `project` when the project directory is
@@ -164,8 +171,10 @@ impl ServerConfig {
             packages: Vec::new(),
             build: Vec::new(),
             copy: Vec::new(),
+            dockerfile: None,
             port: 8000,
             app_dir: Some("/app".to_string()),
+            app_dir_set: false,
             mounts: Vec::new(),
             user: String::new(),
         }
@@ -229,7 +238,11 @@ impl ProjectConfig {
                 config.errors.extend(parsed.errors);
                 config.warnings.extend(parsed.warnings);
             }
-        } else if config.servers.iter().any(|s| s.command.is_empty() && s.app_dir.is_some()) {
+        } else if config
+            .servers
+            .iter()
+            .any(|s| s.command.is_empty() && s.app_dir.is_some() && s.dockerfile.is_none())
+        {
             // A declared service with no command and the project directory mounted runs the
             // project's own code, so its command is detected too - that is how a node project
             // adds `packages` or reload rules without giving up detection. Without the mount
@@ -243,7 +256,9 @@ impl ProjectConfig {
             });
             let mut errors = Vec::new();
             for server in
-                config.servers.iter_mut().filter(|s| s.command.is_empty() && s.app_dir.is_some())
+                config.servers.iter_mut().filter(|s| {
+                    s.command.is_empty() && s.app_dir.is_some() && s.dockerfile.is_none()
+                })
             {
                 match donor.as_ref().and_then(|d| d.as_ref()) {
                     Some(donor) => {
@@ -273,10 +288,15 @@ impl ProjectConfig {
             (config.reload_include.clone(), config.reload_exclude.clone());
         for server in &mut config.servers {
             if server.reload_include.is_empty() {
-                server.reload_include = if default_include.is_empty() {
-                    DEFAULT_INCLUDES.iter().map(|s| s.to_string()).collect()
-                } else {
+                server.reload_include = if !default_include.is_empty() {
                     default_include.clone()
+                } else if server.dockerfile.is_some() {
+                    // The build context is the whole directory, so anything in it can change what
+                    // the image *is* - unlike a mounted service, where only program text matters
+                    // because everything else is read from disk as it stands.
+                    vec!["**/*".to_string()]
+                } else {
+                    DEFAULT_INCLUDES.iter().map(|s| s.to_string()).collect()
                 };
             }
             // A copied file is baked into the image, so editing it has to rebuild and restart -
@@ -343,6 +363,10 @@ fn add_implicit_tail(config: &mut ProjectConfig, dir: &Path) {
 /// *start* an application. Manifests like `requirements.txt` or `Gemfile` say what to install,
 /// which is not the same question - guessing a command from them would be guessing.
 fn auto_detect(dir: &Path) -> Option<String> {
+    // A Dockerfile has already answered everything, in whatever language the project is written.
+    if dir.join("Dockerfile").is_file() {
+        return Some("service {\n  dockerfile = Dockerfile\n}\n".to_string());
+    }
     let content = fs::read_to_string(dir.join("package.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
     let start = value.get("scripts")?.get("start")?.as_str()?;
@@ -1458,9 +1482,8 @@ impl<'a> Builder<'a> {
                 server.reload_exclude.extend(list);
             }
 
-            "base" | "packages" | "build" | "copy" | "mounts" | "port" | "app_dir" | "user" => {
-                self.container_setting(server, key)
-            }
+            "base" | "packages" | "build" | "copy" | "dockerfile" | "mounts" | "port"
+            | "app_dir" | "user" => self.container_setting(server, key),
 
             other => {
                 self.scanner
@@ -1484,6 +1507,7 @@ impl<'a> Builder<'a> {
                 let text = self.expand(&word);
                 // `none` means the project directory is not mounted at all: the image carries
                 // the application itself, so there is nothing of the project to run from.
+                server.app_dir_set = true;
                 server.app_dir = match text.as_str() {
                     "none" => None,
                     path if path.starts_with('/') => Some(text),
@@ -1513,14 +1537,28 @@ impl<'a> Builder<'a> {
                 let command = self.expand_line(command, key.pos);
                 server.build.push(command);
             }
+            "dockerfile" => {
+                let Some(word) = self.scanner.read_word() else { return };
+                let path = self.expand(&word);
+                if escapes_project(&path) {
+                    self.scanner.error_at(
+                        word.pos,
+                        format!(
+                            "'{}' is outside the project directory - dockerfile can only name a \
+                             file within it",
+                            path
+                        ),
+                    );
+                    return;
+                }
+                server.dockerfile = Some(path);
+            }
             "copy" => {
                 // The build context is the project directory, so a path that climbs out of it
                 // would either fail obscurely or reach a file the project does not own. Refused
                 // here, and checked again against symlinks when the image is actually built.
                 for path in self.word_list() {
-                    let escapes = path.starts_with('/')
-                        || Path::new(&path).components().any(|c| c.as_os_str() == "..");
-                    if escapes {
+                    if escapes_project(&path) {
                         self.scanner.error_at(
                             key.pos,
                             format!(
@@ -1577,6 +1615,29 @@ impl<'a> Builder<'a> {
     }
 
     fn finish_server(&mut self, server: &mut ServerConfig) {
+        if server.dockerfile.is_some() {
+            // The Dockerfile builds the image; these would be webcentral building a different one.
+            for (name, used) in [
+                ("base", server.base.is_some()),
+                ("packages", !server.packages.is_empty()),
+                ("build", !server.build.is_empty()),
+                ("copy", !server.copy.is_empty()),
+            ] {
+                if used {
+                    self.scanner.error(format!(
+                        "'{}' and 'dockerfile' are alternatives: the Dockerfile already says how \
+                         the image is built",
+                        name
+                    ));
+                }
+            }
+            // The image carries the application, so mounting the project over it would hide what
+            // was just built. Said only when the file did not say otherwise.
+            if !server.app_dir_set {
+                server.app_dir = None;
+            }
+        }
+
         if server.app_dir.is_none() {
             for mount in &server.mounts {
                 if !mount.starts_with('/') {
@@ -1615,6 +1676,12 @@ fn inherit_into_sidecars(server: &mut ServerConfig) {
         env.append(&mut sidecar.env);
         sidecar.env = env;
     }
+}
+
+/// Whether a configured path could reach outside the project. Checked again against symlinks
+/// when the image is built, where they can actually be resolved.
+fn escapes_project(path: &str) -> bool {
+    path.starts_with('/') || Path::new(path).components().any(|c| c.as_os_str() == "..")
 }
 
 fn walk(stmts: &[Stmt], predicate: &mut impl FnMut(&Stmt) -> bool) -> bool {

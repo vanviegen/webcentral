@@ -3,6 +3,7 @@ mod app_server;
 mod config;
 mod dashboard;
 mod logger;
+mod owner;
 mod parser;
 mod project;
 mod script;

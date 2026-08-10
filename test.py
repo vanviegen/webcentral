@@ -419,6 +419,11 @@ class TestRunner:
         """
         required = set(required)
         skipped_names = []
+        known = {test.__name__ for test in self.tests}
+        unknown = sorted(required - known)
+        if unknown:
+            print(f"{RED}--require names tests that do not exist:{RESET} {', '.join(unknown)}")
+            sys.exit(1)
         # Filter tests if specific names provided
         tests_to_run = self.tests
         if test_names:
@@ -4334,29 +4339,108 @@ def test_podman_runs_as_project_user(t):
 
 
 @test
-def test_podman_bakes_owner_into_image(t):
-    """A root webcentral bakes a non-root project owner into the image as user 'webcentral'"""
+def test_podman_runs_as_the_project_owner(t):
+    """A root webcentral runs a project's containers as the person who owns it.
+
+    This is the multi-user case the whole design turns on: podman is spawned as the owner, so
+    container root *is* that owner and what the container writes is already theirs, with no uid
+    mapping of webcentral's own. It needs a second real account with a subuid range, which is what
+    SUDO_UID points at when the suite is run under sudo.
+    """
     if os.geteuid() != 0:
-        raise SkipTest("needs root to give the project dir to another user")
+        raise SkipTest("needs root to hand a project to another user")
+    uid = int(os.environ.get('SUDO_UID') or 0)
+    gid = int(os.environ.get('SUDO_GID') or 0)
+    if not uid:
+        raise SkipTest("no SUDO_UID, so there is no second user to hand the project to")
 
     _podman_setup(t,
-        f'  command = {{ id -u; id -g; whoami; printenv HOME; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
-        '  base = alpine\n'
-        + PODMAN_PACKAGES +
-        '  mounts = data\n')
+                  f'  command = {{ id -u; id -g; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
+                  '  base = alpine\n'
+                  + PODMAN_PACKAGES +
+                  '  mounts = data\n')
     project_dir = os.path.join(t.tmpdir, t.current_test_domain)
     for root, dirs, files in os.walk(project_dir):
-        for p in dirs + files:
-            os.chown(os.path.join(root, p), 4321, 4321)
-    os.chown(project_dir, 4321, 4321)
+        for name in dirs + files:
+            os.chown(os.path.join(root, name), uid, gid)
+    os.chown(project_dir, uid, gid)
 
     t.assert_http('/', check_body='podman ok', timeout=300)
 
-    fields, uid, gid = _read_mount(t, 'app/data/id.txt')
-    assert fields == ['4321', '4321', 'webcentral', '/app/_webcentral_data/home'], \
-        f"container reported {fields}, expected 4321/4321 as 'webcentral'"
-    assert (uid, gid) == (4321, 4321), \
-        f"mounted file is owned by {uid}:{gid} on the host, expected the project owner 4321:4321"
+    fields, file_uid, file_gid = _read_mount(t, 'app/data/id.txt')
+    # Inside, `user = project` is container root - which is what rootless podman calls the user it
+    # was invoked as
+    assert fields == ['0', '0'], f"container reported {fields}, expected to be root inside"
+    # Outside, what it wrote belongs to the owner rather than to the root webcentral
+    assert (file_uid, file_gid) == (uid, gid), \
+        f"mounted file is owned by {file_uid}:{file_gid}, expected the owner {uid}:{gid}"
+
+
+@test
+def test_dockerfile_project(t):
+    """A project with a Dockerfile is built and run from it, with no configuration at all"""
+    t.write_file('Dockerfile', """
+FROM webcentral-test-base
+WORKDIR /srv
+COPY hello.txt /srv/hello.txt
+RUN echo "built at image time" > /srv/built.txt
+CMD ["python3", "-u", "-m", "http.server", "8000"]
+""")
+    t.write_file('hello.txt', 'copied into the image')
+
+    # No webcentral.conf: the Dockerfile answers every question there is
+    t.assert_http('/hello.txt', check_body='copied into the image', timeout=300)
+    t.assert_http('/built.txt', check_body='built at image time')
+    # The project directory is not mounted, so a file added afterwards is not visible...
+    t.write_file('later.txt', 'not in the image')
+    t.assert_http('/later.txt', check_code=404)
+
+
+@test
+def test_dockerfile_rebuilds_on_change(t):
+    """Editing what the image is built from rebuilds it"""
+    t.write_file('version.txt', 'first')
+    t.write_file('Dockerfile', """
+FROM webcentral-test-base
+WORKDIR /srv
+COPY version.txt /srv/version.txt
+CMD ["python3", "-u", "-m", "http.server", "8000"]
+""")
+    t.assert_http('/version.txt', check_body='first', timeout=300)
+    t.mark_log_read()
+
+    # A source file the image copies: the service restarts and the image is built again
+    t.write_file('version.txt', 'second')
+    t.await_log('Stopping due to file changes')
+    t.assert_http('/version.txt', check_body='second', timeout=300)
+
+
+@test
+def test_dockerfile_cannot_escape_the_project(t):
+    """A Dockerfile cannot reach outside the directory it is built from"""
+    t.write_file('public/index.html', 'shell')
+    # Both refused at parse time, before podman is asked anything
+    t.write_file('webcentral.conf', """
+service {
+  dockerfile = ../../etc/Dockerfile
+}
+serve_dir public
+""")
+    t.assert_http('/', check_body='shell')
+    t.await_log('is outside the project directory')
+
+    # And a Dockerfile is an alternative to building one ourselves, not an addition
+    t.write_file('webcentral.conf', """
+service {
+  dockerfile = Dockerfile
+  packages = python3
+}
+serve_dir public
+""")
+    # A configuration is only re-read when a request arrives for it
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='shell')
+    t.await_log("'packages' and 'dockerfile' are alternatives")
 
 
 @test
