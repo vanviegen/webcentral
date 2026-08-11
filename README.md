@@ -142,7 +142,7 @@ With **no configuration file at all**, webcentral looks at what the directory ho
 | `package.json` with a `start` script | `npm start` is run as a service, on a node image |
 
 That still applies when a `webcentral.conf` is present but never says how to answer a request - so
-a file that only sets `log_requests` doesn't stop a `package.json` from being picked up.
+a file that only sets `redirect_http` doesn't stop a `package.json` from being picked up.
 
 Nothing else is guessed at. `requirements.txt` and `Gemfile` say what to *install*, not what to
 run, and inventing a start command from them would be inventing - so every other language says it
@@ -936,9 +936,10 @@ request streaming.
 
 ### Project settings
 
+The four things that belong to the project rather than to a service or a request:
+
 ```ini
 settings {
-  log_requests = true         # one log line per request
   redirect_http = false       # don't redirect http:// to https:// for this project
   redirect_https = true       # ...redirect the other way around instead
   reload_include = src public "file with spaces"
@@ -948,7 +949,15 @@ settings {
 
 `redirect_http` overrides the server-wide `--redirect-http` for this project alone - useful for a
 domain that has to stay reachable over plain HTTP. `redirect_https = true` goes the other way,
-sending HTTPS visitors to the plain-HTTP site; there is no server-wide version of that.
+sending HTTPS visitors to the plain-HTTP site; there is no server-wide version of that. The two
+`reload_` lists are the defaults for services that name none of their own - see **Reload rules**.
+
+There is no `log_requests`: a `log` statement at the top of the script does it, and says what you
+want said rather than what webcentral guessed.
+
+```ini
+log "${method} ${path}"
+```
 
 
 ## Command-Line Options

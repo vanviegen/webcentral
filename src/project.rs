@@ -437,17 +437,10 @@ impl Project {
         }
     }
 
-    fn log_request<B>(&self, req: &Request<B>) {
+    /// Requests are counted, not logged: what is worth writing down differs per project, and a
+    /// `log` statement at the top of the script says it in the project's own words.
+    fn log_request<B>(&self, _req: &Request<B>) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
-        if self.config.log_requests {
-            let addr = req
-                .headers()
-                .get("X-Forwarded-For")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("-");
-            self.logger
-                .write("request", &format!("{} {} {}", addr, req.method(), req.uri().path()));
-        }
     }
 
     /// Build (once) and reuse a connector/client pair per target, so connections are pooled per

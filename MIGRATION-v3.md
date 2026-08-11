@@ -216,10 +216,6 @@ admin = $argon2id$v=19$m=19456,t=2,p=1$...
 **After**:
 
 ```ini
-settings {
-  log_requests = true
-}
-
 service {
   base = python:3-alpine
   command = python app.py --port $PORT
@@ -231,15 +227,19 @@ service {
   service email { command = python email_processor.py }
 }
 
+log "${method} ${path}"
 match /blog/(.*?)/.* { set path /articles/${1}.html }
 match /[^/]* { set path /index.html }
 serve
 ```
 
-Four things to notice:
+Five things to notice:
 
 - **Workers are nested services** - *sidecars*. One that names no `base` of its own runs in its
   parent's image and starts from its parent's environment, which is exactly what a worker was.
+- **`log_requests` is a `log` statement now**, so the line says what you want it to say and can sit
+  behind a `match` if only some requests are worth recording. The client address is the one thing
+  the old line had that this doesn't.
 - **Capture groups are `${1}`, not `$1`.**
 - **The script runs top to bottom**, so the order of the two `match` lines is the order they are
   tried in - where `[rewrite]` used to depend on the order of a hash map.
@@ -279,6 +279,7 @@ else the script can answer with. See **Internal redirects** in the README.
 
 | 2.x | 3.0 |
 |---|---|
+| `log_requests = true` | `log "${method} ${path}"` as the first statement |
 | `[reload]` `timeout` | `shutdown_time` in the service |
 | `startup_deadline` | `startup_time` |
 | `[podman]` `http_port` | `port` |

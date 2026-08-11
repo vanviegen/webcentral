@@ -2001,8 +2001,6 @@ respond 200 hello
     # The script that routes the requests, as parsed - including the tail nothing wrote
     assert 'webcentral.conf' in body, body
     assert 'implicit' in body, body
-    # Each service says what kind of thing it is, and so does anything the script routes to
-    assert 'podman' in body, body
 
     # project_dashboard shows only the project's own slice: no other domains, and none of the
     # server-wide numbers

@@ -140,7 +140,7 @@ fn render_project(domain: &DomainStatus, collapsible: bool) -> String {
 
     html.push_str("<h3>Services</h3>\n");
     if !domain.loaded {
-        html.push_str("<div class=\"none\">Not read yet - the next request to it will.</div>\n");
+        html.push_str("<div class=\"none\">Reading its configuration…</div>\n");
     } else if domain.servers.is_empty() {
         html.push_str("<div class=\"none\">None</div>\n");
     }
@@ -177,33 +177,38 @@ fn render_service(server: &ServerStatus) -> String {
     };
     let mut html = format!(
         "<div class=\"service\">\n<div class=\"service-head\"><span class=\"name\">{}</span>\
-         <span class=\"kind\">podman</span><span class=\"state {}\">{}</span></div>\n",
+         {}<span class=\"state {}\">{}</span></div>\n",
         escape(&server.name),
+        describe_run(&server.image, &server.command),
         status_class(&server.state),
         escape(&state),
     );
-    html.push_str(&format!("<div class=\"runs\">{}</div>\n", describe_run(&server.image, &server.command)));
 
-    // Idle time and websockets are the same question - how long could this be stopped for - so
-    // they share a place rather than a column each.
-    let idle = if server.active_upgrades > 0 {
-        format!(
+    // Only what is worth reading: a service with nothing pending, no websockets and no idle time
+    // to report says so by saying nothing, rather than by three zeroes.
+    let mut numbers = vec![format!(
+        "{} request{}",
+        server.total_requests,
+        if server.total_requests == 1 { "" } else { "s" }
+    )];
+    if server.pending_requests > 0 {
+        numbers.push(format!("{} pending", server.pending_requests));
+    }
+    if server.active_upgrades > 0 {
+        numbers.push(format!(
             "{} websocket{} open",
             server.active_upgrades,
             if server.active_upgrades == 1 { "" } else { "s" }
-        )
-    } else {
-        match server.idle_seconds {
-            Some(seconds) => format!("idle {}", format_idle(seconds)),
-            None => "not running".to_string(),
-        }
-    };
+        ));
+    } else if let Some(seconds) = server.idle_seconds {
+        numbers.push(format!("idle {}", format_idle(seconds)));
+    }
     html.push_str(&format!(
-        "<div class=\"numbers\"><span>{} request{}</span><span>{} pending</span><span>{}</span></div>\n",
-        server.total_requests,
-        if server.total_requests == 1 { "" } else { "s" },
-        server.pending_requests,
-        escape(&idle),
+        "<div class=\"numbers\">{}</div>\n",
+        numbers
+            .iter()
+            .map(|n| format!("<span>{}</span>", escape(n)))
+            .collect::<String>()
     ));
 
     for sidecar in &server.sidecars {
@@ -245,15 +250,11 @@ fn render_statements(stmts: &[crate::script::Outline]) -> String {
 
 /// What a container runs: its image, and the command if it isn't the image's own entrypoint.
 fn describe_run(image: &str, command: &str) -> String {
-    if command.is_empty() {
-        format!("<span class=\"image\">{}</span>", escape(image))
-    } else {
-        format!(
-            "<span class=\"image\">{}</span><code>{}</code>",
-            escape(image),
-            escape(command)
-        )
+    let mut html = format!("<span class=\"image\">{}</span>", escape(image));
+    if !command.is_empty() {
+        html.push_str(&format!("<code>{}</code>", escape(command)));
     }
+    html
 }
 
 fn status_class(status: &str) -> &'static str {
@@ -332,15 +333,12 @@ h3 .from { text-transform: none; letter-spacing: 0; font-family: ui-monospace, m
 /* One service, or one thing the script routes to. */
 .service { padding: 0.55em 0.8em; margin-bottom: 0.4em; background: #fafafa; border-radius: 5px;
            border-left: 3px solid #d8d8d8; }
-.service-head { display: flex; flex-wrap: wrap; gap: 0.7em; align-items: baseline; }
+.service-head { display: flex; flex-wrap: wrap; gap: 0.2em 0.7em; align-items: baseline; }
 .service-head .name { font-weight: 600; }
-.kind { font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.05em; color: #999;
-        border: 1px solid #ddd; border-radius: 3px; padding: 0 0.4em; }
-.state { font-size: 0.85em; }
-.runs { font-size: 0.85em; color: #666; margin-top: 0.2em; }
-.image { color: #999; margin-right: 0.7em; }
+.state { font-size: 0.85em; margin-left: auto; }
+.image { color: #999; font-size: 0.85em; }
 code { font-family: ui-monospace, monospace; background: #efefef; padding: 0.05em 0.4em;
-       border-radius: 3px; }
+       border-radius: 3px; font-size: 0.85em; }
 .numbers { display: flex; flex-wrap: wrap; gap: 0.3em 1.2em; font-size: 0.8em; color: #999;
            margin-top: 0.3em; }
 .sidecar { margin: 0.45em 0 0 1em; padding-left: 0.8em; border-left: 2px solid #e0e0e0;
@@ -387,7 +385,6 @@ code { font-family: ui-monospace, monospace; background: #efefef; padding: 0.05e
   .project, .info-card { background: #1f2228; box-shadow: none; }
   .service { background: #23262d; border-left-color: #3a3f48; }
   code { background: #23262d; }
-  .kind { border-color: #3a3f48; }
   .stmts .verb { color: #8fb8d8; }
   .stmts .stmts, .sidecar { border-left-color: #3a3f48; }
   .answers b, .info-card .value { color: #eee; }

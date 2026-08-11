@@ -192,7 +192,6 @@ impl ServerConfig {
 
 #[derive(Debug, Clone)]
 pub struct ProjectConfig {
-    pub log_requests: bool,
     pub redirect_http: Option<bool>,
     pub redirect_https: Option<bool>,
     pub servers: Vec<ServerConfig>,
@@ -579,7 +578,6 @@ pub fn parse(source: &str, dir: Option<&Path>) -> ProjectConfig {
         scanner: Scanner::new(source),
         dir: dir.map(|d| d.to_path_buf()),
         config: ProjectConfig {
-            log_requests: false,
             redirect_http: None,
             redirect_https: None,
             servers: Vec::new(),
@@ -1353,11 +1351,6 @@ impl<'a> Builder<'a> {
 
     fn settings_block(&mut self) {
         self.each_setting(|me, key| match key.text.as_str() {
-            "log_requests" => {
-                if let Some(value) = me.bool_value() {
-                    me.config.log_requests = value;
-                }
-            }
             "redirect_http" => me.config.redirect_http = me.bool_value(),
             "redirect_https" => me.config.redirect_https = me.bool_value(),
             "reload_include" => {
