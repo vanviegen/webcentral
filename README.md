@@ -675,7 +675,8 @@ the Dockerfile is already the answer to how the image gets built.
 away with the container, so a stock database image would lose everything it wrote on the first
 restart - and only on the first restart, which is the worst moment to find out. Webcentral gives
 each declared volume a directory under `_webcentral_data/mounts/` instead, and says so in the
-project log. A `mounts` entry that already covers the path wins, so this only decides what happens
+project log. Whatever the image ships at that path is copied into the directory while it is still
+empty, since a host directory would otherwise simply cover it. A `mounts` entry that already covers the path wins, so this only decides what happens
 when the configuration says nothing:
 
 ```ini

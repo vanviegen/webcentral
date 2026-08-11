@@ -294,7 +294,13 @@ declare writes as that uid.
 **Declared volumes:** an image's `VOLUME` paths are inspected when the image is prepared and
 given a directory under `_webcentral_data/mounts`, because podman's anonymous volume for one goes
 away with `--rm` - silently, and only on the first restart. A `mounts` entry covering the path
-wins, and so does `app_dir`, since the project directory already persists.
+wins, and so does `app_dir`, since the project directory already persists. What the image ships
+at that path is copied into the directory while it is empty: podman copies into a volume it
+creates itself, but a bind mount just covers what was there, and an image that seeds its volume
+would look as though it had lost it. What the image ships
+at that path is copied into the directory while it is empty: podman copies into a volume it
+creates itself, but a bind mount just covers what was there, and an image that seeds its volume
+would look as though it had lost it.
 
 **Declared volumes:** an image's `VOLUME` paths are inspected when the image is prepared and
 given a directory under `_webcentral_data/mounts`, because podman's anonymous volume for one goes

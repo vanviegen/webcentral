@@ -1187,9 +1187,60 @@ impl AppServer {
                  it yourself.",
                 image, volume, volume
             ));
+            self.seed_from_image(image, &volume).await;
             persist.push(volume);
         }
         persist
+    }
+
+    /// Where a path inside the container is kept on the host.
+    fn host_mount_path(&self, container_path: &str) -> PathBuf {
+        self.dir.join("_webcentral_data/mounts").join(container_path.trim_start_matches('/'))
+    }
+
+    /// Give a directory webcentral is about to bind-mount whatever the image ships at that path.
+    ///
+    /// Podman does this when it creates a volume of its own, but never for a bind mount: the host
+    /// directory simply covers what was there. An image that seeds a declared volume with
+    /// configuration, a schema or a first-run database would come up looking as though it had lost
+    /// all of it - so the contents are copied out once, while the directory is still empty.
+    /// Anything that goes wrong here leaves an empty directory, which is what podman's own
+    /// behaviour would have given us anyway.
+    async fn seed_from_image(&self, image: &str, container_path: &str) {
+        let host_path = self.host_mount_path(container_path);
+        if self.create_dir_for_container(&host_path).is_err() {
+            return;
+        }
+        let empty = fs::read_dir(&host_path).map(|mut d| d.next().is_none()).unwrap_or(false);
+        if !empty {
+            return;
+        }
+
+        // Mounted somewhere else, so that the image's own contents at `container_path` are still
+        // visible to copy from.
+        const SCRATCH: &str = "/webcentral-seed";
+        let mut copy = self.owner.podman();
+        copy.args(["run", "--rm", "--entrypoint", "/bin/sh"]);
+        copy.args(["-v", &format!("{}:{}", host_path.display(), SCRATCH)]);
+        copy.args([
+            image,
+            "-c",
+            &format!("cp -a {}/. {}/ 2>/dev/null || true", container_path, SCRATCH),
+        ]);
+        match copy.output().await {
+            Ok(out) if out.status.success() => {
+                if fs::read_dir(&host_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
+                    self.log(&format!("Copied what {} ships in {} into it", image, container_path));
+                }
+            }
+            // An image with no shell cannot be copied out of this way. It is also an image that
+            // could not have had anything but an empty directory there to begin with, unless it
+            // was built FROM one that had a shell - so this is worth a line, not a failure.
+            _ => self.log(&format!(
+                "Could not read what {} ships in {}; starting it empty",
+                image, container_path
+            )),
+        }
     }
 
     /// The `VOLUME` paths an image declares, sorted so the same image always reports them in the
@@ -1311,10 +1362,7 @@ impl AppServer {
             Self::container_mount_path(config, mount)
         });
         for container_path in configured.chain(prepared.volumes.iter().cloned()) {
-            let host_path = self
-                .dir
-                .join("_webcentral_data/mounts")
-                .join(container_path.trim_start_matches('/'));
+            let host_path = self.host_mount_path(&container_path);
             self.create_dir_for_container(&host_path)?;
             cmd.args(["-v", &format!("{}:{}", host_path.display(), container_path)]);
         }

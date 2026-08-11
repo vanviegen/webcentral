@@ -4641,6 +4641,7 @@ http.server.HTTPServer(('0.0.0.0', 8000), Handler).serve_forever()
 """)
     t.write_file('Dockerfile', """
 FROM webcentral-test-base
+RUN mkdir -p /data && echo "shipped with the image" > /data/seed.txt
 WORKDIR /srv
 COPY count.py /srv/count.py
 VOLUME /data
@@ -4649,6 +4650,11 @@ CMD ["python3", "-u", "/srv/count.py"]
 
     t.assert_http('/', check_body='started 1 times', timeout=300)
     t.assert_log('declares VOLUME /data', count=1)
+    # A bind mount covers what the image put there, so the contents are copied out first -
+    # otherwise an image that seeds its volume would come up looking as though it had lost it
+    seed = os.path.join(t.tmpdir, t.current_test_domain, '_webcentral_data/mounts/data/seed.txt')
+    assert os.path.exists(seed), f"{seed} is missing, so the image's own contents were hidden"
+    assert open(seed).read().strip() == 'shipped with the image', open(seed).read()
     t.mark_log_read()
 
     # Restart it by changing what the image is built from
