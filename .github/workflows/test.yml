@@ -20,9 +20,9 @@ jobs:
       fail-fast: false
       matrix:
         # The two halves of the container-ownership invariant, neither of which exercises the
-        # other: a non-root webcentral uses rootless podman and `--userns=keep-id`, while a root
-        # one uses rootful podman, maps uids by hand and bakes the project owner into the image.
-        # Three tests skip in each mode, and they are not the same three.
+        # other: a non-root webcentral runs podman as itself and maps other uids with
+        # `--userns=keep-id`, while a root one spawns podman as each project's owner. The tests
+        # that skip in each mode are not the same ones.
         mode: [rootless, root]
 
     steps:
@@ -44,6 +44,18 @@ jobs:
           grep -q "^$user:" /etc/subuid \
             || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$user"
 
+      - name: Create a project owner who has never logged in
+        if: matrix.mode == 'root'
+        run: |
+          # No login, no `loginctl enable-linger`, no systemd user session - the state a real
+          # project owner is in, and the one that used to break rootless podman for want of an
+          # XDG_RUNTIME_DIR and a cgroup manager. Failing here fails the job rather than letting
+          # the test quietly fall back to the runner's own account.
+          sudo useradd --create-home --shell /usr/sbin/nologin webcentral-owner
+          sudo usermod --add-subuids 200000-265535 --add-subgids 200000-265535 webcentral-owner
+          uid=$(id -u webcentral-owner)
+          test ! -e "/run/user/$uid"
+
       - name: Build
         run: cargo build
 
@@ -56,7 +68,7 @@ jobs:
           # to prove the other half - podman spawned as a project's owner rather than as root.
           keepid=test_podman_user_override,test_podman_foreign_user_mapped_to_owner
           if [ "${{ matrix.mode }}" = root ]; then
-            sudo --preserve-env=PATH ./test.py \
+            sudo --preserve-env=PATH env WEBCENTRAL_TEST_OWNER=webcentral-owner ./test.py \
               --require "test_podman_runs_as_the_project_owner" 2>&1 | tee test-output.log
           else
             ./test.py --require "$keepid" 2>&1 | tee test-output.log

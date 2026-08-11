@@ -203,17 +203,17 @@ separates a name from a value:
 set token whatever-the-upstream-wants
 
 set_header Authorization "Bearer ${token}"      # a value with a space in it
-match /html respond 200 body type=text/html     # `type` is a named argument
-match /text respond 200 "type=text/html"        # the body is the text `type=text/html`
+match /html { respond 200 body type=text/html }   # `type` is a named argument
+match /text { respond 200 "type=text/html" }      # the body is the text `type=text/html`
 ```
 
 To put a quote inside a word, either switch quote style or escape it:
 
 ```ini
-match /a respond 200 'say "hi"'          # double quotes inside single ones
-match /b respond 200 "she said \"hi\""    # or escaped inside double ones
-match /c respond 200 "it's fine"         # an apostrophe inside double quotes
-match /d respond 200 'it'"'"'s'          # ...and glued segments in a single-quoted word
+match /a { respond 200 'say "hi"' }        # double quotes inside single ones
+match /b { respond 200 "she said \"hi\"" }  # or escaped inside double ones
+match /c { respond 200 "it's fine" }       # an apostrophe inside double quotes
+match /d { respond 200 'it'"'"'s' }        # ...and glued segments in a single-quoted word
 ```
 
 Single quotes have no escapes at all, which is what makes them right for regexes and hashes -
@@ -221,8 +221,8 @@ and why **a regex should never be double-quoted**: `"\.css$"` fails, because `\.
 escape webcentral knows. Leave it bare, or use single quotes:
 
 ```ini
-match \.css$ anchored=false set_header Cache-Control immutable
-match '\.(png|jpg)$' anchored=false set_header Cache-Control immutable
+match \.css$ anchored=false { set_header Cache-Control immutable }
+match '\.(png|jpg)$' anchored=false { set_header Cache-Control immutable }
 ```
 
 ### Arguments
@@ -271,8 +271,8 @@ match /old/(.*) {
   set path /new/${1}                  # the query is left alone
   serve_dir public
 }
-match /legacy set path /v2/index.html?legacy=1   # a path may carry its own query
-match /bare set path /clean?                     # ...and a lone `?` drops it
+match /legacy { set path /v2/index.html?legacy=1 } # a path may carry its own query
+match /bare { set path /clean? }                   # ...and a lone `?` drops it
 ```
 
 `set query` changes the query on its own. The other request variables describe what arrived and
@@ -292,8 +292,8 @@ service {
   command = npm start --port $PORT
 }
 
-match /api/(.*) proxy ${backend}
-match /static/(.*) serve_file ${assets}/${1}
+match /api/(.*) { proxy ${backend} }
+match /static/(.*) { serve_file ${assets}/${1} }
 serve
 ```
 
@@ -303,7 +303,7 @@ would otherwise overwrite:
 ```ini
 match /(?<lang>[a-z]{2})/docs/(.*) {
   set page ${2}
-  match .*\.pdf serve_file downloads/${lang}/${page}
+  match .*\.pdf { serve_file downloads/${lang}/${page} }
   serve_file docs/${lang}/${page}.html
 }
 ```
@@ -345,31 +345,31 @@ anything, including several variables joined together. `matcher=literal` compare
 instead of a regex, and `anchored=false` matches anywhere in the value rather than all of it.
 
 ```ini
-match /admin/(.*) respond 403 Forbidden
-match POST subject=${method} respond 405 "read only"
-match old.example.com subject=${host} matcher=literal redirect https://example.com${path} status=301
-match /internal/ anchored=false matcher=literal respond 403 "not from outside"
-match .*\.test/health subject=${host}${path} respond 200 OK
+match /admin/(.*) { respond 403 Forbidden }
+match POST subject=${method} { respond 405 "read only" }
+match old.example.com subject=${host} matcher=literal { redirect https://example.com${path} status=301 }
+match /internal/ anchored=false matcher=literal { respond 403 "not from outside" }
+match .*\.test/health subject=${host}${path} { respond 200 OK }
 ```
 
 #### else
 
-`else` runs when the statement before it declined. It pairs with the statement it follows, so an
-inline body belongs to the `match`, and a block is how you attach it to something inside:
+`else` runs when the statement before it declined. It pairs with the statement it follows, so the
+one below belongs to the `match`, not to the `serve_file` inside it:
 
 ```ini
 match /files/(.*) {
   serve_file uploads/${1} fallthrough=true
   respond 404 "no such upload"
 }
-else respond 400 "not a file request"
+else { respond 400 "not a file request" }
 ```
 
 #### set path `set path <path>` changes the request path. Everything after it - including `${path}` - sees the new
 one, and the query string is kept unless the new path brings its own.
 
 ```ini
-match /v1/(.*) set path /api/${1}
+match /v1/(.*) { set path /api/${1} }
 ```
 
 #### serve
@@ -403,7 +403,7 @@ serve_file public/index.html
 `fallthrough=true`.
 
 ```ini
-match /robots.txt serve_file config/robots-production.txt
+match /robots.txt { serve_file config/robots-production.txt }
 ```
 
 #### check_file
@@ -429,17 +429,18 @@ match /static/(.*) {
 `Host` header alone - so the backend sees the request as the client sent it.
 
 ```ini
-match /metrics/(.*) forward 9090
-match /socket/(.*) forward /run/app/app.sock
+match /metrics/(.*) { forward 9090 }
+match /socket/(.*) { forward /run/app/app.sock }
 ```
 
 #### proxy
 
 `proxy <url>` sends the request to another server, rewriting `Host` to the upstream's and adding
-`X-Forwarded-Host`. The request path is appended to the URL.
+`X-Forwarded-Host`. The request path is appended to the URL. An `https://` URL is proxied over
+TLS, with the upstream's certificate verified against the system's trust store.
 
 ```ini
-match /images/(.*) proxy https://cdn.example.com
+match /images/(.*) { proxy https://cdn.example.com }
 ```
 
 #### redirect
@@ -449,8 +450,8 @@ deliberately, since browsers cache it indefinitely. `307` and `308` are there to
 that must not turn a POST into a GET.
 
 ```ini
-match /blog/(.*) redirect https://blog.example.com/${1} status=301
-match /beta redirect /signup status=307
+match /blog/(.*) { redirect https://blog.example.com/${1} status=301 }
+match /beta { redirect /signup status=307 }
 ```
 
 #### respond
@@ -459,9 +460,9 @@ match /beta redirect /signup status=307
 status's own reason phrase is used.
 
 ```ini
-match /health respond 200 OK
-match /.git/(.*) respond 403
-match /teapot respond 418 "<b>short and stout</b>" type=text/html
+match /health { respond 200 OK }
+match /.git/(.*) { respond 403 }
+match /teapot { respond 418 "<b>short and stout</b>" type=text/html }
 ```
 
 #### check_auth
@@ -475,8 +476,8 @@ it). Like `match`, what follows the statement still runs either way - end the sc
 set admin_secret hunter2
 
 match /admin/(.*) {
-  check_auth ${admin_secret} serve_dir admin
-  else respond 403
+  check_auth ${admin_secret} { serve_dir admin }
+  else { respond 403 }
 }
 serve_dir public
 ```
@@ -519,7 +520,7 @@ on top. Since that shows everyone's projects, it only answers (with anything but
 project owned by the user webcentral itself runs as.
 
 ```ini
-check_auth hunter2 admin_dashboard
+check_auth hunter2 { admin_dashboard }
 respond 401
 ```
 
@@ -548,7 +549,7 @@ service canary {
   command = ./canary-server
 }
 
-match beta subject=${query} anchored=false serve canary
+match beta subject=${query} anchored=false { serve canary }
 serve stable
 ```
 
@@ -636,7 +637,7 @@ service web {
   command = node web.js
 }
 
-match /api/(.*) serve api
+match /api/(.*) { serve api }
 serve web
 ```
 
@@ -744,7 +745,7 @@ service assets {
   reload_include = src/assets
 }
 
-match /build/(.*) serve assets
+match /build/(.*) { serve assets }
 serve api
 ```
 
@@ -788,7 +789,7 @@ service { command = ./app }
 
 match /files/(.*) {
   # Only reachable via the app, which checks who is asking before redirecting here
-  match default subject=${redirected_by} matcher=literal serve_dir storage fallthrough=true
+  match default subject=${redirected_by} matcher=literal { serve_dir storage fallthrough=true }
   respond 403
 }
 serve
@@ -825,7 +826,7 @@ service {
     }
   }
 }
-check_auth ${DASHBOARD_SECRET} project_dashboard
+check_auth ${DASHBOARD_SECRET} { project_dashboard }
 serve
 ```
 
@@ -1003,6 +1004,9 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
   - `env_file` keeps secrets out of the configuration, and they reach a container through podman's environment rather than its command line, which `ps` exposes to every user on the machine
   - Request bodies and static files are **streamed**, and static files support `Range`, so uploads and video seeking work at any size
   - The whole projects tree is watched with **one** inotify instance rather than one per project (60 projects went from 61 to 2), and reload rules default to a whitelist of program text rather than to everything
+  - A conditional's body is always a `{ ... }` block, on one line or many, so what a `match` covers is legible without reading ahead
+  - `proxy` speaks **https**, verifying the upstream's certificate against the system trust store, and a `proxy` URL or `forward` target written out in full is checked when the file is read
+  - The dashboard shows what each service runs and which kind of statement answered how many requests
   - Fix containers being orphaned on shutdown, both because only SIGINT was handled - not the SIGTERM systemd sends - and because the stop was never waited for
   - Fix services being unreachable on IPv6 hosts: ports are published on `127.0.0.1` and addressed that way
 

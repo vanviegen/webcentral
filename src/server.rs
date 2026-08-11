@@ -173,6 +173,7 @@ pub fn get_domain_status() -> Vec<DomainStatus> {
                 summary: project.get_type_name(),
                 servers: project.get_server_status(),
                 total_requests: project.get_total_requests(),
+                answers: project.get_answers(),
                 cert_status,
             },
             None => DomainStatus {
@@ -181,6 +182,7 @@ pub fn get_domain_status() -> Vec<DomainStatus> {
                 summary: "Not loaded".to_string(),
                 servers: Vec::new(),
                 total_requests: 0,
+                answers: Vec::new(),
                 cert_status,
             },
         }

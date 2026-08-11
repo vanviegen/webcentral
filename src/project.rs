@@ -40,12 +40,13 @@ pub fn body_from<T: Into<Bytes>>(data: T) -> StreamBody {
     BoxBody::new(Full::new(data.into()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e)))
 }
 
-lazy_static::lazy_static! {
-    static ref DEFAULT_HTTP_CLIENT: Client<AnyConnector, StreamBody> =
-        Client::builder(SHARED_EXECUTOR.clone())
-            .retry_canceled_requests(false)
-            .build(AnyConnector::Http(HttpConnector::new()));
-    static ref DEFAULT_CONNECTOR: AnyConnector = AnyConnector::Http(HttpConnector::new());
+/// How to reach a `proxy` target: TLS when it asks for it, plain otherwise.
+fn proxy_connector(target: &str) -> AnyConnector {
+    if target.starts_with("https://") {
+        AnyConnector::Https(crate::streams::upstream_tls())
+    } else {
+        AnyConnector::Http(HttpConnector::new())
+    }
 }
 
 #[derive(Debug)]
@@ -58,6 +59,10 @@ pub struct Project {
     /// Clients for `forward`/`proxy` targets, built on first use and reused after that.
     targets: dashmap::DashMap<String, (AnyConnector, Client<AnyConnector, StreamBody>)>,
     total_requests: AtomicU64,
+    /// How many requests each kind of statement answered, for the dashboard. Kept per kind rather
+    /// than per statement: it says where requests end up without the AST having to carry an
+    /// identity for every line.
+    answers: dashmap::DashMap<&'static str, u64>,
     /// The project files' mtimes from just before the configuration was read, so an event that
     /// merely reports the write this project was built from can be told from a real change.
     project_file_mtimes: Vec<(PathBuf, Option<std::time::SystemTime>)>,
@@ -122,6 +127,7 @@ impl Project {
             servers,
             targets: dashmap::DashMap::new(),
             total_requests: 0.into(),
+            answers: dashmap::DashMap::new(),
             project_file_mtimes,
             vars,
             admin_allowed: uid == nix::unistd::geteuid().as_raw(),
@@ -205,16 +211,29 @@ impl Project {
         self.total_requests.load(Ordering::Relaxed)
     }
 
+    /// Which statements answered, busiest first.
+    pub fn get_answers(&self) -> Vec<(String, u64)> {
+        let mut answers: Vec<(String, u64)> =
+            self.answers.iter().map(|e| (e.key().to_string(), *e.value())).collect();
+        answers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        answers
+    }
+
     pub fn get_server_status(&self) -> Vec<ServerStatus> {
         self.servers
             .iter()
             .map(|server| ServerStatus {
                 name: server.name().to_string(),
-                kind: server
-                    .config
-                    .base
-                    .clone()
-                    .unwrap_or_else(|| crate::config::DEFAULT_BASE_IMAGE.to_string()),
+                kind: if server.config.dockerfile.is_some() {
+                    "Dockerfile".to_string()
+                } else {
+                    server
+                        .config
+                        .base
+                        .clone()
+                        .unwrap_or_else(|| crate::config::DEFAULT_BASE_IMAGE.to_string())
+                },
+                command: server.config.command.clone(),
                 state: match server.state() {
                     AppState::Stopped => "Stopped",
                     AppState::Starting => "Starting",
@@ -257,8 +276,9 @@ impl Project {
                     self.clone().upgrade(connector, req, None).await?
                 }
                 Terminal::Proxy(target) => {
+                    let connector = proxy_connector(&target);
                     let req = rewrite_for_proxy(req, &target)?;
-                    self.clone().upgrade(DEFAULT_CONNECTOR.clone(), req, None).await?
+                    self.clone().upgrade(connector, req, None).await?
                 }
             };
             return Ok(decorate(response, outcome.headers));
@@ -366,7 +386,9 @@ impl Project {
             domain: &self.domain,
             admin_allowed: self.admin_allowed,
         };
-        script::run(&self.config.script, env, vars, req).await
+        let outcome = script::run(&self.config.script, env, vars, req).await?;
+        *self.answers.entry(outcome.answered_by).or_insert(0) += 1;
+        Ok(outcome)
     }
 
     /// Perform whatever the script decided, for a request that is not being upgraded.
@@ -388,8 +410,9 @@ impl Project {
                 self.send(client, req, None).await
             }
             Terminal::Proxy(target) => {
+                let (_, client) = self.target(&target, || proxy_connector(&target));
                 let req = rewrite_for_proxy(req, &target)?;
-                self.send(DEFAULT_HTTP_CLIENT.clone(), req, None).await
+                self.send(client, req, None).await
             }
         }
     }
@@ -407,8 +430,8 @@ impl Project {
         }
     }
 
-    /// Build (once) and reuse a connector/client pair for a `forward` target. Proxying goes
-    /// through the shared client instead, which pools per upstream host by itself.
+    /// Build (once) and reuse a connector/client pair per target, so connections are pooled per
+    /// upstream and an `https` one does its handshake against a client that keeps the session.
     fn target(
         &self,
         key: &str,

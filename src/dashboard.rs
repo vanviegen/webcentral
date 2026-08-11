@@ -12,6 +12,8 @@ pub struct ServerStatus {
     pub kind: String,
     pub state: String,
     pub port: Option<u16>,
+    /// What the container runs, shown so the row says which process this is.
+    pub command: String,
     pub total_requests: u64,
     pub pending_requests: u64,
     pub active_upgrades: u64,
@@ -25,6 +27,8 @@ pub struct DomainStatus {
     pub summary: String,
     pub servers: Vec<ServerStatus>,
     pub total_requests: u64,
+    /// Statement kind to the number of requests it answered, busiest first.
+    pub answers: Vec<(String, u64)>,
     pub cert_status: Option<String>,
 }
 
@@ -52,6 +56,10 @@ th, td {{ border: 1px solid #ddd; padding: 0.6em 1em; text-align: left; }}
 th {{ background: #f8f8f8; }}
 tr.domain td {{ background: #fafafa; font-weight: 600; }}
 tr.server td:first-child {{ padding-left: 2.5em; font-weight: normal; color: #555; }}
+tr.answers td {{ padding-left: 2.5em; color: #666; font-size: 0.85em; background: #fcfcfc; }}
+tr.answers .answer {{ display: inline-block; margin-right: 1.5em; }}
+tr.answers .answer b {{ color: #333; font-weight: 600; }}
+.cmd {{ display: block; font-size: 0.8em; color: #888; font-family: ui-monospace, monospace; }}
 .status-running {{ color: #2a2; }}
 .status-stopped {{ color: #888; }}
 .status-starting {{ color: #f90; }}
@@ -115,6 +123,21 @@ tr.server td:first-child {{ padding-left: 2.5em; font-weight: normal; color: #55
             escape(&domain.directory),
         ));
 
+        // What answered the requests, which is the part of the script that is actually in use.
+        if !domain.answers.is_empty() {
+            let tally: String = domain
+                .answers
+                .iter()
+                .map(|(kind, count)| {
+                    format!("<span class=\"answer\">{} <b>{}</b></span>", escape(kind), count)
+                })
+                .collect();
+            html.push_str(&format!(
+                "<tr class=\"answers\"><td colspan=\"8\">{}</td></tr>\n",
+                tally
+            ));
+        }
+
         for server in &domain.servers {
             let state = match (server.state.as_str(), server.port) {
                 ("Running", Some(port)) => format!("Running (port {})", port),
@@ -129,7 +152,15 @@ tr.server td:first-child {{ padding-left: 2.5em; font-weight: normal; color: #55
                 "<tr class=\"server\"><td>{}</td><td>{}</td><td class=\"{}\">{}</td><td></td>\
                  <td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td><td></td></tr>\n",
                 escape(&server.name),
-                escape(&server.kind),
+                if server.command.is_empty() {
+                    escape(&server.kind)
+                } else {
+                    format!(
+                        "{}<span class=\"cmd\">{}</span>",
+                        escape(&server.kind),
+                        escape(&server.command)
+                    )
+                },
                 status_class(&server.state),
                 escape(&state),
                 server.total_requests,

@@ -290,23 +290,28 @@ pub struct Env<'a> {
 pub struct Outcome {
     pub terminal: Terminal,
     pub headers: Vec<(HeaderName, HeaderValue)>,
+    /// The kind of statement that decided this request, for the dashboard's tally. A name rather
+    /// than a line, because one flat count per kind says where requests go without the AST having
+    /// to carry an identity for every statement.
+    pub answered_by: &'static str,
 }
 
 struct Run<'a> {
     env: Env<'a>,
     vars: Vars,
     headers: Vec<(HeaderName, HeaderValue)>,
+    answered_by: &'static str,
 }
 
 /// Run `script` against `req`, mutating its URI as `rewrite` statements ask.
 pub async fn run<B>(script: &[Stmt], env: Env<'_>, vars: Vars, req: &mut Request<B>) -> Result<Outcome> {
-    let mut run = Run { env, vars, headers: Vec::new() };
+    let mut run = Run { env, vars, headers: Vec::new(), answered_by: "not found" };
     run.vars.set_request(req);
     let terminal = match run.block(script, req).await? {
         Some(terminal) => terminal,
         None => Terminal::Response(status_response(404, "Not Found")?),
     };
-    Ok(Outcome { terminal, headers: run.headers })
+    Ok(Outcome { terminal, headers: run.headers, answered_by: run.answered_by })
 }
 
 impl<'a> Run<'a> {
@@ -368,7 +373,10 @@ impl<'a> Run<'a> {
                     None => return self.not_found(*fallthrough),
                 };
                 match read_file(&file, req).await? {
-                    Some(response) => Ok(Some(Terminal::Response(response))),
+                    Some(response) => {
+                        self.answered_by = "serve_file";
+                        Ok(Some(Terminal::Response(response)))
+                    }
                     None => self.not_found(*fallthrough),
                 }
             }
@@ -394,18 +402,31 @@ impl<'a> Run<'a> {
                 let file = if file.is_dir() { file.join(index) } else { file };
 
                 match read_file(&file, req).await? {
-                    Some(response) => Ok(Some(Terminal::Response(response))),
+                    Some(response) => {
+                        self.answered_by = "serve_dir";
+                        Ok(Some(Terminal::Response(response)))
+                    }
                     None => self.not_found(*fallthrough),
                 }
             }
 
-            Stmt::ServeApp(name) => Ok(Some(Terminal::ServeApp(name.clone()))),
+            Stmt::ServeApp(name) => {
+                self.answered_by = "serve";
+                Ok(Some(Terminal::ServeApp(name.clone())))
+            },
 
-            Stmt::Forward(target) => Ok(Some(Terminal::Forward(target.render(&self.vars)))),
+            Stmt::Forward(target) => {
+                self.answered_by = "forward";
+                Ok(Some(Terminal::Forward(target.render(&self.vars))))
+            },
 
-            Stmt::Proxy(target) => Ok(Some(Terminal::Proxy(target.render(&self.vars)))),
+            Stmt::Proxy(target) => {
+                self.answered_by = "proxy";
+                Ok(Some(Terminal::Proxy(target.render(&self.vars))))
+            },
 
             Stmt::Redirect { target, status } => {
+                self.answered_by = "redirect";
                 let location = target.render(&self.vars);
                 Ok(Some(Terminal::Response(
                     Response::builder().status(*status).header("Location", location).body(empty_body())?,
@@ -413,6 +434,7 @@ impl<'a> Run<'a> {
             }
 
             Stmt::Respond { status, body, content_type } => {
+                self.answered_by = "respond";
                 let text = match body {
                     Some(template) => template.render(&self.vars),
                     None => default_reason(*status).to_string(),
@@ -479,6 +501,7 @@ impl<'a> Run<'a> {
                         "admin_dashboard is only served for projects owned by the user running webcentral",
                     )?)));
                 }
+                self.answered_by = "dashboard";
                 let filter = if *admin { None } else { Some(self.env.domain) };
                 Ok(Some(Terminal::Response(crate::dashboard::render(filter)?)))
             }

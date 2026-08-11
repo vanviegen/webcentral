@@ -28,6 +28,7 @@ rcgen = "0.14"
 rustls = "0.23"
 rustls-pemfile = "2.2"
 tokio-rustls = "0.26"
+rustls-native-certs = "0.8"
 quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }

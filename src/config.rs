@@ -416,8 +416,8 @@ struct Signature {
     positional: &'static [Param],
     /// Modifiers, which only make sense named.
     named: &'static [Param],
-    /// Whether a `{ ... }` block or an inline statement follows. Argument reading stops at the
-    /// first word that isn't an argument, instead of complaining about it.
+    /// Whether a `{ ... }` block follows. Argument reading stops at the `{` instead of
+    /// complaining about it.
     body: bool,
 }
 
@@ -941,26 +941,19 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// The body of `match` or `else`: a block, or a single inline statement.
+    /// The body of `match` or `else`, which is always a block. Braces are required even around a
+    /// single statement: what a line does should not depend on how far the eye has to travel to
+    /// find out. They may all share one line.
     fn body(&mut self, verb: &Word) -> Option<Vec<Stmt>> {
-        if self.scanner.read_block_open() {
-            return Some(self.statements(false));
-        }
-        let Some(inner_verb) = self.scanner.read_word() else {
-            self.scanner
-                .error_at(verb.pos, format!("'{}' needs a statement or a '{{ ... }}' block", verb.text));
-            self.scanner.skip_line();
+        if !self.expect_block(verb) {
             return None;
-        };
-        let mut inner = Vec::new();
-        self.statement(inner_verb, false, &mut inner);
-        Some(inner)
+        }
+        Some(self.statements(false))
     }
 
-    /// Skip a statement that failed to parse, including whatever body follows it, so that an
-    /// inline `match /x respond 200 y` doesn't leave `respond 200 y` behind as a statement of its
-    /// own. A block always opens on the statement's own line, so there is nothing to look for
-    /// beyond it.
+    /// Skip a statement that failed to parse, including whatever body follows it, so that the
+    /// contents of a `match /x { respond 200 y }` don't stay behind as statements of their own. A
+    /// block always opens on the statement's own line, so there is nothing to look for beyond it.
     fn skip_block(&mut self) {
         let mut depth = 0;
         loop {
@@ -1059,8 +1052,27 @@ impl<'a> Builder<'a> {
                 Some(Stmt::CheckFile { path, body, otherwise: None })
             }
 
-            "forward" => Some(Stmt::Forward(args.template("target")?)),
-            "proxy" => Some(Stmt::Proxy(args.template("url")?)),
+            "forward" => {
+                let target = args.template("target")?;
+                if let Some(literal) = target.as_literal() {
+                    if let Err(why) = check_forward_target(literal) {
+                        self.scanner.error_at(verb.pos, why);
+                        return None;
+                    }
+                }
+                Some(Stmt::Forward(target))
+            }
+
+            "proxy" => {
+                let url = args.template("url")?;
+                if let Some(literal) = url.as_literal() {
+                    if let Err(why) = check_proxy_url(literal) {
+                        self.scanner.error_at(verb.pos, why);
+                        return None;
+                    }
+                }
+                Some(Stmt::Proxy(url))
+            }
             "log" => Some(Stmt::Log(args.template("message")?)),
             "project_dashboard" => Some(Stmt::Dashboard { admin: false }),
             "admin_dashboard" => Some(Stmt::Dashboard { admin: true }),
@@ -1676,6 +1688,63 @@ fn inherit_into_sidecars(server: &mut ServerConfig) {
         env.append(&mut sidecar.env);
         sidecar.env = env;
     }
+}
+
+/// A `forward` target: a port on this host, a `host[:port]`, or the path of a unix socket. Only
+/// checked when it is written out in full - one built from `${...}` is whatever the request makes
+/// it, and can only be judged when it is used.
+fn check_forward_target(target: &str) -> Result<(), String> {
+    if target.starts_with('/') {
+        return Ok(());
+    }
+    if target.contains("://") {
+        return Err(format!(
+            "'{}' is a URL, and forward takes a port, a host:port or a unix socket path - use \
+             proxy for a URL",
+            target
+        ));
+    }
+    let port = match target.rsplit_once(':') {
+        Some((host, port)) => {
+            if host.is_empty() {
+                return Err(format!("'{}' has no host before its port", target));
+            }
+            Some(port)
+        }
+        None if target.chars().all(|c| c.is_ascii_digit()) => Some(target),
+        // A bare hostname, which is forwarded to on port 80.
+        None if !target.is_empty() => None,
+        None => return Err("forward needs somewhere to forward to".to_string()),
+    };
+    match port {
+        Some(port) => match port.parse::<u16>() {
+            Ok(0) | Err(_) => Err(format!(
+                "'{}' is not a port number, so '{}' cannot be forwarded to",
+                port, target
+            )),
+            Ok(_) => Ok(()),
+        },
+        None => Ok(()),
+    }
+}
+
+/// A `proxy` target: an absolute URL, since its scheme decides whether the connection is encrypted
+/// and its host is what the upstream is told it is.
+fn check_proxy_url(url: &str) -> Result<(), String> {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Err(format!(
+            "'{}' is not a URL - proxy needs a scheme and a host, like https://example.com; use \
+             forward for a port or a socket",
+            url
+        ));
+    };
+    if !matches!(scheme, "http" | "https") {
+        return Err(format!("proxy cannot speak '{}', only http and https", scheme));
+    }
+    if rest.is_empty() || rest.starts_with('/') {
+        return Err(format!("'{}' names no host to proxy to", url));
+    }
+    Ok(())
 }
 
 /// Whether a configured path could reach outside the project. Checked again against symlinks

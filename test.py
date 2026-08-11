@@ -108,6 +108,42 @@ class TestRunner:
             port = s.getsockname()[1]
         return port
 
+    def make_test_certificate(self):
+        """A self-signed certificate for localhost that webcentral will trust, so a test can prove
+        `proxy https://` really speaks TLS rather than only reaching the right port.
+
+        Trust is handed over with SSL_CERT_FILE, which podman honours too - hence the system
+        bundle concatenated in front of it, or pulling an image would stop working.
+        """
+        tls = os.path.join(self.tmpdir, 'tls')
+        os.makedirs(tls)
+        self.tls_cert = os.path.join(tls, 'cert.pem')
+        self.tls_key = os.path.join(tls, 'key.pem')
+        ca_cert, ca_key = os.path.join(tls, 'ca.pem'), os.path.join(tls, 'ca.key')
+        csr, ext = os.path.join(tls, 'leaf.csr'), os.path.join(tls, 'leaf.ext')
+        with open(ext, 'w') as f:
+            f.write('subjectAltName=DNS:localhost\n')
+        # A real chain, not a self-signed leaf: a certificate marked as a CA is refused as an end
+        # entity, which is exactly the check we want the upstream to be subject to.
+        for args in (
+            ['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+             '-keyout', ca_key, '-out', ca_cert, '-subj', '/CN=webcentral-test-ca'],
+            ['openssl', 'req', '-newkey', 'rsa:2048', '-nodes',
+             '-keyout', self.tls_key, '-out', csr, '-subj', '/CN=localhost'],
+            ['openssl', 'x509', '-req', '-in', csr, '-CA', ca_cert, '-CAkey', ca_key,
+             '-CAcreateserial', '-days', '1', '-extfile', ext, '-out', self.tls_cert],
+        ):
+            subprocess.run(args, check=True, capture_output=True)
+        bundle = os.path.join(tls, 'bundle.pem')
+        with open(bundle, 'w') as out:
+            for system in ('/etc/ssl/certs/ca-certificates.crt',
+                           '/etc/pki/tls/certs/ca-bundle.crt'):
+                if os.path.exists(system):
+                    out.write(open(system).read())
+                    break
+            out.write(open(ca_cert).read())
+        os.environ['SSL_CERT_FILE'] = bundle
+
     def setup(self):
         """Set up test environment and start webcentral"""
         # Use fixed test directory in current directory
@@ -135,6 +171,8 @@ class TestRunner:
         # Find free port
         self.port = self.find_free_port()
         print(f"Test port: {self.port}")
+
+        self.make_test_certificate()
 
         # Start webcentral process
         stdout_log = f"{self.tmpdir}/stdout/_webcentral_data/log/current"
@@ -600,8 +638,8 @@ def test_rewrite_static(t):
     t.write_file('public/index.html', '<h1>App Shell</h1>')
     t.write_file('public/articles/hello.html', '<h1>Hello Article</h1>')
     t.write_file('webcentral.conf', '''
-match /blog/(.*) set path /articles/${1}.html
-match /deep/link set path /index.html
+match /blog/(.*) { set path /articles/${1}.html }
+match /deep/link { set path /index.html }
 ''')
 
     t.assert_http('/blog/hello', check_body='Hello Article')
@@ -618,8 +656,8 @@ def test_script_runs_in_order(t):
     t.write_file('public/favicon.ico', 'icon')
     t.write_file('public/app.js', 'script')
     t.write_file('webcentral.conf', '''
-match /favicon.ico serve_dir public
-match /app.js serve_dir public
+match /favicon.ico { serve_dir public }
+match /app.js { serve_dir public }
 serve_file public/index.html
 ''')
 
@@ -667,7 +705,7 @@ match /files/(.*) {
   serve_file public/${1} fallthrough=true
   respond 404 "no file called ${1}"
 }
-else respond 418 "not a file request"
+else { respond 418 "not a file request" }
 ''')
 
     t.assert_http('/files/real.txt', check_body='real file')
@@ -679,9 +717,9 @@ else respond 418 "not a file request"
 def test_redirect_and_moved(t):
     """redirect is a 302 unless status= says otherwise"""
     t.write_file('webcentral.conf', '''
-match /old/(.*) redirect https://example.com/new/${1} status=301
-match /tmp/(.*) redirect https://example.com/t/${1}
-match /odd/(.*) redirect https://example.com/o/${1} status=307
+match /old/(.*) { redirect https://example.com/new/${1} status=301 }
+match /tmp/(.*) { redirect https://example.com/t/${1} }
+match /odd/(.*) { redirect https://example.com/o/${1} status=307 }
 ''')
 
     t.assert_http('/old/page', check_code=301, check_header=('Location', 'https://example.com/new/page'))
@@ -755,7 +793,7 @@ service web {
   reload_include = *.js web.py
 }
 
-match /api/(.*) serve api
+match /api/(.*) { serve api }
 serve web
 ''')
 
@@ -895,7 +933,7 @@ def test_capture_scoping(t):
     """Captures resolve innermost-first then outwards, so nesting keeps outer groups reachable"""
     t.write_file('webcentral.conf', '''
 match /shop/(?<section>[a-z]+)/(.*) {
-  match .*\\.json respond 200 "json in ${section} from ${2}"
+  match .*\\.json { respond 200 "json in ${section} from ${2}" }
   respond 200 "page ${section}/${2}"
 }
 respond 200 "no match"
@@ -909,11 +947,11 @@ respond 200 "no match"
 
 @test
 def test_else_pairs_with_the_preceding_statement(t):
-    """else always pairs with the statement right before it, inline body or not"""
+    """else always pairs with the statement right before it, one line or many"""
     t.write_file('public/real.txt', 'real file')
     t.write_file('webcentral.conf', '''
-match /files/(.*) check_file public/${1} serve_file public/${1}
-else respond 418 "not a files request"
+match /files/(.*) { check_file public/${1} { serve_file public/${1} } }
+else { respond 418 "not a files request" }
 respond 200 fell-through
 ''')
 
@@ -923,11 +961,11 @@ respond 200 fell-through
     t.assert_http('/files/nope', check_body='fell-through')
     t.assert_http('/other', check_code=418, check_body='not a files request')
 
-    # Pairing it with the inner statement instead is what the block form is for
+    # Pairing it with the inner statement instead means putting it inside that block
     t.write_file('webcentral.conf', '''
 match /files/(.*) {
-  check_file public/${1} serve_file public/${1}
-  else respond 404 "no ${1} here"
+  check_file public/${1} { serve_file public/${1} }
+  else { respond 404 "no ${1} here" }
 }
 respond 200 fell-through
 ''')
@@ -944,9 +982,9 @@ respond 200 fell-through
 def test_match_subjects(t):
     """method= and host= match those instead of the path"""
     t.write_file('webcentral.conf', '''
-match POST subject=${method} respond 200 posted
-match subject=${host} nope.example matcher=literal respond 200 wrong-host
-match subject=${host} .*\\.test respond 200 right-host
+match POST subject=${method} { respond 200 posted }
+match subject=${host} nope.example matcher=literal { respond 200 wrong-host }
+match subject=${host} .*\\.test { respond 200 right-host }
 respond 200 unreachable
 ''')
 
@@ -961,9 +999,9 @@ def test_response_shaping(t):
     t.write_file('public/index.html', 'root page')
     t.write_file('public/app/main.html', 'app shell')
     t.write_file('webcentral.conf', '''
-match .*\\.html set_header Cache-Control "max-age=31536000"
-match /html respond 200 "<b>hi</b>" type=text/html
-match /app/ serve_dir public index=main.html
+match .*\\.html { set_header Cache-Control "max-age=31536000" }
+match /html { respond 200 "<b>hi</b>" type=text/html }
+match /app/ { serve_dir public index=main.html }
 serve_dir public
 ''')
 
@@ -979,8 +1017,8 @@ def test_named_arguments(t):
     """Positional arguments can also be given by name, and named ones tune the rest"""
     t.write_file('public/index.html', 'root')
     t.write_file('webcentral.conf', '''
-match subject=${path} pattern=/named respond status=200 body="by name" type=text/html
-match /positional respond 200 "by position"
+match subject=${path} pattern=/named { respond status=200 body="by name" type=text/html }
+match /positional { respond 200 "by position" }
 serve_dir dir=public index=index.html
 ''')
 
@@ -995,7 +1033,7 @@ def test_unknown_named_argument(t):
     t.write_file('public/index.html', 'root')
     t.write_file('webcentral.conf', '''
 set_header Cache-Control max-age=60
-match /x subject=${nosuchvar} respond 200 never
+match /x subject=${nosuchvar} { respond 200 never }
 respond 200 "kept going"
 ''')
 
@@ -1011,9 +1049,9 @@ def test_request_variables(t):
     """${path}, ${method}, ${host} and ${query} are available wherever captures are"""
     t.write_file('public/deep/file.txt', 'deep file')
     t.write_file('webcentral.conf', '''
-match /echo respond 200 "${method} ${path}?${query} via ${host}"
-match /files/(.*) serve_file public/${path} fallthrough=true
-match /shadow/(?<path>.*) respond 200 "shadowed ${path}"
+match /echo { respond 200 "${method} ${path}?${query} via ${host}" }
+match /files/(.*) { serve_file public/${path} fallthrough=true }
+match /shadow/(?<path>.*) { respond 200 "shadowed ${path}" }
 respond 200 "no match"
 ''')
 
@@ -1028,7 +1066,7 @@ respond 200 "no match"
 def test_request_variables_follow_rewrite(t):
     """${path} describes the request as it stands now, so a set path updates it"""
     t.write_file('webcentral.conf', '''
-match /old/(.*) set path /new/${1}
+match /old/(.*) { set path /new/${1} }
 respond 200 "path is ${path}"
 ''')
 
@@ -1047,7 +1085,7 @@ match /say${suffix} {
   set who ${1}
   respond 200 "${greeting} ${who}"
 }
-match /raw respond 200 '${greeting} is not substituted here'
+match /raw { respond 200 '${greeting} is not substituted here' }
 serve_dir public
 ''')
 
@@ -1064,9 +1102,9 @@ def test_match_subject_and_literal(t):
     t.write_file('webcentral.conf', '''
 set wanted /exact.path
 
-match POST subject=${method} respond 200 posted
-match ${wanted} matcher=literal respond 200 "literal hit"
-match subject=${host} .*\\.test respond 200 "host hit"
+match POST subject=${method} { respond 200 posted }
+match ${wanted} matcher=literal { respond 200 "literal hit" }
+match subject=${host} .*\\.test { respond 200 "host hit" }
 respond 200 fallthrough
 ''')
 
@@ -1095,8 +1133,8 @@ respond 200 other
 def test_subject_is_an_ordinary_argument(t):
     """subject= is a value like any other, so it can be built from several variables"""
     t.write_file('webcentral.conf', '''
-match .*\\.test/admin/.* subject=${host}${path} respond 200 "admin on this host"
-match /admin/.* respond 200 "admin elsewhere"
+match .*\\.test/admin/.* subject=${host}${path} { respond 200 "admin on this host" }
+match /admin/.* { respond 200 "admin elsewhere" }
 respond 200 other
 ''')
 
@@ -1108,8 +1146,8 @@ respond 200 other
 def test_unanchored_matching(t):
     """anchored=false matches anywhere in the value, for a regex or a plain string"""
     t.write_file('webcentral.conf', '''
-match /internal/ anchored=false matcher=literal respond 200 "contains internal"
-match v[0-9]+ anchored=false respond 200 "has a version"
+match /internal/ anchored=false matcher=literal { respond 200 "contains internal" }
+match v[0-9]+ anchored=false { respond 200 "has a version" }
 respond 200 plain
 ''')
 
@@ -1123,7 +1161,7 @@ def test_undefined_variables_are_reported(t):
     """A ${name} nothing ever sets is empty, and said so at load time"""
     t.write_file('public/index.html', 'root')
     t.write_file('webcentral.conf', '''
-match /typo respond 200 "value is ${verison}"
+match /typo { respond 200 "value is ${verison}" }
 serve_dir public
 ''')
 
@@ -1231,8 +1269,8 @@ serve_dir public
 
     # An else branch runs when the file is absent
     t.write_file('webcentral.conf', """
-check_file nothing/here.txt respond 200 found
-else respond 404 "no such thing"
+check_file nothing/here.txt { respond 200 found }
+else { respond 404 "no such thing" }
 """)
     t.await_log('(reloading configuration)')
     t.assert_http('/', check_code=404, check_body='no such thing')
@@ -1316,13 +1354,13 @@ serve_dir public
 def test_quoting_rules(t):
     """What quotes do to a word: gluing, `=`, and quoting a quote"""
     t.write_file('webcentral.conf', """
-match /named respond 200 body type=text/html
-match /quoted respond 200 "type=text/html"
-match /dq respond 200 "she said \\"hi\\""
-match /sq respond 200 "it's fine"
-match /ds respond 200 'say "hi"'
-match /glue respond 200 'it'"'"'s'
-match /backslash respond 200 a\\.b
+match /named { respond 200 body type=text/html }
+match /quoted { respond 200 "type=text/html" }
+match /dq { respond 200 "she said \\"hi\\"" }
+match /sq { respond 200 "it's fine" }
+match /ds { respond 200 'say "hi"' }
+match /glue { respond 200 'it'"'"'s' }
+match /backslash { respond 200 a\\.b }
 respond 404 no
 """)
 
@@ -1348,11 +1386,11 @@ def test_only_braces_are_substituted(t):
     t.write_file('webcentral.conf', """
 set who world
 
-match /shell respond 200 "$HOME and $PATH and $$ are not mine"
-match /plain respond 200 "$who is literal, ${who} is not"
-match /price respond 200 'costs ${5}'
-match /a{2}b respond 200 "quantifier works"
-match /tail$ anchored=false respond 200 "trailing anchor works"
+match /shell { respond 200 "$HOME and $PATH and $$ are not mine" }
+match /plain { respond 200 "$who is literal, ${who} is not" }
+match /price { respond 200 'costs ${5}' }
+match /a{2}b { respond 200 "quantifier works" }
+match /tail$ anchored=false { respond 200 "trailing anchor works" }
 respond 200 other
 """)
 
@@ -1388,8 +1426,8 @@ service {
   }
 }
 
-match /secret respond 200 "the secret is ${DB_PASSWORD}"
-check_auth ${DASHBOARD_SECRET} respond 200 "admin ok"
+match /secret { respond 200 "the secret is ${DB_PASSWORD}" }
+check_auth ${DASHBOARD_SECRET} { respond 200 "admin ok" }
 serve
 """)
 
@@ -1459,7 +1497,7 @@ service b {
   command = python3 -u b.py
 }
 
-match /b/.* serve b
+match /b/.* { serve b }
 serve a
 ''')
 
@@ -1480,8 +1518,8 @@ def test_check_auth(t):
 set admin_secret hunter2
 
 match /admin/(.*) {
-  check_auth ${admin_secret} respond 200 "admin area"
-  else respond 403 denied
+  check_auth ${admin_secret} { respond 200 "admin area" }
+  else { respond 403 denied }
 }
 serve_dir public
 ''')
@@ -1510,8 +1548,8 @@ serve backend
                              t.get_log_content(t.current_test_domain, 0)).group(1)
 
     t.write_file('webcentral.conf', f'''
-match /fwd/(.*) forward {backend_port}
-match /prx/(.*) proxy http://localhost:{backend_port}
+match /fwd/(.*) {{ forward {backend_port} }}
+match /prx/(.*) {{ proxy http://localhost:{backend_port} }}
 respond 200 neither
 ''', domain='router.test')
 
@@ -1522,13 +1560,67 @@ respond 200 neither
 
 
 @test
+def test_proxy_speaks_https(t):
+    """proxy reaches an https upstream, and verifies its certificate rather than trusting it"""
+    port = t.find_free_port()
+    backend = os.path.join(t.tmpdir, 'tls-backend.py')
+    with open(backend, 'w') as f:
+        f.write(f"""
+import http.server, ssl
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = ('secured ' + self.path).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain({t.tls_cert!r}, {t.tls_key!r})
+server = http.server.HTTPServer(('127.0.0.1', {port}), Handler)
+server.socket = context.wrap_socket(server.socket, server_side=True)
+server.serve_forever()
+""")
+    log = open(os.path.join(t.tmpdir, 'tls-backend.log'), 'w+')
+    proc = subprocess.Popen([sys.executable, backend], stdout=log, stderr=subprocess.STDOUT)
+    try:
+        # The upstream has to be listening before webcentral is asked to reach it
+        for _ in range(100):
+            if proc.poll() is not None:
+                log.seek(0)
+                raise AssertionError('the TLS backend died:\n' + log.read())
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=0.5).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            raise AssertionError('the TLS backend never started listening')
+
+        t.write_file('webcentral.conf', f"""
+match /secure/(.*) {{ proxy https://localhost:{port} }}
+match /wrongname/(.*) {{ proxy https://127.0.0.1:{port} }}
+respond 200 plain
+""")
+        t.assert_http('/secure/thing', check_body='secured /secure/thing', timeout=15)
+        # The certificate is checked against the name asked for, so the same upstream reached by
+        # an address the certificate doesn't cover is refused rather than silently accepted
+        t.assert_http('/wrongname/thing', check_code=502)
+        t.assert_http('/elsewhere', check_body='plain')
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@test
 def test_rewrite_application(t):
     """Rewrites reach the application, preserving the query string"""
     t.write_file('webcentral.conf', '''
 service {
   command = python3 -u -m http.server $PORT
 }
-match /pretty/(.*) set path /${1}.txt
+match /pretty/(.*) { set path /${1}.txt }
 ''')
     t.write_file('real.txt', 'the real file')
 
@@ -1845,7 +1937,7 @@ with socketserver.TCPServer(("", PORT), Handler) as httpd:
 @test
 def test_redirect_configuration(t):
     """Test HTTP redirect configuration"""
-    t.write_file('webcentral.conf', 'match (.*) redirect https://example.org${1} status=301')
+    t.write_file('webcentral.conf', 'match (.*) { redirect https://example.org${1} status=301 }')
 
     # Expect 301 redirect
     t.assert_http('/', check_code=301)
@@ -2101,7 +2193,7 @@ service {
     t.await_log('Stopping due to inactivity', timeout=3)
     t.mark_log_read()
     # Change config while idle: turn the project into a redirect
-    t.write_file('webcentral.conf', 'match (.*) redirect http://example.com${1} status=301')
+    t.write_file('webcentral.conf', 'match (.*) { redirect http://example.com${1} status=301 }')
     t.await_log('(reloading configuration)', timeout=3)
     time.sleep(0.3)
     # Next request must use the NEW config (a 301 redirect), not restart the old app
@@ -2358,14 +2450,14 @@ def test_config_diagnostics(t):
     t.write_file('public/index.html', '<h1>Shell</h1>')
     t.write_file('webcentral.conf', f'''
 invalid_statement key value
-match /broken( set path /index.html
-match \\.css$ respond 200 css
+match /broken( {{ set path /index.html }}
+match \\.css$ {{ respond 200 css }}
 service api {{
   command = python3 -u -m http.server $PORT
   nonesuch = 1
 }}
 serve_dir public
-else respond 404 nope
+else {{ respond 404 nope }}
 serve typo
 ''')
 
@@ -2380,6 +2472,94 @@ serve typo
     t.assert_log("'else' can only follow", count=1)
     # A server nobody serves is dead configuration
     t.assert_log("server 'api' is declared but never served", count=1)
+
+
+@test
+def test_bodies_need_braces(t):
+    """A conditional's body is always a block, on one line or across several"""
+    t.write_file('public/index.html', '<h1>Shell</h1>')
+    t.write_file('webcentral.conf', """
+match /bare respond 200 "no braces"
+match /braced { respond 200 "braced" }
+match /multi {
+  respond 200 "multi"
+}
+serve_dir public
+""")
+
+    # The rest of the file still works, and the body of the broken line is not left behind as a
+    # statement of its own - /bare would answer 200 "no braces" if it were
+    t.assert_http('/braced', check_body='braced')
+    t.assert_http('/multi', check_body='multi')
+    t.assert_http('/', check_body='Shell')
+    t.assert_http('/bare', check_code=404)
+    t.assert_log("line 2:1: 'match' needs a '{ ... }' block", count=1)
+
+
+@test
+def test_proxy_and_forward_targets_are_checked(t):
+    """A constant proxy URL or forward target is judged when the file is read, not per request"""
+    t.write_file('public/index.html', '<h1>Shell</h1>')
+    t.write_file('webcentral.conf', """
+match /a { proxy example.com }
+match /b { proxy ftp://example.com }
+match /c { proxy https:///nohost }
+match /d { forward http://example.com }
+match /e { forward 99999 }
+match /f { forward :8080 }
+match /ok1 { forward 8080 }
+match /ok2 { forward example.com:8080 }
+match /ok3 { forward /run/app.sock }
+match /ok4 { proxy https://example.com/base }
+serve_dir public
+""")
+
+    t.assert_http('/', check_body='Shell')
+    t.assert_log("'example.com' is not a URL", count=1)
+    t.assert_log("proxy cannot speak 'ftp'", count=1)
+    t.assert_log("names no host to proxy to", count=1)
+    t.assert_log("'http://example.com' is a URL", count=1)
+    t.assert_log("'99999' is not a port number", count=1)
+    t.assert_log("has no host before its port", count=1)
+
+    t.mark_log_read()
+    t.write_file('webcentral.conf', """
+set backend example.com
+match /built { forward ${backend}:8080 }
+serve_dir public
+""")
+    t.assert_http('/', check_body='Shell')
+    t.assert_log('is not a port number', count=0)
+
+
+@test
+def test_dashboard_shows_config_and_answers(t):
+    """The dashboard names what each service runs, and tallies what answered the requests"""
+    t.write_file('public/index.html', '<h1>Home</h1>')
+    t.write_file('webcentral.conf', """
+service api {
+  command = python3 -u -m http.server $PORT
+}
+match /api/(.*) { serve api }
+match /gone { redirect https://example.com }
+match /hello { respond 200 hi }
+match /status { project_dashboard }
+serve_dir public
+""")
+
+    t.assert_http('/', check_body='Home')
+    t.assert_http('/hello', check_body='hi')
+    t.assert_http('/gone', check_code=302)
+    t.assert_http('/nothing/here', check_code=404)
+
+    body = t.assert_http('/status', check_body='Webcentral Dashboard')
+    # The service row says what it runs and what image it runs on
+    assert 'http.server' in body, body
+    # The image is the one the harness gives a service that names none
+    assert 'webcentral-test-base' in body, body
+    # ...and the tally says which statements did the answering
+    for kind in ('serve_dir', 'respond', 'redirect', 'not found'):
+        assert kind in body, f"{kind} missing from the tally: {body}"
 
 
 @test
@@ -2962,7 +3142,7 @@ def test_redirect_changes_to_app(t):
     # Start as redirect
     t.write_file('webcentral.conf',
                  '''
-match (.*) redirect https://example.com${1} status=301
+match (.*) { redirect https://example.com${1} status=301 }
 ''')
     t.write_file('index.html', '<h1>App Content</h1>')
 
@@ -3006,7 +3186,7 @@ service {
     # Change to redirect
     t.write_file('webcentral.conf',
                  '''
-match (.*) redirect https://example.org${1} status=301
+match (.*) { redirect https://example.org${1} status=301 }
 ''')
 
     # Should trigger reload
@@ -4009,7 +4189,7 @@ def test_check_auth_falls_through(t):
     t.write_file('public/index.html', '<h1>Page</h1>')
     t.assert_http('/', check_body='Page')
 
-    t.write_file('webcentral.conf', 'check_auth s3cret serve_dir public\nrespond 401 "who goes there"\n')
+    t.write_file('webcentral.conf', 'check_auth s3cret { serve_dir public }\nrespond 401 "who goes there"\n')
     t.await_log('(reloading configuration)')
 
     t.assert_http('/', check_code=401)
@@ -4025,7 +4205,7 @@ def test_check_auth_with_application(t):
 service {
   command = python3 -u -m http.server $PORT
 }
-check_auth topsecret serve
+check_auth topsecret { serve }
 respond 401 Unauthorized
 ''')
     t.write_file('index.html', '<h1>App</h1>')
@@ -4057,7 +4237,7 @@ service { command = python3 -u app.py }
 
 match /protected/(.*) {
   # Only reachable through an internal redirect from the app, never directly
-  match default subject=${redirected_by} matcher=literal serve_dir . fallthrough=true
+  match default subject=${redirected_by} matcher=literal { serve_dir . fallthrough=true }
   respond 403 "no direct access"
 }
 serve
@@ -4350,13 +4530,27 @@ def test_podman_runs_as_the_project_owner(t):
     container root *is* that owner and what the container writes is already theirs, with no uid
     mapping of webcentral's own. It needs a second real account with a subuid range, which is what
     SUDO_UID points at when the suite is run under sudo.
+
+    `WEBCENTRAL_TEST_OWNER` names an account to use instead, and CI points it at one that has
+    never logged in: no `/run/user/<uid>`, no systemd user session, no lingering. That is the
+    state a real project owner is in, and everything podman wants from a login session -
+    XDG_RUNTIME_DIR, a dbus socket, a systemd cgroup manager - has to be supplied by
+    `Owner::podman` rather than assumed.
     """
     if os.geteuid() != 0:
         raise SkipTest("needs root to hand a project to another user")
-    uid = int(os.environ.get('SUDO_UID') or 0)
-    gid = int(os.environ.get('SUDO_GID') or 0)
-    if not uid:
-        raise SkipTest("no SUDO_UID, so there is no second user to hand the project to")
+    owner = os.environ.get('WEBCENTRAL_TEST_OWNER')
+    if owner:
+        import pwd
+        entry = pwd.getpwnam(owner)
+        uid, gid = entry.pw_uid, entry.pw_gid
+        assert not os.path.exists(f'/run/user/{uid}'), \
+            f"{owner} has a runtime directory, so this no longer tests the never-logged-in case"
+    else:
+        uid = int(os.environ.get('SUDO_UID') or 0)
+        gid = int(os.environ.get('SUDO_GID') or 0)
+        if not uid:
+            raise SkipTest("no SUDO_UID, so there is no second user to hand the project to")
 
     _podman_setup(t,
                   f'  command = {{ id -u; id -g; }} > /app/data/id.txt && {PODMAN_SERVE}\n'
