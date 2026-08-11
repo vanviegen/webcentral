@@ -93,22 +93,28 @@ jobs:
           grep -aE '✗|Error:|At:|Required tests were skipped|assert' test-output.log \
             | tail -40 | emit "test failures"
 
+          # A project's log directory rotates daily, so it can hold more than one file. Only the
+          # one being written to is interesting, and a glob that matches both would otherwise
+          # silently report neither.
+          newest_log() { sudo ls -t "$1"/_webcentral_data/log/* 2>/dev/null | head -1; }
+
           # The projects of the tests that failed first, since a later failure is often the
           # earlier one's wreckage. Their logs say what podman was asked to do and what it said.
           failed=$(sed -e 's/\x1b\[[0-9;]*m//g' test-output.log \
             | grep -aoE '✗ test_[a-z0-9_]+' | sed 's/✗ test_//' | tr '_' '-' | head -5)
           for domain in $failed; do
-            log=$(echo .test-tmp/"$domain".test/_webcentral_data/log/*)
-            [ -f "$log" ] || continue
+            log=$(newest_log ".test-tmp/$domain.test")
+            [ -n "$log" ] || continue
             sudo tail -80 "$log" | emit "$domain"
           done
 
           # Anything else that complained, in case the failure was really somewhere upstream of
           # the test that reported it. A build failure puts the package manager's own output here.
-          for log in .test-tmp/*/_webcentral_data/log/*; do
-            [ -f "$log" ] || continue
-            domain=$(basename "$(dirname "$(dirname "$(dirname "$log")")")")
-            echo "$failed" | grep -q "^${domain%.test}$" && continue
+          for dir in .test-tmp/*.test; do
+            domain=$(basename "$dir" .test)
+            echo "$failed" | grep -qx "$domain" && continue
+            log=$(newest_log "$dir")
+            [ -n "$log" ] || continue
             sudo grep -qiE 'error|failed|not found' "$log" || continue
             sudo tail -40 "$log" | emit "$domain"
           done | head -c 60000
