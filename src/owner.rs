@@ -141,6 +141,12 @@ impl Owner {
                     Ok(())
                 });
             }
+            // A child inherits the working directory, and webcentral's is wherever it was started
+            // from - which the owner it is about to become may not be allowed to enter, and
+            // podman resolves it again as it re-executes itself into a user namespace. Nothing it
+            // is asked to do is relative, so the owner's own home is a directory they can always
+            // reach.
+            cmd.current_dir(&identity.home);
             cmd.env("HOME", &identity.home);
             cmd.env("USER", &self.name);
             cmd.env("LOGNAME", &self.name);
