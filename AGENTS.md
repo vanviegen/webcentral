@@ -291,6 +291,16 @@ non-root `user =` there is warned about rather than silently mapped. Only an exp
 mapping only covers the resolved user: an image that switches at runtime to a uid it does not
 declare writes as that uid.
 
+**Declared volumes:** an image's `VOLUME` paths are inspected when the image is prepared and
+given a directory under `_webcentral_data/mounts`, because podman's anonymous volume for one goes
+away with `--rm` - silently, and only on the first restart. A `mounts` entry covering the path
+wins, and so does `app_dir`, since the project directory already persists.
+
+**Declared volumes:** an image's `VOLUME` paths are inspected when the image is prepared and
+given a directory under `_webcentral_data/mounts`, because podman's anonymous volume for one goes
+away with `--rm` - silently, and only on the first restart. A `mounts` entry covering the path
+wins, and so does `app_dir`, since the project directory already persists.
+
 **Sidecars:** Nested server declarations, spawned before their parent and killed with it. One
 without a `base` of its own inherits the parent's prepared image *and* its `env` (its own entries
 winning), which is what replaced the worker concept. A

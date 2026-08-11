@@ -72,6 +72,9 @@ struct Prepared {
     /// The ids the container really runs as, which the host-side ownership mapping derives from.
     run_uid: u32,
     run_gid: u32,
+    /// Paths the image declares with `VOLUME` that nothing else already covers, to be given a
+    /// directory on the host. Settled with the image, since that is what declares them.
+    volumes: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1133,9 +1136,74 @@ impl AppServer {
             },
         };
 
-        let prepared = Prepared { image, user_arg, run_uid, run_gid };
+        let volumes = self.volumes_to_persist(config, &image).await;
+        let prepared = Prepared { image, user_arg, run_uid, run_gid, volumes };
         cache.insert(config.name.clone(), prepared.clone());
         Ok(prepared)
+    }
+
+    /// Where a `mounts` entry lands inside the container. Relative entries hang off `app_dir`, so
+    /// there is nowhere to put one when nothing is mounted - which the parser refuses anyway.
+    fn container_mount_path(config: &ServerConfig, mount: &str) -> Option<String> {
+        match (&config.app_dir, mount.starts_with('/')) {
+            (_, true) => Some(mount.to_string()),
+            (Some(app_dir), false) => Some(format!("{}/{}", app_dir, mount)),
+            (None, false) => None,
+        }
+    }
+
+    /// Whether `path` is `covered_by` or sits inside it.
+    fn is_within(path: &str, covered_by: &str) -> bool {
+        path == covered_by || path.starts_with(&format!("{}/", covered_by.trim_end_matches('/')))
+    }
+
+    /// What the image asks to have persisted, minus whatever the configuration already persists.
+    ///
+    /// An image that declares `VOLUME /data` persists nothing by itself: podman gives the
+    /// container an anonymous volume and `--rm` takes it away with the container, so a stock
+    /// database image would lose everything it wrote on the first restart - and only on the first
+    /// restart, which is the worst moment to find out. Webcentral gives each one a directory
+    /// beside the mounts the configuration asked for instead. Saying so in the file with `mounts`
+    /// still wins; this is only about the case where nobody said anything.
+    async fn volumes_to_persist(&self, config: &ServerConfig, image: &str) -> Vec<String> {
+        let mut covered: Vec<String> = config
+            .mounts
+            .iter()
+            .filter_map(|mount| Self::container_mount_path(config, mount))
+            .collect();
+        // The project directory is already a host directory, so anything under it persists.
+        if let Some(app_dir) = &config.app_dir {
+            covered.push(app_dir.clone());
+        }
+
+        let mut persist = Vec::new();
+        for volume in self.image_volumes(image).await {
+            if covered.iter().any(|c| Self::is_within(&volume, c)) {
+                continue;
+            }
+            self.log(&format!(
+                "Image {} declares VOLUME {}, which podman would discard when the container \
+                 stops; keeping it in _webcentral_data/mounts instead. Say 'mounts = {}' to place \
+                 it yourself.",
+                image, volume, volume
+            ));
+            persist.push(volume);
+        }
+        persist
+    }
+
+    /// The `VOLUME` paths an image declares, sorted so the same image always reports them in the
+    /// same order. An image that declares none, or that cannot be inspected, has none.
+    async fn image_volumes(&self, image: &str) -> Vec<String> {
+        let mut inspect = self.owner.podman();
+        inspect.args(["image", "inspect", "--format", "{{json .Config.Volumes}}", image]);
+        let output = match inspect.output().await {
+            Ok(out) if out.status.success() => out.stdout,
+            _ => return Vec::new(),
+        };
+        let parsed: Option<std::collections::BTreeMap<String, serde_json::Value>> =
+            serde_json::from_slice(&output).unwrap_or_default();
+        parsed.map(|map| map.into_keys().collect()).unwrap_or_default()
     }
 
     /// The image for one service, whether it needs a build of its own or just its base pulled.
@@ -1185,7 +1253,7 @@ impl AppServer {
         publish: Option<u16>,
     ) -> Result<Command> {
         let container_name = format!("webcentral-{:x}", self.dir_hash(&config.name));
-        let Prepared { image, user_arg, run_uid, run_gid } = prepared.clone();
+        let Prepared { image, user_arg, run_uid, run_gid, .. } = prepared.clone();
 
         // A container that outlived its webcentral (killed rather than shut down) keeps holding
         // the name, and `run` then fails with a name conflict on every subsequent attempt -
@@ -1237,13 +1305,12 @@ impl AppServer {
 
         // Additional mounts. These live on the host but are written by the container; owner
         // ownership is exactly where the container's writes land through the userns mapping.
-        for mount in &config.mounts {
-            let container_path = match (&config.app_dir, mount.starts_with('/')) {
-                (_, true) => mount.clone(),
-                (Some(app_dir), false) => format!("{}/{}", app_dir, mount),
-                // Refused at parse time; skipping keeps a stray one from mounting at garbage.
-                (None, false) => continue,
-            };
+        let configured = config.mounts.iter().filter_map(|mount| {
+            // A relative entry with nothing to hang off is refused at parse time; skipping keeps a
+            // stray one from mounting at garbage.
+            Self::container_mount_path(config, mount)
+        });
+        for container_path in configured.chain(prepared.volumes.iter().cloned()) {
             let host_path = self
                 .dir
                 .join("_webcentral_data/mounts")

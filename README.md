@@ -587,7 +587,7 @@ service {                         # no name, so it is called "default"
 | `copy` | Project files to put in the image before `build` runs, so it can use them (`copy = requirements.txt`). Paths are relative to the project and may not leave it. Editing one rebuilds the image and restarts the service. |
 | `dockerfile` | Build the image from a Dockerfile of the project's own - see **Dockerfiles** below. Replaces `base`, `packages`, `build` and `copy`. |
 | `port` | The port the command listens on inside the container. Default `8000`. |
-| `mounts` | Directories that outlive the container, kept in `_webcentral_data/mounts/`. Relative paths are under `app_dir`. |
+| `mounts` | Directories that outlive the container, kept in `_webcentral_data/mounts/`. Relative paths are under `app_dir`. Paths the image declares with `VOLUME` are kept there too, unless a `mounts` entry already covers them. |
 | `app_dir` | Where the project directory is mounted. Default `/app`; `none` mounts nothing, for images that carry the application themselves. |
 | `user` | Who the container runs as *inside* - see **Container user** below. |
 | `shutdown_time` | Idle time before stopping again. `0` keeps it running. Default `300` (seconds; `90s`, `5m` and `2h` also work). |
@@ -670,6 +670,20 @@ image is, and podman's layer cache keeps an unchanged rebuild to about a second.
 
 `dockerfile` and `base`/`packages`/`build`/`copy` are alternatives, and saying both is an error:
 the Dockerfile is already the answer to how the image gets built.
+
+**A `VOLUME` the image declares is kept.** Podman would give it an anonymous volume and take that
+away with the container, so a stock database image would lose everything it wrote on the first
+restart - and only on the first restart, which is the worst moment to find out. Webcentral gives
+each declared volume a directory under `_webcentral_data/mounts/` instead, and says so in the
+project log. A `mounts` entry that already covers the path wins, so this only decides what happens
+when the configuration says nothing:
+
+```ini
+service {
+  dockerfile = Dockerfile
+  mounts = /var/lib/postgresql/data      # placed here rather than where webcentral would put it
+}
+```
 
 A Dockerfile can only reach what is inside the project directory. `COPY ../elsewhere` is refused,
 and a symlink pointing out of the project resolves *inside* it and so finds nothing - podman
@@ -1007,6 +1021,7 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
   - A conditional's body is always a `{ ... }` block, on one line or many, so what a `match` covers is legible without reading ahead
   - `proxy` speaks **https**, verifying the upstream's certificate against the system trust store, and a `proxy` URL or `forward` target written out in full is checked when the file is read
   - The dashboard shows what each service runs and which kind of statement answered how many requests
+  - A `VOLUME` an image declares is now given a directory that outlives the container. Podman hands a declared volume an anonymous one and `--rm` takes it away again, so a stock database image silently lost everything it had written the first time it restarted
   - Fix a project's containers failing to start under a root webcentral because of where it was started from or what its environment held: podman is now handed the owner's own `XDG_*` directories (it honours `XDG_CONFIG_HOME` over `HOME`) and their home as its working directory, rather than inheriting a path that owner may not be allowed to read
   - Overlapping subordinate id ranges are reported at startup instead of surfacing as `newuidmap: write to uid_map failed: Invalid argument` from a container that never starts
   - Fix containers being orphaned on shutdown, both because only SIGINT was handled - not the SIGTERM systemd sends - and because the stop was never waited for

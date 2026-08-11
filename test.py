@@ -4618,6 +4618,68 @@ CMD ["python3", "-u", "-m", "http.server", "8000"]
 
 
 @test
+def test_declared_volumes_are_persisted(t):
+    """A VOLUME the image declares survives a restart instead of going with the container"""
+    # Podman gives a declared volume an anonymous one and `--rm` takes it away again, so without
+    # webcentral placing it on the host this counter would read 1 every time.
+    t.write_file('count.py', """
+import http.server, os
+os.makedirs('/data', exist_ok=True)
+path = '/data/count'
+count = int(open(path).read()) + 1 if os.path.exists(path) else 1
+open(path, 'w').write(str(count))
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = f'started {count} times'.encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(('0.0.0.0', 8000), Handler).serve_forever()
+""")
+    t.write_file('Dockerfile', """
+FROM webcentral-test-base
+WORKDIR /srv
+COPY count.py /srv/count.py
+VOLUME /data
+CMD ["python3", "-u", "/srv/count.py"]
+""")
+
+    t.assert_http('/', check_body='started 1 times', timeout=300)
+    t.assert_log('declares VOLUME /data', count=1)
+    t.mark_log_read()
+
+    # Restart it by changing what the image is built from
+    t.write_file('count.py', open(os.path.join(t.tmpdir, t.current_test_domain, 'count.py')).read()
+                 + '# touched\n')
+    t.await_log('Stopping due to file changes')
+    t.assert_http('/', check_body='started 2 times', timeout=300)
+
+
+@test
+def test_declared_volume_yields_to_the_configuration(t):
+    """A volume the configuration already places is not placed twice"""
+    t.write_file('Dockerfile', """
+FROM webcentral-test-base
+WORKDIR /srv
+VOLUME /data
+CMD ["sh", "-c", "echo mine > /data/marker; python3 -u -m http.server 8000 --directory /data"]
+""")
+    t.write_file('webcentral.conf', """
+service {
+  dockerfile = Dockerfile
+  mounts = /data
+}
+""")
+
+    t.assert_http('/marker', check_body='mine', timeout=300)
+    # Said nothing about it, because the file did
+    t.assert_log('declares VOLUME', count=0)
+
+
+@test
 def test_dockerfile_cannot_escape_the_project(t):
     """A Dockerfile cannot reach outside the directory it is built from"""
     t.write_file('public/index.html', 'shell')
