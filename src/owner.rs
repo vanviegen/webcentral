@@ -202,17 +202,42 @@ pub fn ownership(path: &Path) -> (u32, u32) {
 fn subid_problems(name: &str) -> Vec<String> {
     let mut problems = Vec::new();
     for file in ["/etc/subuid", "/etc/subgid"] {
-        let has_range = std::fs::read_to_string(file)
-            .map(|content| {
-                content.lines().any(|line| line.split(':').next() == Some(name))
+        let content = std::fs::read_to_string(file).unwrap_or_default();
+        // (start, count) for each range this user holds, in file order.
+        let ranges: Vec<(u64, u64)> = content
+            .lines()
+            .filter(|line| line.split(':').next() == Some(name))
+            .filter_map(|line| {
+                let mut fields = line.split(':').skip(1);
+                Some((fields.next()?.trim().parse().ok()?, fields.next()?.trim().parse().ok()?))
             })
-            .unwrap_or(false);
-        if !has_range {
+            .collect();
+
+        if ranges.is_empty() {
             problems.push(format!(
                 "{} has no range in {}, which rootless podman needs to run containers. Fix with: \
                  usermod --add-subuids 100000-165535 --add-subgids 100000-165535 {}",
                 name, file, name
             ));
+            continue;
+        }
+
+        // Podman maps every range the user holds, and the kernel refuses a map whose host ranges
+        // overlap - so a second range added on top of the one `useradd` allocated by itself stops
+        // every container from starting, with nothing but `newuidmap: write to uid_map failed:
+        // Invalid argument` to say why.
+        let mut sorted = ranges.clone();
+        sorted.sort();
+        for pair in sorted.windows(2) {
+            let ((start, count), (next, _)) = (pair[0], pair[1]);
+            if start + count > next {
+                problems.push(format!(
+                    "{} has overlapping ranges in {} ({}+{} runs into {}), which the kernel \
+                     refuses to map. Remove all but one of {}'s lines from {}.",
+                    name, file, start, count, next, name, file
+                ));
+                break;
+            }
         }
     }
     problems

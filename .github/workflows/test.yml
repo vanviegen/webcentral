@@ -52,7 +52,11 @@ jobs:
           # XDG_RUNTIME_DIR and a cgroup manager. Failing here fails the job rather than letting
           # the test quietly fall back to the runner's own account.
           sudo useradd --create-home --shell /usr/sbin/nologin webcentral-owner
-          sudo usermod --add-subuids 200000-265535 --add-subgids 200000-265535 webcentral-owner
+          # useradd allocates a subordinate range by itself. Adding a second one would overlap it,
+          # and the kernel refuses to map overlapping ranges - so only step in if there is none.
+          grep -q '^webcentral-owner:' /etc/subuid \
+            || sudo usermod --add-subuids 200000-265535 --add-subgids 200000-265535 webcentral-owner
+          grep '^webcentral-owner:' /etc/subuid /etc/subgid
           uid=$(id -u webcentral-owner)
           test ! -e "/run/user/$uid"
 
