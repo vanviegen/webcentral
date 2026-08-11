@@ -340,6 +340,15 @@ impl Template {
         Template(vec![Part::Variable(name.to_string())])
     }
 
+    /// What a bare `log` writes: the request, which is what a request log is for.
+    pub fn request_line() -> Template {
+        Template(vec![
+            Part::Variable("method".to_string()),
+            Part::Literal(" ".to_string()),
+            Part::Variable("path".to_string()),
+        ])
+    }
+
     pub fn render(&self, vars: &Vars) -> String {
         let mut out = String::new();
         for part in &self.0 {
@@ -358,13 +367,41 @@ impl Template {
 #[derive(Debug, Clone, Default)]
 pub struct Vars(HashMap<String, String>);
 
+/// The prefix that makes a variable a request header rather than a name somebody set.
+pub const HEADER_PREFIX: &str = "header:";
+
 impl Vars {
     pub fn get(&self, name: &str) -> &str {
+        // Header names are case-insensitive, so `${header:X-Forwarded-For}` and
+        // `${header:x-forwarded-for}` are the same variable; they are stored folded.
+        if let Some(header) = name.strip_prefix(HEADER_PREFIX) {
+            let folded = format!("{}{}", HEADER_PREFIX, header.to_ascii_lowercase());
+            return self.0.get(&folded).map(String::as_str).unwrap_or("");
+        }
         self.0.get(name).map(String::as_str).unwrap_or("")
     }
 
     pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
         self.0.insert(name.into(), value.into());
+    }
+
+    /// Copy the request's headers in, once, as `header:<name>`. Done separately from
+    /// `set_request` because headers do not change when the path does, and a request carries
+    /// enough of them that repeating this on every rewrite would not be free.
+    ///
+    /// A header sent more than once is joined with `, `, which is what the HTTP specification says
+    /// a repeated field is equivalent to.
+    fn set_headers<B>(&mut self, req: &Request<B>) {
+        for name in req.headers().keys() {
+            let joined = req
+                .headers()
+                .get_all(name)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.set(format!("{}{}", HEADER_PREFIX, name.as_str()), joined);
+        }
     }
 
     /// Refresh the request's own variables. Called before the script runs and after every
@@ -447,6 +484,7 @@ struct Run<'a> {
 /// Run `script` against `req`, mutating its URI as `rewrite` statements ask.
 pub async fn run<B>(script: &[Stmt], env: Env<'_>, vars: Vars, req: &mut Request<B>) -> Result<Outcome> {
     let mut run = Run { env, vars, headers: Vec::new(), answered_by: "not found" };
+    run.vars.set_headers(req);
     run.vars.set_request(req);
     let terminal = match run.block(script, req).await? {
         Some(terminal) => terminal,

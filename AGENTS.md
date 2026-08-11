@@ -92,13 +92,18 @@ which is what lets `${1}` end one and `x{2}` be a quantifier. Every name a templ
 collected and checked at the end against everything the file defines, so a typo is reported
 rather than being silently empty.
 
-A `settings` block holds the four things that belong to the project rather than to a service or a
-request: `redirect_http`, `redirect_https`, and the two `reload_` defaults. There is no
-`log_requests` - a `log` statement at the top of the script says it, in the project's own words and
-behind a `match` if only some requests are worth recording. Settings stay in a block rather than
-becoming top-level `key = value` lines, because which shape a line has must follow from the
-enclosing block: allowing both at the top level would make a bare `=` significant outside a
-settings block, which is exactly what keeps `=` ordinary in patterns and secrets.
+A `settings` block holds what belongs to the project rather than to a service or a request:
+`redirect_http` and `redirect_https`. Reload rules live in the service they restart, not here.
+There is no `log_requests` - a bare `log` writes `${method} ${path}`, behind a `match` when only
+some requests are worth recording. Settings stay in a block rather than becoming top-level
+`key = value` lines, because which shape a line has must follow from the enclosing block: allowing
+both at the top level would make a bare `=` significant outside a settings block, which is exactly
+what keeps `=` ordinary in patterns and secrets.
+
+`${header:Name}` reads a request header, folded to lower case, copied into `Vars` once per request
+by `Vars::set_headers` (not per rewrite - headers don't change when the path does). Any name is
+valid, so the never-set check skips them; `set` refuses one, since `set_header` writes the
+*response*. `env_file` takes `prefix=`, which namespaces a file's keys.
 
 `env_file <path>` reads `KEY=value` lines into those same constants, in file order like `set`, so
 a secret lives outside `webcentral.conf` and reaches only what names it - nothing is injected into

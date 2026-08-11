@@ -822,19 +822,16 @@ serve web
 
 
 @test
-def test_reload_rules_default_to_project_settings(t):
-    """settings.reload_include is the default for servers that declare none"""
+def test_reload_rules_belong_to_the_service(t):
+    """reload_include is named in the service it restarts, and covers a directory's contents"""
     t.write_file('api.py', _echo_server('api'))
     # Created up front: a directory that appears and is written to in the same instant can be
     # missed, since the watch for it is added only once it exists.
     t.write_file('watched/deep/file.txt', 'first')
     t.write_file('webcentral.conf', '''
-settings {
-  reload_include = *.py watched
-}
-
 service api {
   command = python3 -u api.py
+  reload_include = *.py watched
 }
 serve api
 ''')
@@ -851,6 +848,12 @@ serve api
     # ...and a listed directory covers what is inside it, however deep
     t.write_file('watched/deep/file.txt', 'second')
     t.await_log('Stopping due to file changes: watched/deep/file.txt')
+
+    # Saying it in `settings` says where it belongs instead of quietly doing nothing
+    t.write_file('webcentral.conf', 'settings {\n  reload_include = src\n}\nrespond 200 ok\n')
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='ok')
+    t.assert_log("'reload_include' belongs in the service it restarts", count=1)
 
 
 @test
@@ -1966,6 +1969,71 @@ def test_static_tail_survives_an_empty_directory(t):
 
 
 @test
+def test_request_headers_are_variables(t):
+    """${header:Name} reads what the request arrived with, whatever case it is written in"""
+    t.write_file('webcentral.conf', """
+match /agent { respond 200 "ua=${header:User-Agent} again=${header:user-agent}" }
+match /joined { respond 200 "accept=${header:Accept}" }
+match /absent { respond 200 "[${header:X-Not-Sent}]" }
+respond 200 root
+""")
+
+    t.assert_http('/agent', check_body='ua=probe/1 again=probe/1',
+                  headers={'User-Agent': 'probe/1'})
+    t.assert_http('/joined', check_body='accept=text/plain', headers={'Accept': 'text/plain'})
+    # A header nobody sent is empty rather than an error - it is whatever arrived
+    t.assert_http('/absent', check_body='[]')
+
+    # ...and it is the request's, so it cannot be assigned; set_header writes the response
+    t.write_file('webcentral.conf', 'set header:X-Foo bar\nrespond 200 ok\n')
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='ok')
+    t.assert_log('is a header the request arrived with and cannot be set', count=1)
+
+
+@test
+def test_bare_log_writes_the_request(t):
+    """`log` with nothing to say logs the request, which is what a request log is"""
+    t.write_file('webcentral.conf', """
+log
+match /quiet { respond 200 quiet }
+log "reached the tail for ${path}"
+respond 200 loud
+""")
+
+    t.assert_http('/quiet', check_body='quiet')
+    t.assert_http('/other', check_body='loud')
+    t.assert_log('GET /quiet', count=1)
+    t.assert_log('GET /other', count=1)
+    # The statement below the match only runs for what got past it
+    t.assert_log('reached the tail for /other', count=1)
+    t.assert_log('reached the tail for /quiet', count=0)
+
+
+@test
+def test_env_file_prefix(t):
+    """env_file can keep a file's names together under a prefix of their own"""
+    t.write_file('.env', 'TOKEN=s3cret\n')
+    t.write_file('webcentral.conf', """
+env_file .env prefix=env:
+match /prefixed { respond 200 "token=${env:TOKEN}" }
+respond 200 root
+""")
+
+    t.assert_http('/prefixed', check_body='token=s3cret')
+
+    # Without the prefix the bare name is what it was read as, and the prefixed one is not defined
+    t.mark_log_read()
+    t.write_file('webcentral.conf', """
+env_file .env prefix=env:
+respond 200 "${TOKEN}"
+""")
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_code=200)
+    t.assert_log("'${TOKEN}' is never set", count=1)
+
+
+@test
 def test_dashboard_shows_the_shape_of_a_project(t):
     """The dashboard is a section per project: its services, their sidecars, and its configuration"""
     # The test runner owns its projects and runs webcentral, so the admin view is allowed
@@ -2457,9 +2525,12 @@ def test_readme_examples_are_valid(t):
         # Examples reference commands and images that don't exist here; only parsing is checked.
         d = os.path.join(t.tmpdir, f'readme-example-{i}')
         os.makedirs(d, exist_ok=True)
-        # Examples that read secrets need the file to exist; the values do not matter here.
+        # Examples that read secrets need the files to exist; the values do not matter here.
         with open(os.path.join(d, '.env'), 'w') as f:
-            f.write('DB_PASSWORD=x\nDASHBOARD_SECRET=y\n')
+            f.write('DB_PASSWORD=x\nDASHBOARD_SECRET=y\nGREETING=hello\n')
+        os.makedirs(os.path.join(d, 'secrets'), exist_ok=True)
+        with open(os.path.join(d, 'secrets/stripe.env'), 'w') as f:
+            f.write('PUBLISHABLE_KEY=pk_test\n')
         with open(os.path.join(d, 'webcentral.conf'), 'w') as f:
             f.write(example)
         result = subprocess.run(['./webcentral', 'check', d], capture_output=True, text=True,

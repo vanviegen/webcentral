@@ -382,12 +382,19 @@ match .*\.(js|css|woff2) {
 
 #### log
 
-`log <message>` writes a line to the project's log - handy for working out why a request went
-where it did.
+`log [message]` writes a line to the project's log. With nothing to say it writes the request -
+`GET /path` - so a bare `log` at the top of a script is a request log:
+
+```ini
+log
+```
+
+With a message it writes that instead, which is more useful further down, where only some requests
+reach it:
 
 ```ini
 match /webhook/(.*) {
-  log "webhook ${1} from ${host}"
+  log "webhook ${1} from ${header:User-Agent}"
   forward 4000
 }
 ```
@@ -477,7 +484,7 @@ service {                         # no name, so it is called "default"
 | `user` | Who the container runs as *inside* - see **Container user** below. |
 | `shutdown_time` | Idle time before stopping again. `0` keeps it running. Default `300` (seconds; `90s`, `5m` and `2h` also work). |
 | `startup_time` | How long to wait for the port to answer before giving up. Default `60`. |
-| `reload_include` | Which files restart it. Defaults to the project's `settings`, then to the built-in list below. |
+| `reload_include` | Which files restart it. Defaults to the built-in list below, or to everything for a `dockerfile` service. |
 | `reload_exclude` | Which of those to ignore anyway. |
 | `env { }` | Environment variables for the command. |
 | `service <name> { }` | A *sidecar*: another service sharing this one's lifetime - see **Sidecars** below. Without a `base` of its own it runs in this service's image, which is how an extra worker process is declared. |
@@ -643,9 +650,9 @@ the server above them.
 
 ### Reload rules
 
-`reload_include` and `reload_exclude` decide which changes restart a service. In `settings` they
-are the default for every service in the project; a service can name its own instead, which is how
-a change to a PHP file can restart the PHP service and leave the asset builder running:
+`reload_include` and `reload_exclude` decide which changes restart a service, and are named inside
+the service they restart - which is how a change to a PHP file can restart the PHP service and
+leave the asset builder running:
 
 ```ini
 service api {
@@ -816,6 +823,14 @@ These are always there, describing the request as it stands *now*:
 | `${method}` | `GET`, `POST`, ... |
 | `${host}` | the `Host` header - what the client asked for |
 | `${domain}` | the domain this project is registered under - what it really is |
+| `${header:Name}` | a header the request arrived with, `Name` matched case-insensitively |
+
+`${header:...}` reads whatever the request carried, and is empty when it carried no such header -
+there is nothing to check a header name against, so nothing is reported for one that never turns
+up. Webcentral sets `X-Forwarded-For` to the client's address before the script runs, which makes
+`log "${header:X-Forwarded-For} ${method} ${path}"` an access log. Headers are read-only:
+`set_header` writes one on the *response*, and `set header:...` is refused rather than silently
+doing something else.
 
 **The first two are the request, not a copy of it**: reading `${path}` gives the path being
 served, and assigning it re-points what gets served or forwarded - see **set path** above. The
@@ -907,6 +922,16 @@ line, because `podman run` stays alive for as long as the container does and any
 can read another process's command line with `ps`. Nothing is written to disk for it, and the
 startup log line records the variable's name without its value.
 
+`prefix=` keeps a file's names together, which says where a value came from and lets two files be
+read without their keys colliding:
+
+```ini
+env_file .env prefix=env:
+env_file secrets/stripe.env prefix=stripe:
+
+respond 200 "${env:GREETING} ${stripe:PUBLISHABLE_KEY}"
+```
+
 Keep the file out of git (`.gitignore`) and readable only by the project owner.
 
 ### Internal redirects
@@ -936,21 +961,19 @@ request streaming.
 
 ### Project settings
 
-The four things that belong to the project rather than to a service or a request:
+The two things that belong to the project rather than to a service or a request:
 
 ```ini
 settings {
   redirect_http = false       # don't redirect http:// to https:// for this project
   redirect_https = true       # ...redirect the other way around instead
-  reload_include = src public "file with spaces"
-  reload_exclude = src/build **/*.bak
 }
 ```
 
 `redirect_http` overrides the server-wide `--redirect-http` for this project alone - useful for a
 domain that has to stay reachable over plain HTTP. `redirect_https = true` goes the other way,
-sending HTTPS visitors to the plain-HTTP site; there is no server-wide version of that. The two
-`reload_` lists are the defaults for services that name none of their own - see **Reload rules**.
+sending HTTPS visitors to the plain-HTTP site; there is no server-wide version of that. Reload
+rules are not here: what restarts a service belongs to that service - see **Reload rules**.
 
 There is no `log_requests`: a `log` statement at the top of the script does it, and says what you
 want said rather than what webcentral guessed.
@@ -1043,6 +1066,7 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
   - A project with a **`Dockerfile`** is built and run from it, in any language and with no configuration at all. Its build context cannot reach outside the project directory, which is what makes it safe on a shared machine
   - **Authentication belongs to the application.** Accounts, password hashes and the auth cookie are gone. What remains is `check_auth <secret>` for guarding something small, and `X-Accel-Redirect`, which lets an application authorise a request and hand the delivery back to webcentral
   - A project is **read when it appears**, not when it is first visited, so a configuration error reaches its log while whoever wrote it is still looking - and the dashboard, now a section per project showing each service, its sidecars and the routing script itself, can show a project nobody has requested yet
+  - `${header:Name}` reads a request header, case-insensitively, so a script can route on a `User-Agent` or log an `X-Forwarded-For`. A bare `log` writes the request, which is what `log_requests` used to do less well
   - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. `webcentral check` parses a project without starting anything
   - Request bodies and static files are **streamed**, and static files support `Range`, so uploads and video seeking work at any size
   - `env_file` keeps secrets out of the configuration, and they reach a container through podman's own environment rather than its command line, which `ps` exposes to every user on the machine

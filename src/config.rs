@@ -127,7 +127,8 @@ pub struct ServerConfig {
     pub shutdown_time: u64,
     /// Seconds to wait for the port to answer before declaring the startup failed.
     pub startup_time: u64,
-    /// Which files restart this server. Defaults to the project's `settings`, then to everything.
+    /// Which files restart this server. Defaults to `DEFAULT_INCLUDES`, or to everything for a
+    /// service built from a Dockerfile.
     pub reload_include: Vec<String>,
     pub reload_exclude: Vec<String>,
     /// Services started and stopped with this one - a database, a cache, a queue runner. Each gets
@@ -201,9 +202,6 @@ pub struct ProjectConfig {
     /// Files that reload the entire project when touched (the config, and whatever was
     /// auto-detected in its absence).
     pub config_files: Vec<String>,
-    /// The default reload rules for servers that declare none of their own.
-    pub reload_include: Vec<String>,
-    pub reload_exclude: Vec<String>,
     /// Problems that stop something from working, which `webcentral check` fails on.
     pub errors: Vec<String>,
     /// Things worth saying that the project still runs with, which it does not.
@@ -297,15 +295,11 @@ impl ProjectConfig {
 
         add_implicit_tail(&mut config);
 
-        // Reload rules fall back to the project's settings and then to everything, and are only
-        // resolved now because a `settings` block may come after the servers it applies to.
-        let (default_include, default_exclude) =
-            (config.reload_include.clone(), config.reload_exclude.clone());
+        // What restarts a service belongs to that service: it is the thing being restarted, and a
+        // project with two of them rarely wants the same rules for both.
         for server in &mut config.servers {
             if server.reload_include.is_empty() {
-                server.reload_include = if !default_include.is_empty() {
-                    default_include.clone()
-                } else if server.dockerfile.is_some() {
+                server.reload_include = if server.dockerfile.is_some() {
                     // The build context is the whole directory, so anything in it can change what
                     // the image *is* - unlike a mounted service, where only program text matters
                     // because everything else is read from disk as it stands.
@@ -325,7 +319,6 @@ impl ProjectConfig {
                 .collect();
             server.reload_include.extend(copied);
 
-            server.reload_exclude.extend(default_exclude.iter().cloned());
             server.reload_exclude.extend(DEFAULT_EXCLUDES.iter().map(|s| s.to_string()));
             // A change to one of these replaces the project rather than restarting a server.
             server.reload_exclude.extend(PROJECT_FILES.iter().map(|f| format!("/{}", f)));
@@ -486,7 +479,7 @@ const CHECK_AUTH: Signature = Signature {
 };
 const SET_HEADER: Signature =
     sig(&[req("name", Kind::Word), req("value", Kind::Template)], &[]);
-const LOG: Signature = sig(&[req("message", Kind::Template)], &[]);
+const LOG: Signature = sig(&[opt("message", Kind::Template)], &[]);
 const DASHBOARD: Signature = sig(&[], &[]);
 
 /// The signature of every routing statement.
@@ -584,8 +577,6 @@ pub fn parse(source: &str, dir: Option<&Path>) -> ProjectConfig {
             script: Vec::new(),
             vars: Vars::default(),
             config_files: vec![CONFIG_FILE.to_string()],
-            reload_include: Vec::new(),
-            reload_exclude: Vec::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
             source_name: CONFIG_FILE.to_string(),
@@ -647,6 +638,10 @@ impl<'a> Builder<'a> {
         // is intent. The check is file-wide rather than per branch: knowing a name is defined
         // *somewhere* is enough to keep it from being a mistake, and avoids false alarms.
         for (name, pos) in std::mem::take(&mut self.referenced) {
+            // Whatever a request happens to carry, so there is nothing to check it against.
+            if name.starts_with(crate::script::HEADER_PREFIX) {
+                continue;
+            }
             if !self.defined.contains(&name) {
                 self.scanner.error_at(
                     pos,
@@ -867,15 +862,26 @@ impl<'a> Builder<'a> {
                     self.scanner.skip_line();
                     return;
                 }
-                match self.scanner.read_word() {
-                    Some(word) => {
-                        let path = self.expand(&word);
-                        self.load_env_file(&path, word.pos);
+                let Some(word) = self.scanner.read_word() else {
+                    self.scanner
+                        .error_at(verb.pos, "'env_file' needs a file to read".to_string());
+                    return;
+                };
+                let path = self.expand(&word);
+                // `prefix=env:` makes the file's keys `${env:KEY}`, which keeps a secret's origin
+                // visible and lets two files be read without their names colliding. Written out in
+                // full rather than implied, since the prefix is part of how the name reads.
+                let mut prefix = String::new();
+                if let Some(next) = self.scanner.read_word() {
+                    match next.text.split_once('=') {
+                        Some(("prefix", value)) => prefix = value.to_string(),
+                        _ => self.scanner.error_at(
+                            next.pos,
+                            format!("Unknown argument '{}' - env_file takes only 'prefix='", next.text),
+                        ),
                     }
-                    None => self
-                        .scanner
-                        .error_at(verb.pos, "'env_file' needs a file to read".to_string()),
                 }
+                self.load_env_file(&path, &prefix, word.pos);
             }
             "else" => {
                 let Some(branch) = self.body(&verb) else { return };
@@ -915,7 +921,7 @@ impl<'a> Builder<'a> {
     /// Read `KEY=value` lines into the file's constants, so a secret can live somewhere that is
     /// not the configuration - and reach exactly the `env` blocks and statements that name it,
     /// rather than every process. Values are taken as written: a secret is not a template.
-    fn load_env_file(&mut self, path: &str, pos: usize) {
+    fn load_env_file(&mut self, path: &str, prefix: &str, pos: usize) {
         // The same containment rule as `copy`. Under a root webcentral an absolute path would let
         // any project read any file on the machine.
         if path.starts_with('/') || Path::new(path).components().any(|c| c.as_os_str() == "..") {
@@ -957,8 +963,9 @@ impl<'a> Builder<'a> {
                 .and_then(|v| v.strip_suffix('"'))
                 .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
                 .unwrap_or(value);
-            self.vars.set(key, value);
-            self.defined.insert(key.to_string());
+            let name = format!("{}{}", prefix, key);
+            self.vars.set(name.clone(), value);
+            self.defined.insert(name);
         }
     }
 
@@ -1022,6 +1029,17 @@ impl<'a> Builder<'a> {
                 // `path`, `query` and `uri` are the request itself, so assigning one changes what
                 // is served or forwarded. The rest of the request's variables describe what
                 // arrived and cannot be rewritten into something else.
+                if name.text.starts_with(crate::script::HEADER_PREFIX) {
+                    self.scanner.error_at(
+                        name.pos,
+                        format!(
+                            "'{}' is a header the request arrived with and cannot be set; \
+                             'set_header' sets one on the response",
+                            name.text
+                        ),
+                    );
+                    return None;
+                }
                 if READ_ONLY_VARS.contains(&name.text.as_str()) {
                     self.scanner.error_at(
                         name.pos,
@@ -1094,7 +1112,11 @@ impl<'a> Builder<'a> {
                 }
                 Some(Stmt::Proxy(url))
             }
-            "log" => Some(Stmt::Log(args.template("message")?)),
+            // Bare `log` writes the request, which is what a request log is; anything else is
+            // said by giving it something to say.
+            "log" => Some(Stmt::Log(
+                args.template("message").unwrap_or_else(Template::request_line),
+            )),
             "project_dashboard" => Some(Stmt::Dashboard { admin: false }),
             "admin_dashboard" => Some(Stmt::Dashboard { admin: true }),
 
@@ -1351,16 +1373,19 @@ impl<'a> Builder<'a> {
 
     fn settings_block(&mut self) {
         self.each_setting(|me, key| match key.text.as_str() {
+            // Named here in 3.0's release candidates, and worth saying where they went.
+            "reload_include" | "reload_exclude" => {
+                me.scanner.error_at(
+                    key.pos,
+                    format!(
+                        "'{}' belongs in the service it restarts, not in 'settings'",
+                        key.text
+                    ),
+                );
+                me.scanner.skip_line();
+            }
             "redirect_http" => me.config.redirect_http = me.bool_value(),
             "redirect_https" => me.config.redirect_https = me.bool_value(),
-            "reload_include" => {
-                let list = me.word_list();
-                me.config.reload_include.extend(list);
-            }
-            "reload_exclude" => {
-                let list = me.word_list();
-                me.config.reload_exclude.extend(list);
-            }
             other => {
                 me.scanner.error_at(key.pos, format!("Unknown setting '{}'", other));
                 me.scanner.skip_line();
