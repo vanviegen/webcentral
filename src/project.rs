@@ -101,7 +101,7 @@ impl Project {
         // Said where both audiences look: the owner reads their project's log, whoever runs
         // webcentral reads its output. A project with an unusable owner is still registered - its
         // services will fail to start, and by then this has already explained why.
-        for problem in &owner.problems {
+        for problem in owner.problems.iter().chain(owner.unreachable(dir).iter()) {
             logger.write("supervisor", problem);
             eprintln!("{}: {}", domain, problem);
         }

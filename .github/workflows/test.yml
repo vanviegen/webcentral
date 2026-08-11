@@ -59,6 +59,11 @@ jobs:
           grep '^webcentral-owner:' /etc/subuid /etc/subgid
           uid=$(id -u webcentral-owner)
           test ! -e "/run/user/$uid"
+          # The projects live under the runner's home, which is 0750, and podman becomes the owner
+          # before it so much as stats the build context. In production a project sits somewhere
+          # its owner can reach; here the workspace has to be made traversable by hand.
+          dir=$GITHUB_WORKSPACE
+          while [ "$dir" != / ]; do sudo chmod o+x "$dir"; dir=$(dirname "$dir"); done
 
       - name: Build
         run: cargo build

@@ -188,6 +188,38 @@ impl Owner {
 }
 
 impl Owner {
+    /// Whether every directory above `dir` can be entered by this owner, since podman becomes them
+    /// before it so much as stats the project. Checked per project rather than cached with the
+    /// owner, because it is a fact about the path. Podman's own report of this is
+    /// `context must be a directory`, which names neither the directory at fault nor the reason.
+    pub fn unreachable(&self, dir: &Path) -> Option<String> {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let Some(identity) = &self.identity else { return None };
+
+        let mut prefix = PathBuf::from("/");
+        for component in dir.components().skip(1) {
+            prefix.push(component);
+            let Ok(meta) = std::fs::metadata(&prefix) else { continue };
+            let mode = meta.permissions().mode();
+            let may_enter = mode & 0o001 != 0
+                || (mode & 0o100 != 0 && meta.uid() == self.uid)
+                || (mode & 0o010 != 0
+                    && identity.groups.iter().any(|g| g.as_raw() == meta.gid()));
+            if !may_enter {
+                return Some(format!(
+                    "{} cannot enter {} (mode {:o}), so podman running as them cannot reach this \
+                     project. Fix with: chmod o+x {}",
+                    self.name,
+                    prefix.display(),
+                    mode & 0o7777,
+                    prefix.display()
+                ));
+            }
+        }
+        None
+    }
+
     /// Whether podman will be rootless for this owner. It is whenever webcentral is not root, and
     /// whenever it is root but becomes somebody else first - which leaves one case where it is
     /// not: a project owned by root on a root webcentral, where podman is root's own and rootless
