@@ -145,8 +145,28 @@ impl Owner {
             cmd.env("USER", &self.name);
             cmd.env("LOGNAME", &self.name);
             // Podman finds its own configuration through these, and the child no longer has
-            // root's.
+            // root's. Setting HOME is not enough: an inherited `XDG_CONFIG_HOME` wins over it and
+            // would send podman to the *invoking* user's `containers/storage.conf`, which the
+            // owner it has just become cannot read - so every one of them is re-pointed at the
+            // owner's own home rather than left to whatever started webcentral.
             cmd.env("XDG_RUNTIME_DIR", &identity.runroot);
+            cmd.env("XDG_CONFIG_HOME", identity.home.join(".config"));
+            cmd.env("XDG_DATA_HOME", identity.home.join(".local/share"));
+            cmd.env("XDG_CACHE_HOME", identity.home.join(".cache"));
+            // Named files rather than directories, so there is no owner-relative form to put
+            // them at: dropped, which leaves podman with its own defaults under that home.
+            for name in [
+                "CONTAINERS_CONF",
+                "CONTAINERS_CONF_OVERRIDE",
+                "CONTAINERS_STORAGE_CONF",
+                "CONTAINERS_REGISTRIES_CONF",
+                "CONTAINERS_HELPER_BINARY_DIR",
+                "REGISTRY_AUTH_FILE",
+                "DOCKER_CONFIG",
+                "TMPDIR",
+            ] {
+                cmd.env_remove(name);
+            }
             cmd.arg("--root").arg(&identity.store);
             cmd.arg("--runroot").arg(&identity.runroot);
             // Someone who has never logged in has no systemd user session, and so no session bus

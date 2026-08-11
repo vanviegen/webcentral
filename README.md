@@ -1007,6 +1007,7 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
   - A conditional's body is always a `{ ... }` block, on one line or many, so what a `match` covers is legible without reading ahead
   - `proxy` speaks **https**, verifying the upstream's certificate against the system trust store, and a `proxy` URL or `forward` target written out in full is checked when the file is read
   - The dashboard shows what each service runs and which kind of statement answered how many requests
+  - Fix a project's containers failing to start under a root webcentral that was itself started with `XDG_CONFIG_HOME` set: podman honours it over `HOME`, and so looked for its configuration in a directory belonging to somebody else
   - Fix containers being orphaned on shutdown, both because only SIGINT was handled - not the SIGTERM systemd sends - and because the stop was never waited for
   - Fix services being unreachable on IPv6 hosts: ports are published on `127.0.0.1` and addressed that way
 
