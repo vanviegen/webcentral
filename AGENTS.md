@@ -2,7 +2,6 @@
 
 A reverse proxy that runs multiple web applications for multiple users on a single server. Just put your app in a directory named like the target domain (eg `myapp.example.com/`), point DNS at the server, and you're done! The app will start (and shutdown) on-demand, and reload when its files change.
 
-
 ## Architecture
 
 ### Files
@@ -22,9 +21,10 @@ interpreter. Also static-file resolution (streamed, with `Range`/`If-Range` supp
 `check_auth` secret comparison
 
 `src/config.rs` - The configuration model and the parser for `webcentral.conf`; auto-detection
-from `package.json` synthesises the same language rather than a separate code path. Only
-`package.json`, because `scripts.start` is the one convention that says how to *start* something -
-other manifests say what to install, which is a different question
+synthesises the same language rather than a separate code path. Only a `Dockerfile` (which answers
+every question there is) and `package.json`, because `scripts.start` is the one other convention
+that says how to *start* something - other manifests say what to install, which is a different
+question
 
 `src/parser.rs` - Scanner for the configuration language: words, quoting, blocks, diagnostics
 
@@ -32,13 +32,12 @@ other manifests say what to install, which is a different question
 which webcentral uses to decide which server a changed file belongs to.)
 
 `src/owner.rs` - Who a project belongs to: resolves the owner, checks the host can run rootless
-podman as them, and hands out a `Command` that will
+podman as them (subordinate ids present and not overlapping, `newuidmap` installed, every
+directory above the project traversable), and hands out a `Command` that will - which means
+re-pointing *everything* a child inherits that could name the wrong user: the XDG directories, the
+container config overrides, and the working directory
 
 `src/dashboard.rs` - The built-in status page: a row per domain and per service (image or
-`Dockerfile`, command, state, port, request counts), plus a tally of which *kind* of statement
-answered each project's requests. The tally is counted per kind rather than per statement, so no
-statement has to carry an identity; `script::Outcome::answered_by` names it as the terminal is
-produced: a row per domain and per service (image or
 `Dockerfile`, command, state, port, request counts), plus a tally of which *kind* of statement
 answered each project's requests. The tally is counted per kind rather than per statement, so no
 statement has to carry an identity; `script::Outcome::answered_by` names it as the terminal is
@@ -46,11 +45,15 @@ produced
 
 `src/logger.rs` - Daily-rotated logs with configurable retention
 
-`src/streams.rs` - Stream abstraction (AnyConnector/AnyStream) for HTTP/TCP/Unix socket connections
+`src/streams.rs` - Stream abstraction (AnyConnector/AnyStream) for HTTP/HTTPS/TCP/Unix socket
+connections; `upstream_tls` builds the client config once from the system trust store
 
 `src/acme.rs` - ACME/Let's Encrypt certificate acquisition using HTTP-01 challenges
 
 `test.py` - Test suite and harness
+
+`MIGRATION-v3.md` - Converting a 2.x project; linked from the README's announcement and its
+**Upgrading from 2.x** section, so a change to the language belongs here too
 
 ### Configuration language
 
@@ -112,10 +115,6 @@ Three statements are conditionals (`match`, `check_auth`, `check_file`) and carr
 `fallthrough=true` instead of declining into an `else`, so what a statement does is legible from
 the statement rather than from a branch below it. Everything else is terminal or a modifier. An
 implicit tail (`serve` / `serve_dir public` / 404) is appended to every script.
-
-`forward` and `proxy` targets are checked when the file is read, but only when they are written
-out in full - one built from `${...}` is whatever the request makes it. `proxy https://...`
-connects over TLS (`AnyConnector::Https`), verifying the upstream against the system trust store.
 
 `forward` and `proxy` targets are checked when the file is read, but only when they are written
 out in full - one built from `${...}` is whatever the request makes it. `proxy https://...`
@@ -297,15 +296,7 @@ away with `--rm` - silently, and only on the first restart. A `mounts` entry cov
 wins, and so does `app_dir`, since the project directory already persists. What the image ships
 at that path is copied into the directory while it is empty: podman copies into a volume it
 creates itself, but a bind mount just covers what was there, and an image that seeds its volume
-would look as though it had lost it. What the image ships
-at that path is copied into the directory while it is empty: podman copies into a volume it
-creates itself, but a bind mount just covers what was there, and an image that seeds its volume
 would look as though it had lost it.
-
-**Declared volumes:** an image's `VOLUME` paths are inspected when the image is prepared and
-given a directory under `_webcentral_data/mounts`, because podman's anonymous volume for one goes
-away with `--rm` - silently, and only on the first restart. A `mounts` entry covering the path
-wins, and so does `app_dir`, since the project directory already persists.
 
 **Sidecars:** Nested server declarations, spawned before their parent and killed with it. One
 without a `base` of its own inherits the parent's prepared image *and* its `env` (its own entries
@@ -329,10 +320,6 @@ request. A pattern naming a directory covers its contents; the `include-exclude-
 built from a `dockerfile` defaults to `**/*` instead: its build context is the project directory,
 so any file in it can change the image, and a whitelist of source extensions would miss the
 `COPY` that brought in something else. The default excludes still apply, and a project that
-rebuilds too eagerly narrows it with `reload_include`. A service
-built from a `dockerfile` defaults to `**/*` instead: its build context is the project directory,
-so any file in it can change the image, and a whitelist of source extensions would miss the
-`COPY` that brought in something else. The default excludes still apply, and a project that
 rebuilds too eagerly narrows it with `reload_include`.
 
 **Default excludes:** `_webcentral_data/**`, `node_modules/**`, `**/*.log`, `**/*.bak`, `**/.*`,
@@ -344,7 +331,6 @@ The project is deregistered *before* being torn down, closing the window in whic
 still reach the outgoing instance; the next request builds a new one.
 
 **Server-level:** Non-recursive watch on project parent directories for domain additions/removals
-
 
 ### Test Infrastructure
 
@@ -379,8 +365,6 @@ still reach the outgoing instance; the next request builds a new one.
 - Add code comments only for explaining non-obvious logic, why things are done a certain way, and how thread-safety is ensured. Don't add comments describing what you're changing and why, as comments should reflect the final code, not the change history.
 - When you notice unexpected behavior or a bug at any time, create an issue on your todo-list for later investigation. Never let bugs go uninvestigated nor work around them.
 - **Podman honours `XDG_CONFIG_HOME` over `HOME`.** Anything that re-points a podman client at another user has to re-point *every* path variable, not just `HOME` - see `Owner::podman`. A stray `XDG_CONFIG_HOME` from a systemd `Environment=` line or a `sudo -E` otherwise sends it to a `containers/storage.conf` the owner cannot read, and the only symptom is `permission denied` on a path belonging to somebody else.
-- **Podman honours `XDG_CONFIG_HOME` over `HOME`.** Anything that re-points a podman client at another user has to re-point *every* path variable, not just `HOME` - see `Owner::podman`. A stray `XDG_CONFIG_HOME` from a systemd `Environment=` line or a `sudo -E` otherwise sends it to a `containers/storage.conf` the owner cannot read, and the only symptom is `permission denied` on a path belonging to somebody else.
-- **Reproducing a podman problem that only happens under webcentral:** run podman the way `Owner::podman` does rather than the way your shell does - `env -i PATH=... HOME=<owner home> podman --root <store> --runroot <runroot> ...`. A login shell carries `XDG_RUNTIME_DIR`, a systemd user session and a dbus socket that a service user does not have, and every difference we have chased (the sd-bus `Interactive authentication required` failure, store `database configuration mismatch`) came from one of those. Podman's own warnings can mislead: it reported "Falling back to --cgroup-manager=cgroupfs" while still failing for want of exactly that flag.
 - **Reproducing a podman problem that only happens under webcentral:** run podman the way `Owner::podman` does rather than the way your shell does - `env -i PATH=... HOME=<owner home> podman --root <store> --runroot <runroot> ...`. A login shell carries `XDG_RUNTIME_DIR`, a systemd user session and a dbus socket that a service user does not have, and every difference we have chased (the sd-bus `Interactive authentication required` failure, store `database configuration mismatch`) came from one of those. Podman's own warnings can mislead: it reported "Falling back to --cgroup-manager=cgroupfs" while still failing for want of exactly that flag.
 - When trying to debug problems, do not fiddle around with ad-hoc shell commands too much. The user needs to approve all of these. Instead, extend `test.py` to clearly demonstrate the problem, and if needed add (temporary, with a `TODO: remove` comment) logging to the code (but prefer to just improve error logging).
 - **Releases:** Increment version in `Cargo.toml` (x.y.z: x for rewrites, y for major features, z for minor/bugfixes) and add changelog entry in README.md. Create release by pushing git tag: `git tag v2.4.3 && git push origin v2.4.3`. GitHub Actions (`.github/workflows/release.yml` via cargo-dist) builds static binaries (musl x86_64, aarch64 gnu, x86_64 gnu) and creates GitHub Release with artifacts and installer script. Regular commits to main don't trigger releases.

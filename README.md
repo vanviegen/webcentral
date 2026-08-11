@@ -2,6 +2,33 @@
 
 A reverse proxy that runs multiple web applications for multiple users on a single server. Just put your app in a directory named like the target domain (eg `myapp.example.com/`), point DNS at the server, and you're done! The app will start (and shutdown) on-demand, and reload when its files change.
 
+> ### 🎉 3.0 is here - and it breaks just about everything
+>
+> **What a project does is now written in one small language.** `webcentral.conf` holds a script,
+> run top to bottom for every request: `match` a path, `serve` an application, `serve_dir` some
+> files, `proxy` somewhere else, `respond` on the spot. What used to be a handful of fixed project
+> types is now a few lines you can read, so a redirect, a static site and a Node app are the same
+> kind of thing rather than three special cases.
+>
+> **Every project can run several services**, each in its own container with its own image, port
+> and lifecycle, started only when a request is actually routed to it - and a nested one is a
+> *sidecar* sharing its parent's life, which is how you get a database or a queue runner.
+>
+> **A project with a `Dockerfile` needs no configuration at all.** It is built with the project
+> directory as its context - podman confines that, so one user's Dockerfile cannot reach another's
+> files - and its `CMD` is run, in whatever language the project happens to be written.
+>
+> **Containers always run rootless, as the person who owns the project.** Not as root, ever, even
+> when webcentral itself is. What a container writes is already theirs, with no uid mapping to get
+> wrong, and a `build` step - which is arbitrary code from somebody else's project - has at worst
+> that person's privileges.
+>
+> **The catch: `webcentral.ini` is not read any more**, Procfile support is gone, firejail and the
+> unsandboxed path are gone, and so are webcentral's own user accounts and passwords. Nearly every
+> 2.x project needs converting, which is usually five minutes of work and always tells you what it
+> objects to. See **[MIGRATION-v3.md](MIGRATION-v3.md)**, and run `webcentral check` when you're
+> done.
+
 
 ## Features
 
@@ -53,6 +80,14 @@ sudo webcentral --email you@example.com --systemd
 
 The `email` flag is mandatory, as it's needed for Let's Encrypt. Alternatively you can disable HTTPS (`webcentral --https 0`). See `webcentral --help` for more options.
 
+Containers run rootless as the user who owns each project, so that user needs a subordinate id
+range. Most distributions give every account one; webcentral checks when it first sees a project
+and prints the command to run if not:
+
+```sh
+grep "^$USER:" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
+```
+
 Create a directory at `~/webcentral-projects/someapp.yourdomain.com/` with either:
 - A `package.json` for Node.js apps (`npm start` should start a webserver on `$PORT`)
 - A `public/` folder for static files
@@ -95,23 +130,13 @@ If you want to run WebCentral as a regular user while still being able to bind t
 
 ## Upgrading from 2.x
 
-`webcentral.ini` is not read any more. Rename it to `webcentral.conf`, rewrite it in the language
-below, and run `webcentral check` - it names every line it doesn't understand. What catches people:
+**[MIGRATION-v3.md](MIGRATION-v3.md)** converts a 2.x project, with a table from every old setting
+to its replacement and a worked example. The two things behind all of it: every application now
+runs in a podman container, so it has to say which image provides its runtime, and `webcentral.ini`
+is replaced by the `webcentral.conf` language described below.
 
-- **Everything runs in a container**, so a project that used the host's `python`, `node` or `ruby`
-  has to say which image has it: `base = python:3-alpine`, or `packages = ...` on top of alpine.
-- **`Procfile` is no longer read.** It only ever supplied a command line, while the runtime and the
-  dependencies it assumes came from Heroku's buildpacks - so write the `web:` line as `command =`,
-  and its `worker:` lines as nested services.
-- **Dependencies are not installed for you.** Heroku's buildpacks do that; webcentral does not.
-  Use `copy` and `build` (see **Services**), a `Dockerfile`, or install them in the `command`.
-- **There are no accounts or passwords.** `[auth]` and its hashes are gone. `check_auth <secret>`
-  guards a dashboard with one shared secret; real logins belong to the application.
-- `[rewrite] /a = /b` becomes `match /a set path /b`, and a rewrite target that was a URL becomes
-  `redirect`. `type = dashboard` becomes `project_dashboard` or `admin_dashboard`.
-- A bare `port`/`host` with no command becomes `forward host:port`.
-- `mount_app_dir = false` becomes `app_dir = none`, `startup_deadline` becomes `startup_time`, and
-  `[environment]` becomes an `env { }` block - with secrets better kept in `env_file`.
+`webcentral check <dir>` parses a project and prints every problem it finds, with a line and
+column, without starting anything.
 
 ---
 
@@ -170,6 +195,10 @@ There are two kinds of statement:
 - **Routing statements** - everything else - form a small script, run top to bottom for every
   request.
 
+`${1}` and `${path}` in the examples below are variables: the groups a `match` captured, and the
+request as it stands. **Words and quoting**, **Arguments** and **Variables** further down give the
+full rules; almost nothing needs quoting, and `${...}` is the only substitution there is.
+
 ```ini
 service {  # defines the 'default' service
   packages = nodejs npm
@@ -183,147 +212,6 @@ match /api/(.*) {
 serve_dir public fallthrough=true
 serve  # handled by the 'default' service
 ```
-
-### Words and quoting
-
-A word runs until whitespace. Almost every character is ordinary - `$`, `{`, `#` mid-word, and a
-backslash - so regexes, URLs and version constraints need no quoting at all. Two kinds of quote
-exist for the cases that do:
-
-| | Use it for | `${...}` inside | Backslash inside |
-|---|---|---|---|
-| `"double"` | whitespace, a leading `#`, an `=` that isn't an argument separator | substituted | escapes `\n` `\t` `\r` `\"` `\\`; anything else is an error |
-| `'single'` | the same, when the text must survive exactly as written | left alone | an ordinary character |
-
-Quotes glue onto the rest of the word, like a shell, so a word can be part bare and part quoted.
-**Where the quotes fall decides what the word means**, because only an `=` written *outside* them
-separates a name from a value:
-
-```ini
-set token whatever-the-upstream-wants
-
-set_header Authorization "Bearer ${token}"      # a value with a space in it
-match /html { respond 200 body type=text/html }   # `type` is a named argument
-match /text { respond 200 "type=text/html" }      # the body is the text `type=text/html`
-```
-
-To put a quote inside a word, either switch quote style or escape it:
-
-```ini
-match /a { respond 200 'say "hi"' }        # double quotes inside single ones
-match /b { respond 200 "she said \"hi\"" }  # or escaped inside double ones
-match /c { respond 200 "it's fine" }       # an apostrophe inside double quotes
-match /d { respond 200 'it'"'"'s' }        # ...and glued segments in a single-quoted word
-```
-
-Single quotes have no escapes at all, which is what makes them right for regexes and hashes -
-and why **a regex should never be double-quoted**: `"\.css$"` fails, because `\.` is not an
-escape webcentral knows. Leave it bare, or use single quotes:
-
-```ini
-match \.css$ anchored=false { set_header Cache-Control immutable }
-match '\.(png|jpg)$' anchored=false { set_header Cache-Control immutable }
-```
-
-### Arguments
-
-Positional arguments come first and are required. Anything shaped like `name=value` is a named
-argument, and every positional one can also be given that way, so these are the same statement:
-
-```ini
-respond 404 "Not found" type=text/html
-respond status=404 type=text/html body="Not found"
-```
-
-A name the statement doesn't have is an error rather than a guess - which is why a value that
-contains an `=` has to be quoted:
-
-```ini
-set_header Cache-Control "max-age=31536000"
-```
-
-Without the quotes that reads as an argument called `max-age`, and webcentral says so.
-
-### Variables
-
-`${name}` is a variable, and **it is the only thing webcentral substitutes**. `${1}` to `${9}` are
-the groups the last `match` captured; `${anything}` is a name.
-
-A `$` not followed by `{` is an ordinary character. That is the whole rule, and it is what lets a
-regex end in `$`, a price be `$5`, and a `command` keep `$PORT`, `$HOME` and `$$` for the shell it
-is handed to - with nothing to escape anywhere. To write a literal `${`, single-quote it:
-`respond 200 'costs ${5}'`.
-
-These are always there, describing the request as it stands *now*:
-
-| | |
-|---|---|
-| `${path}` | the request path, percent-encoded as it arrived |
-| `${query}` | everything after the `?`, without it |
-| `${method}` | `GET`, `POST`, ... |
-| `${host}` | the `Host` header - what the client asked for |
-
-**The first two are the request, not a copy of it.** Reading `${path}` gives the path being
-served; assigning it changes what gets served or forwarded, which is how a request is re-pointed:
-
-```ini
-match /old/(.*) {
-  set path /new/${1}                  # the query is left alone
-  serve_dir public
-}
-match /legacy { set path /v2/index.html?legacy=1 } # a path may carry its own query
-match /bare { set path /clean? }                   # ...and a lone `?` drops it
-```
-
-`set query` changes the query on its own. The other request variables describe what arrived and
-cannot be assigned; `set` says so rather than pretending.
-| `${domain}` | the domain this project is registered under - what it really is |
-
-`set` names anything else. At the top of the file it doubles as a constant: the rest of the file
-is read with it already defined, so it can stand in a pattern or a server name too.
-
-```ini
-set backend http://10.0.0.5:8080
-set assets /var/www/shared
-set image node:22-alpine
-
-service {
-  base = ${image}                 # constants reach declarations too
-  command = npm start --port $PORT
-}
-
-match /api/(.*) { proxy ${backend} }
-match /static/(.*) { serve_file ${assets}/${1} }
-serve
-```
-
-Inside the script it is an ordinary assignment - useful to keep a capture that a nested `match`
-would otherwise overwrite:
-
-```ini
-match /(?<lang>[a-z]{2})/docs/(.*) {
-  set page ${2}
-  match .*\.pdf { serve_file downloads/${lang}/${page} }
-  serve_file docs/${lang}/${page}.html
-}
-```
-
-There is one flat set of variables per request, seeded with the file's constants; last write wins,
-and a `match` only overwrites the groups it actually captured.
-
-**Where substitution happens: everywhere.** Statement arguments, settings inside declaration
-blocks, `command` lines - all of them. What differs is *when*, and so what is available:
-
-- Values webcentral reads as it loads the file - every declaration setting, a `match` pattern, a
-  server name, a header name - see the constants that `set` defined **above** them.
-- Values used while answering a request also see `${path}` and friends, and whatever the script has
-  captured or set.
-
-The one exception is a password hash in an `auth` block, which is taken exactly as written: it is
-nothing but `$`, and it is a hash rather than text.
-
-A `${name}` that nothing in the file ever sets is reported when the configuration is read - it would
-otherwise silently be empty, which is a typo far more often than it is intent.
 
 ### Routing statements
 
@@ -365,11 +253,16 @@ match /files/(.*) {
 else { respond 400 "not a file request" }
 ```
 
-#### set path `set path <path>` changes the request path. Everything after it - including `${path}` - sees the new
-one, and the query string is kept unless the new path brings its own.
+#### set path
+
+`set path <path>` changes the request path: what gets served, forwarded or proxied from here on.
+Everything after it - including `${path}` - sees the new one, and the query string is kept unless
+the new path brings its own. `set query` changes the query on its own.
 
 ```ini
-match /v1/(.*) { set path /api/${1} }
+match /v1/(.*) { set path /api/${1} }               # the query is left alone
+match /legacy { set path /v2/index.html?legacy=1 }  # a path may carry its own query
+match /bare { set path /clean? }                    # ...and a lone `?` drops it
 ```
 
 #### serve
@@ -693,8 +586,8 @@ machine shared with others. Its `RUN` steps execute as the project's owner, like
 
 ### Sidecars
 
-A service can nest others inside it. These start and stop with it, and each is told where the
-others are through `<NAME>_HOST` and `<NAME>_PORT`:
+A service can nest others inside it. These start and stop with it, and reach each other by name
+on a private network:
 
 ```ini
 service app {
@@ -782,99 +675,6 @@ restart when a template changes - says so with `reload_include`, which replaces 
 `webcentral.conf` itself is always watched, and changing it reloads the whole project rather than
 restarting a service, since the script and the set of services may both be different afterwards.
 
-### Authentication
-
-Webcentral keeps no accounts and no passwords; `check_auth` (see above) compares one shared
-secret, which is what a status page or a staging site needs. Anything beyond that - logins,
-sessions, users - belongs to the application, which can still leave file delivery to webcentral
-through an internal redirect:
-
-### Internal redirects
-
-A response from `serve`, `forward` or `proxy` that carries an `X-Accel-Redirect: /path` header
-(the nginx convention, so frameworks emit it already) is not sent to the client. Instead the
-request is re-routed through the script as a `GET` for that path, with two extra variables set:
-`${redirected_from}` (the original path) and `${redirected_by}` (the server or target that answered).
-The redirecting response's other headers carry over onto the final response, so the application
-still controls things like `Content-Type` and `Content-Disposition` while webcentral streams the
-file:
-
-```ini
-service { command = ./app }
-
-match /files/(.*) {
-  # Only reachable via the app, which checks who is asking before redirecting here
-  match default subject=${redirected_by} matcher=literal { serve_dir storage fallthrough=true }
-  respond 403
-}
-serve
-```
-
-One redirect may follow a request, not a chain; the redirected request has no body (the
-application already consumed the original), which is also what keeps redirects compatible with
-request streaming.
-
-### Secrets
-
-A password does not belong in `webcentral.conf`, which lives in the project directory and usually
-in git. `env_file` reads `KEY=value` lines from somewhere else and makes them constants, so they
-reach exactly what names them and nothing else:
-
-```ini
-env_file .env
-
-service {
-  command = ./app
-  env {
-    DATABASE_URL = postgres://app:${DB_PASSWORD}@db.internal:5432/app
-  }
-  service db {
-    base = postgres:16
-    port = 5432
-    user = 999:999
-    app_dir = none
-    mounts = /var/lib/postgresql/data
-    env {
-      POSTGRES_PASSWORD = ${DB_PASSWORD}
-      POSTGRES_USER = app
-      POSTGRES_DB = app
-    }
-  }
-}
-check_auth ${DASHBOARD_SECRET} { project_dashboard }
-serve
-```
-
-Nothing is injected anywhere by itself: a value reaches a service only where you write
-`${NAME}`, so a sidecar never sees a secret it has no use for. Blank lines and `#` comments are
-skipped, a leading `export ` is ignored, and one layer of surrounding quotes comes off the value.
-The file must live inside the project directory, is read in the order it appears (like `set`), and
-changing it reloads the project. Values from it are never re-substituted - a secret is not a
-template.
-
-A container's environment is handed to podman through *its* environment rather than its command
-line, because `podman run` stays alive for as long as the container does and anyone on the machine
-can read another process's command line with `ps`. Nothing is written to disk for it, and the
-startup log line records the variable's name without its value.
-
-Keep the file out of git (`.gitignore`) and readable only by the project owner.
-
-### Project settings
-
-```ini
-settings {
-  log_requests = true         # one log line per request
-  redirect_http = false       # don't redirect http:// to https:// for this project
-  redirect_https = true       # ...redirect the other way around instead
-  reload_include = src public "file with spaces"
-  reload_exclude = src/build **/*.bak
-}
-```
-
-`redirect_http` overrides the server-wide `--redirect-http` for this project alone - useful for a
-domain that has to stay reachable over plain HTTP. `redirect_https = true` goes the other way,
-sending HTTPS visitors to the plain-HTTP site; there is no server-wide version of that.
-
 ### Container user
 
 `user` decides who the container runs as inside it:
@@ -931,6 +731,219 @@ Rootless podman needs a subordinate id range per user (`/etc/subuid` and `/etc/s
 checks for one when it first sees a project and says exactly what to run if it is missing.
 
 ---
+### Words and quoting
+
+A word runs until whitespace. Almost every character is ordinary - `$`, `{`, `#` mid-word, and a
+backslash - so regexes, URLs and version constraints need no quoting at all. Two kinds of quote
+exist for the cases that do:
+
+| | Use it for | `${...}` inside | Backslash inside |
+|---|---|---|---|
+| `"double"` | whitespace, a leading `#`, an `=` that isn't an argument separator | substituted | escapes `\n` `\t` `\r` `\"` `\\`; anything else is an error |
+| `'single'` | the same, when the text must survive exactly as written | left alone | an ordinary character |
+
+Quotes glue onto the rest of the word, like a shell, so a word can be part bare and part quoted.
+**Where the quotes fall decides what the word means**, because only an `=` written *outside* them
+separates a name from a value:
+
+```ini
+set token whatever-the-upstream-wants
+
+set_header Authorization "Bearer ${token}"      # a value with a space in it
+match /html { respond 200 body type=text/html }   # `type` is a named argument
+match /text { respond 200 "type=text/html" }      # the body is the text `type=text/html`
+```
+
+To put a quote inside a word, either switch quote style or escape it:
+
+```ini
+match /a { respond 200 'say "hi"' }        # double quotes inside single ones
+match /b { respond 200 "she said \"hi\"" }  # or escaped inside double ones
+match /c { respond 200 "it's fine" }       # an apostrophe inside double quotes
+match /d { respond 200 'it'"'"'s' }        # ...and glued segments in a single-quoted word
+```
+
+Single quotes have no escapes at all, which is what makes them right for regexes and hashes -
+and why **a regex should never be double-quoted**: `"\.css$"` fails, because `\.` is not an
+escape webcentral knows. Leave it bare, or use single quotes:
+
+```ini
+match \.css$ anchored=false { set_header Cache-Control immutable }
+match '\.(png|jpg)$' anchored=false { set_header Cache-Control immutable }
+```
+
+### Arguments
+
+Positional arguments come first and are required. Anything shaped like `name=value` is a named
+argument, and every positional one can also be given that way, so these are the same statement:
+
+```ini
+respond 404 "Not found" type=text/html
+respond status=404 type=text/html body="Not found"
+```
+
+A name the statement doesn't have is an error rather than a guess - which is why a value that
+contains an `=` has to be quoted:
+
+```ini
+set_header Cache-Control "max-age=31536000"
+```
+
+Without the quotes that reads as an argument called `max-age`, and webcentral says so.
+
+### Variables
+
+`${name}` is a variable, and **it is the only thing webcentral substitutes**. `${1}` to `${9}` are
+the groups the last `match` captured; `${anything}` is a name.
+
+A `$` not followed by `{` is an ordinary character. That is the whole rule, and it is what lets a
+regex end in `$`, a price be `$5`, and a `command` keep `$PORT`, `$HOME` and `$$` for the shell it
+is handed to - with nothing to escape anywhere. To write a literal `${`, single-quote it:
+`respond 200 'costs ${5}'`.
+
+These are always there, describing the request as it stands *now*:
+
+| | |
+|---|---|
+| `${path}` | the request path, percent-encoded as it arrived |
+| `${query}` | everything after the `?`, without it |
+| `${method}` | `GET`, `POST`, ... |
+| `${host}` | the `Host` header - what the client asked for |
+| `${domain}` | the domain this project is registered under - what it really is |
+
+**The first two are the request, not a copy of it**: reading `${path}` gives the path being
+served, and assigning it re-points what gets served or forwarded - see **set path** above. The
+rest describe what arrived and cannot be assigned; `set` says so rather than pretending.
+
+`set` names anything else. At the top of the file it doubles as a constant: the rest of the file
+is read with it already defined, so it can stand in a pattern or a server name too.
+
+```ini
+set backend http://10.0.0.5:8080
+set assets /var/www/shared
+set image node:22-alpine
+
+service {
+  base = ${image}                 # constants reach declarations too
+  command = npm start --port $PORT
+}
+
+match /api/(.*) { proxy ${backend} }
+match /static/(.*) { serve_file ${assets}/${1} }
+serve
+```
+
+Inside the script it is an ordinary assignment - useful to keep a capture that a nested `match`
+would otherwise overwrite:
+
+```ini
+match /(?<lang>[a-z]{2})/docs/(.*) {
+  set page ${2}
+  match .*\.pdf { serve_file downloads/${lang}/${page} }
+  serve_file docs/${lang}/${page}.html
+}
+```
+
+There is one flat set of variables per request, seeded with the file's constants; last write wins,
+and a `match` only overwrites the groups it actually captured.
+
+**Where substitution happens: everywhere.** Statement arguments, settings inside declaration
+blocks, `command` lines - all of them. What differs is *when*, and so what is available:
+
+- Values webcentral reads as it loads the file - every declaration setting, a `match` pattern, a
+  server name, a header name - see the constants that `set` defined **above** them.
+- Values used while answering a request also see `${path}` and friends, and whatever the script has
+  captured or set.
+
+A `${name}` that nothing in the file ever sets is reported when the configuration is read - it would
+otherwise silently be empty, which is a typo far more often than it is intent.
+
+### Secrets
+
+A password does not belong in `webcentral.conf`, which lives in the project directory and usually
+in git. `env_file` reads `KEY=value` lines from somewhere else and makes them constants, so they
+reach exactly what names them and nothing else:
+
+```ini
+env_file .env
+
+service {
+  command = ./app
+  env {
+    DATABASE_URL = postgres://app:${DB_PASSWORD}@db.internal:5432/app
+  }
+  service db {
+    base = postgres:16
+    port = 5432
+    user = 999:999
+    app_dir = none
+    mounts = /var/lib/postgresql/data
+    env {
+      POSTGRES_PASSWORD = ${DB_PASSWORD}
+      POSTGRES_USER = app
+      POSTGRES_DB = app
+    }
+  }
+}
+check_auth ${DASHBOARD_SECRET} { project_dashboard }
+serve
+```
+
+Nothing is injected anywhere by itself: a value reaches a service only where you write
+`${NAME}`, so a sidecar never sees a secret it has no use for. Blank lines and `#` comments are
+skipped, a leading `export ` is ignored, and one layer of surrounding quotes comes off the value.
+The file must live inside the project directory, is read in the order it appears (like `set`), and
+changing it reloads the project. Values from it are never re-substituted - a secret is not a
+template.
+
+A container's environment is handed to podman through *its* environment rather than its command
+line, because `podman run` stays alive for as long as the container does and anyone on the machine
+can read another process's command line with `ps`. Nothing is written to disk for it, and the
+startup log line records the variable's name without its value.
+
+Keep the file out of git (`.gitignore`) and readable only by the project owner.
+
+### Internal redirects
+
+A response from `serve`, `forward` or `proxy` that carries an `X-Accel-Redirect: /path` header
+(the nginx convention, so frameworks emit it already) is not sent to the client. Instead the
+request is re-routed through the script as a `GET` for that path, with two extra variables set:
+`${redirected_from}` (the original path) and `${redirected_by}` (the server or target that answered).
+The redirecting response's other headers carry over onto the final response, so the application
+still controls things like `Content-Type` and `Content-Disposition` while webcentral streams the
+file:
+
+```ini
+service { command = ./app }
+
+match /files/(.*) {
+  # Only reachable via the app, which checks who is asking before redirecting here
+  match default subject=${redirected_by} matcher=literal { serve_dir storage fallthrough=true }
+  respond 403
+}
+serve
+```
+
+One redirect may follow a request, not a chain; the redirected request has no body (the
+application already consumed the original), which is also what keeps redirects compatible with
+request streaming.
+
+### Project settings
+
+```ini
+settings {
+  log_requests = true         # one log line per request
+  redirect_http = false       # don't redirect http:// to https:// for this project
+  redirect_https = true       # ...redirect the other way around instead
+  reload_include = src public "file with spaces"
+  reload_exclude = src/build **/*.bak
+}
+```
+
+`redirect_http` overrides the server-wide `--redirect-http` for this project alone - useful for a
+domain that has to stay reachable over plain HTTP. `redirect_https = true` goes the other way,
+sending HTTPS visitors to the plain-HTTP site; there is no server-wide version of that.
+
 
 ## Command-Line Options
 
@@ -1008,23 +1021,18 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
-2026-08-10 (3.0.0):
-  - `Procfile` is no longer detected: it supplied a command but never the runtime or the dependencies its commands assume, so the compatibility was partial in a way that failed at run time rather than at parse time. `package.json` with a `start` script still is
-  - **`webcentral.ini` is replaced by `webcentral.conf`**, a small configuration language. A project's requests are handled by a routing script run top to bottom - `match`, `serve`, `serve_dir`, `check_file`, `forward`, `proxy`, `respond` and friends - which subsumes what used to be fixed project types: a redirect project is now the one-line script `redirect https://example.com status=301`. The old format is not read; see **Configuration** above. Projects that need no configuration file (`public/`, `Procfile`, `package.json`) are unaffected
+2026-08-11 (3.0.0):
+  - **`webcentral.ini` is replaced by `webcentral.conf`**, a small configuration language. A project's requests are handled by a routing script run top to bottom - `match`, `serve`, `serve_dir`, `check_file`, `forward`, `proxy`, `respond` and friends - which subsumes what used to be fixed project types: a redirect project is now the one-line script `redirect https://example.com status=301`. Nearly every 2.x project needs converting; see [MIGRATION-v3.md](MIGRATION-v3.md)
+  - **Containers always run rootless, as the project's owner**, whether webcentral itself runs as root or not. A container - and more sharply a `build` step, which is arbitrary code from somebody else's project - has at worst that person's privileges, and "what a container writes is owned by the project owner" stops being a hand-built uid mapping and becomes what podman does by itself
+  - **Everything runs in a container.** Firejail support and the unsandboxed path are gone, leaving one keyword, `service`, and podman as the only external dependency. A project can declare several, each with its own image, port, lifecycle and reload rules, started only when a request is routed to it. A nested `service` is a *sidecar* sharing its parent's lifetime, image and environment - which is what replaced workers
+  - A project with a **`Dockerfile`** is built and run from it, in any language and with no configuration at all. Its build context cannot reach outside the project directory, which is what makes it safe on a shared machine
+  - **Authentication belongs to the application.** Accounts, password hashes and the auth cookie are gone. What remains is `check_auth <secret>` for guarding something small, and `X-Accel-Redirect`, which lets an application authorise a request and hand the delivery back to webcentral
   - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. `webcentral check` parses a project without starting anything
-  - **Containers always run as the project's owner**, through rootless podman, whether webcentral itself runs as root or not. A container - and more sharply a `build` command, which is arbitrary code from the project - therefore has at worst that person's privileges, and "what a container writes is owned by the project owner" stops being a hand-built uid mapping and becomes what podman does by itself. Each owner gets an image store of their own, so nothing is shared with, or prunable by, their own podman
-  - A project with a **`Dockerfile`** is built and run from it, in any language and with no configuration - the file already says which runtime, which dependencies and which command. Its build context cannot reach outside the project directory
-  - **Everything runs in a container.** Firejail support is gone and with it the choice: one keyword, `service`, and podman as the only external dependency. A project can declare several, each with its own image, port, lifecycle and reload rules, each started only when a request is routed to it. A nested `service` is a *sidecar* sharing its parent's lifetime, image and environment - which is what replaced workers
-  - **Authentication belongs to the application.** Basic auth, password hashes and the auth cookie are gone. What remains is `check_auth <secret>` for guarding a dashboard, and `X-Accel-Redirect`, which lets an application authorise a request and hand the delivery back to webcentral
-  - `env_file` keeps secrets out of the configuration, and they reach a container through podman's environment rather than its command line, which `ps` exposes to every user on the machine
   - Request bodies and static files are **streamed**, and static files support `Range`, so uploads and video seeking work at any size
+  - `env_file` keeps secrets out of the configuration, and they reach a container through podman's own environment rather than its command line, which `ps` exposes to every user on the machine
   - The whole projects tree is watched with **one** inotify instance rather than one per project (60 projects went from 61 to 2), and reload rules default to a whitelist of program text rather than to everything
-  - A conditional's body is always a `{ ... }` block, on one line or many, so what a `match` covers is legible without reading ahead
-  - `proxy` speaks **https**, verifying the upstream's certificate against the system trust store, and a `proxy` URL or `forward` target written out in full is checked when the file is read
-  - The dashboard shows what each service runs and which kind of statement answered how many requests
-  - A `VOLUME` an image declares is now given a directory that outlives the container. Podman hands a declared volume an anonymous one and `--rm` takes it away again, so a stock database image silently lost everything it had written the first time it restarted
-  - Fix a project's containers failing to start under a root webcentral because of where it was started from or what its environment held: podman is now handed the owner's own `XDG_*` directories (it honours `XDG_CONFIG_HOME` over `HOME`) and their home as its working directory, rather than inheriting a path that owner may not be allowed to read
-  - Overlapping subordinate id ranges are reported at startup instead of surfacing as `newuidmap: write to uid_map failed: Invalid argument` from a container that never starts
+  - `proxy` speaks **https**, verifying the upstream against the system trust store, and a `VOLUME` an image declares is given a directory that outlives the container instead of being discarded with it
+  - `Procfile` is no longer detected: it supplied a command but never the runtime or the dependencies its commands assume, so the compatibility failed at run time rather than when the file was read. `package.json` with a `start` script still is
   - Fix containers being orphaned on shutdown, both because only SIGINT was handled - not the SIGTERM systemd sends - and because the stop was never waited for
   - Fix services being unreachable on IPv6 hosts: ports are published on `127.0.0.1` and addressed that way
 
