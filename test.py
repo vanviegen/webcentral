@@ -1944,25 +1944,40 @@ def test_redirect_configuration(t):
 
 
 @test
-def test_dashboard_type(t):
-    """Test dashboard type shows project status"""
+def test_dashboard_shows_the_shape_of_a_project(t):
+    """The dashboard is a section per project: its services, their sidecars, and its configuration"""
     # The test runner owns its projects and runs webcentral, so the admin view is allowed
     t.write_file('webcentral.conf', 'admin_dashboard')
 
-    # Create an app project to show in the dashboard
-    t.write_file('webcentral.conf', 'service {\n  command = sleep 999\n}', domain='app.test')
+    # A project with a service and a sidecar hanging off it
+    t.write_file('webcentral.conf', """
+service {
+  command = sleep 999
+  service helper {
+    command = sleep 998
+  }
+}
+respond 200 hello
+""", domain='app.test')
     t.await_log('stdout', 'Domain app.test added')
+    # A project is only read when a request reaches it, and the dashboard shows what was read.
+    # The script answers without starting anything, so the services stay declared but stopped.
+    t.assert_http('/', host='app.test', check_body='hello')
 
-    # Access dashboard - check structure
-    t.assert_http('/', check_body='<title>Webcentral Dashboard</title>')
-    t.assert_http('/', check_body='<th>Domain / server</th>')
-    t.assert_http('/', check_body='<th>TLS</th>')
-    t.assert_http('/', check_body='<th>Requests</th>')
-    t.assert_http('/', check_body='<th>Idle</th>')
-    t.assert_http('/', check_body='Uptime')
-    t.assert_http('/', check_body='app.test')
-    # Each project's services get their own row under it, showing the image they run
-    t.assert_http('/', check_body=TEST_BASE_IMAGE)
+    body = t.assert_http('/', check_body='<title>Webcentral Dashboard</title>')
+    assert 'Uptime' in body, body
+    assert 'app.test' in body, body
+    # The service, what it runs, and the image it runs on
+    assert TEST_BASE_IMAGE in body, body
+    assert 'sleep 999' in body, body
+    # ...and its sidecar, nested, named as running in its parent's image
+    assert 'helper' in body, body
+    assert 'sleep 998' in body, body
+    assert "default&#x27;s image" in body or "default's image" in body, body
+    # Nothing is published to the host, so the address peers use is worth saying
+    assert 'helper.internal:8000' in body, body
+    # The configuration itself, so the script that routes the requests is legible
+    assert 'webcentral.conf' in body, body
 
     # project_dashboard shows only the project's own slice: no other domains, and none of the
     # server-wide numbers
@@ -1972,6 +1987,8 @@ def test_dashboard_type(t):
     body = t.assert_http('/', host=pd_domain, check_body='project-dash.test')
     assert 'app.test' not in body, "project_dashboard leaked another project's domain"
     assert 'Uptime' not in body, "project_dashboard leaked server-wide info"
+    # A project with no services says so rather than showing an empty list
+    assert 'No services' in body, body
 
 
 @test

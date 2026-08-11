@@ -170,20 +170,31 @@ pub fn get_domain_status() -> Vec<DomainStatus> {
             Some(project) => DomainStatus {
                 domain,
                 directory,
-                summary: project.get_type_name(),
                 servers: project.get_server_status(),
                 total_requests: project.get_total_requests(),
                 answers: project.get_answers(),
                 cert_status,
+                source: project.config.source.clone(),
+                source_name: project.config.source_name.clone(),
+                problems: project
+                    .config
+                    .errors
+                    .iter()
+                    .chain(project.config.warnings.iter())
+                    .cloned()
+                    .collect(),
             },
+            // Deregistered, and not yet rebuilt: the next request to it makes a new one.
             None => DomainStatus {
                 domain,
                 directory,
-                summary: "Not loaded".to_string(),
                 servers: Vec::new(),
                 total_requests: 0,
                 answers: Vec::new(),
                 cert_status,
+                source: String::new(),
+                source_name: String::new(),
+                problems: vec!["Not loaded; the next request will read it again.".to_string()],
             },
         }
     }).collect();

@@ -405,8 +405,11 @@ match /webhook/(.*) {
 
 #### project_dashboard and admin_dashboard
 
-`project_dashboard` serves the built-in status page for this project alone: its services, their
-state, ports and request counts.
+`project_dashboard` serves the built-in status page for this project alone: a section per project
+naming each service, the image and command it runs, whether it is up and on which port, its
+request and idle counts, the sidecars hanging off it with the `<name>.internal:<port>` address
+their peers use, a tally of which kind of statement answered the requests, and the configuration
+as it was read.
 
 `admin_dashboard` serves the same page for *every* domain on the server, with server-wide numbers
 on top. Since that shows everyone's projects, it only answers (with anything but a 403) from a

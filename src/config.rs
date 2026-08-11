@@ -35,6 +35,15 @@ pub const DEFAULT_BASE_IMAGE: &str = "alpine";
 /// Consulted only when the configuration doesn't say how to serve anything.
 const AUTO_DETECT_FILES: &[&str] = &["Dockerfile", "package.json"];
 
+/// Which of those spoke for a project, for the dashboard to name.
+fn detected_from(dir: &Path) -> &'static str {
+    if dir.join("Dockerfile").is_file() {
+        "Dockerfile"
+    } else {
+        "package.json"
+    }
+}
+
 /// The files that *define* a project, as opposed to the ones its servers run from. A change to any
 /// of them replaces the project wholesale, since the script and the set of servers may both be
 /// different. They are watched centrally for every project at once (see the config watcher in `server.rs`),
@@ -200,6 +209,11 @@ pub struct ProjectConfig {
     pub errors: Vec<String>,
     /// Things worth saying that the project still runs with, which it does not.
     pub warnings: Vec<String>,
+    /// The configuration as it was parsed, and where it came from - the file itself, or what was
+    /// detected in its absence. Kept so the dashboard can show a project as it is written rather
+    /// than as a summary of itself.
+    pub source: String,
+    pub source_name: String,
 }
 
 impl ProjectConfig {
@@ -226,6 +240,8 @@ impl ProjectConfig {
         let source = if config_path.exists() { fs::read_to_string(&config_path)? } else { String::new() };
 
         let mut config = parse(&source, Some(dir));
+        config.source = source.clone();
+        config.source_name = CONFIG_FILE.to_string();
 
         // A configuration that declares no server and never says how to answer a request leaves
         // room for the directory to speak for itself, whether or not a webcentral.conf exists.
@@ -234,6 +250,13 @@ impl ProjectConfig {
             config.config_files.extend(AUTO_DETECT_FILES.iter().map(|f| f.to_string()));
             if let Some(snippet) = auto_detect(dir) {
                 let parsed = parse(&snippet, Some(dir));
+                config.source_name = format!("{} (detected)", detected_from(dir));
+                config.source = if config.source.trim().is_empty() {
+                    snippet.clone()
+                } else {
+                    format!("{}\n# detected, because nothing above says how to answer a request:\n{}",
+                            config.source.trim_end(), snippet)
+                };
                 config.servers = parsed.servers;
                 config.errors.extend(parsed.errors);
                 config.warnings.extend(parsed.warnings);
@@ -569,6 +592,8 @@ pub fn parse(source: &str, dir: Option<&Path>) -> ProjectConfig {
             reload_exclude: Vec::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
+            source: source.to_string(),
+            source_name: CONFIG_FILE.to_string(),
         },
         vars: Vars::default(),
         referenced: Vec::new(),

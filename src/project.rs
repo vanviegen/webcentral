@@ -49,6 +49,22 @@ fn proxy_connector(target: &str) -> AnyConnector {
     }
 }
 
+/// What a service runs, said the way the configuration says it: its own image, the Dockerfile it
+/// builds, or - for a sidecar that names none - its parent's.
+fn describe_image(
+    config: &crate::config::ServerConfig,
+    parent: Option<&crate::config::ServerConfig>,
+) -> String {
+    if config.dockerfile.is_some() {
+        return "Dockerfile".to_string();
+    }
+    match (&config.base, parent) {
+        (Some(base), _) => base.clone(),
+        (None, Some(parent)) => format!("{}'s image", parent.name),
+        (None, None) => crate::config::DEFAULT_BASE_IMAGE.to_string(),
+    }
+}
+
 #[derive(Debug)]
 pub struct Project {
     pub config: Arc<ProjectConfig>,
@@ -203,9 +219,6 @@ impl Project {
 
     // --- Status, for the dashboard ---
 
-    pub fn get_type_name(&self) -> String {
-        self.config.summary()
-    }
 
     pub fn get_total_requests(&self) -> u64 {
         self.total_requests.load(Ordering::Relaxed)
@@ -224,16 +237,19 @@ impl Project {
             .iter()
             .map(|server| ServerStatus {
                 name: server.name().to_string(),
-                kind: if server.config.dockerfile.is_some() {
-                    "Dockerfile".to_string()
-                } else {
-                    server
-                        .config
-                        .base
-                        .clone()
-                        .unwrap_or_else(|| crate::config::DEFAULT_BASE_IMAGE.to_string())
-                },
+                image: describe_image(&server.config, None),
                 command: server.config.command.clone(),
+                sidecars: server
+                    .config
+                    .sidecars
+                    .iter()
+                    .map(|sidecar| crate::dashboard::SidecarStatus {
+                        name: sidecar.name.clone(),
+                        image: describe_image(sidecar, Some(&server.config)),
+                        command: sidecar.command.clone(),
+                        port: sidecar.port,
+                    })
+                    .collect(),
                 state: match server.state() {
                     AppState::Stopped => "Stopped",
                     AppState::Starting => "Starting",

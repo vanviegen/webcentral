@@ -37,11 +37,13 @@ directory above the project traversable), and hands out a `Command` that will - 
 re-pointing *everything* a child inherits that could name the wrong user: the XDG directories, the
 container config overrides, and the working directory
 
-`src/dashboard.rs` - The built-in status page: a row per domain and per service (image or
-`Dockerfile`, command, state, port, request counts), plus a tally of which *kind* of statement
-answered each project's requests. The tally is counted per kind rather than per statement, so no
-statement has to carry an identity; `script::Outcome::answered_by` names it as the terminal is
-produced
+`src/dashboard.rs` - The built-in status page. A section per project rather than a row, since a
+project is a script, some services and their sidecars rather than one thing with a type: each
+service's image/command/state/port and counts, its sidecars nested under it with the
+`<name>.internal:<port>` their peers use, a tally of which *kind* of statement answered, and the
+configuration as parsed (`ProjectConfig::source`, which is the synthesised snippet when the
+project was auto-detected). The tally is per kind rather than per statement, so no statement has
+to carry an identity; `script::Outcome::answered_by` names it as the terminal is produced
 
 `src/logger.rs` - Daily-rotated logs with configurable retention
 
