@@ -79,16 +79,36 @@ jobs:
         run: |
           # As annotations, not just log lines: the API serves these without a token, so a failure
           # is legible to anything that can reach the repository rather than only in the web UI.
-          sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\r//g' test-output.log \
-            | grep -aE '✗|Error:|At:|Required tests were skipped|assert' \
-            | tail -25 \
-            | while IFS= read -r line; do echo "::error::$line"; done
-          # Only the logs that actually say something went wrong, and enough of them to see what:
-          # a build failure puts the package manager's own output here, which is the part worth
-          # reading and the first thing a 15-line tail loses.
+          # GitHub keeps only the first *ten* annotations per step, so each one carries many lines
+          # (%0A is a newline inside an annotation) instead of each line being its own - a
+          # line-per-annotation report loses everything after the tenth, which is exactly the part
+          # that says what went wrong.
+          emit() { # $1 = title, stdin = body
+            printf '::error title=%s::' "$1"
+            sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\r//g' -e 's/%/%25/g' \
+              | cut -c1-400 | awk '{printf "%s%%0A", $0}'
+            printf '\n'
+          }
+
+          grep -aE '✗|Error:|At:|Required tests were skipped|assert' test-output.log \
+            | tail -40 | emit "test failures"
+
+          # The projects of the tests that failed first, since a later failure is often the
+          # earlier one's wreckage. Their logs say what podman was asked to do and what it said.
+          failed=$(sed -e 's/\x1b\[[0-9;]*m//g' test-output.log \
+            | grep -aoE '✗ test_[a-z0-9_]+' | sed 's/✗ test_//' | tr '_' '-' | head -5)
+          for domain in $failed; do
+            log=$(echo .test-tmp/"$domain".test/_webcentral_data/log/*)
+            [ -f "$log" ] || continue
+            sudo tail -80 "$log" | emit "$domain"
+          done
+
+          # Anything else that complained, in case the failure was really somewhere upstream of
+          # the test that reported it. A build failure puts the package manager's own output here.
           for log in .test-tmp/*/_webcentral_data/log/*; do
             [ -f "$log" ] || continue
+            domain=$(basename "$(dirname "$(dirname "$(dirname "$log")")")")
+            echo "$failed" | grep -q "^${domain%.test}$" && continue
             sudo grep -qiE 'error|failed|not found' "$log" || continue
-            echo "::error::--- $(basename "$(dirname "$(dirname "$log")")")"
-            sudo tail -60 "$log" | cut -c1-400 | while IFS= read -r line; do echo "::error::$line"; done
-          done
+            sudo tail -40 "$log" | emit "$domain"
+          done | head -c 60000
