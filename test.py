@@ -1944,6 +1944,28 @@ def test_redirect_configuration(t):
 
 
 @test
+def test_projects_are_read_without_a_request(t):
+    """A project is read when it appears, so its problems reach its log before anyone visits"""
+    t.write_file('webcentral.conf', 'nonsense_statement here\n')
+
+    # No request is made to this project at all. Reading is deliberately delayed a couple of
+    # seconds, so that a directory still being written by a deploy is not read half-finished.
+    t.await_log("Unknown statement 'nonsense_statement'", timeout=15)
+
+
+@test
+def test_static_tail_survives_an_empty_directory(t):
+    """A project read before its files land still serves them once they do"""
+    # The project directory exists (write_file made it) but has no public/ yet, which is what a
+    # deploy looks like in its first moments. The implicit tail must not be decided on that.
+    t.write_file('webcentral.conf', '# nothing but a comment\n')
+    t.assert_http('/', check_code=404)
+
+    t.write_file('public/index.html', '<h1>Landed</h1>')
+    t.assert_http('/', check_body='Landed')
+
+
+@test
 def test_dashboard_shows_the_shape_of_a_project(t):
     """The dashboard is a section per project: its services, their sidecars, and its configuration"""
     # The test runner owns its projects and runs webcentral, so the admin view is allowed

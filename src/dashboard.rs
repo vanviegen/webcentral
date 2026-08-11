@@ -39,14 +39,18 @@ pub struct SidecarStatus {
 pub struct DomainStatus {
     pub domain: String,
     pub directory: String,
+    /// Whether the configuration has been read. Everything below is empty when it hasn't, which
+    /// is not the same as a project that has nothing.
+    pub loaded: bool,
     pub servers: Vec<ServerStatus>,
     pub total_requests: u64,
     /// Statement kind to the number of requests it answered, busiest first.
     pub answers: Vec<(String, u64)>,
     pub cert_status: Option<String>,
-    /// The configuration as it was parsed - the file itself, or what was detected in its absence.
-    pub source: String,
-    /// Where that came from, for the heading above it.
+    /// The routing script as parsed, which is what actually answers requests - including the
+    /// implicit tail, which no file mentions.
+    pub script: Vec<crate::script::Outline>,
+    /// Where the configuration came from, for the heading above it.
     pub source_name: String,
     /// Anything the configuration was reported for, so a project that is misbehaving says why on
     /// the page its owner is already looking at.
@@ -133,7 +137,11 @@ fn render_project(domain: &DomainStatus) -> String {
         html.push_str("</div>\n");
     }
 
-    if domain.servers.is_empty() {
+    if !domain.loaded {
+        html.push_str(
+            "<div class=\"no-services\">Not read yet - the next request to it will.</div>\n",
+        );
+    } else if domain.servers.is_empty() {
         html.push_str(
             "<div class=\"no-services\">No services: this project is answered from its files and \
              its script alone.</div>\n",
@@ -143,12 +151,13 @@ fn render_project(domain: &DomainStatus) -> String {
         html.push_str(&render_service(server));
     }
 
-    if !domain.source.trim().is_empty() {
+    if !domain.script.is_empty() {
         html.push_str(&format!(
-            "<details class=\"config\"><summary>{}</summary><pre>{}</pre></details>\n",
-            escape(&domain.source_name),
-            escape(domain.source.trim_end())
+            "<details class=\"script\" open><summary>Routing <span class=\"from\">{}</span>             </summary>\n",
+            escape(&domain.source_name)
         ));
+        html.push_str(&render_statements(&domain.script));
+        html.push_str("</details>\n");
     }
 
     html.push_str("</section>\n");
@@ -202,6 +211,29 @@ fn render_service(server: &ServerStatus) -> String {
     }
 
     html.push_str("</div>\n");
+    html
+}
+
+/// The script as a nested list, so what a conditional covers is visible from the shape rather
+/// than from counting braces.
+fn render_statements(stmts: &[crate::script::Outline]) -> String {
+    let mut html = String::from("<ul class=\"stmts\">\n");
+    for stmt in stmts {
+        html.push_str(if stmt.implicit { "<li class=\"implicit\">" } else { "<li>" });
+        html.push_str(&format!("<span class=\"verb\">{}</span>", escape(stmt.verb)));
+        for arg in &stmt.args {
+            html.push_str(&format!("<span class=\"arg\">{}</span>", escape(arg)));
+        }
+        if !stmt.body.is_empty() {
+            html.push_str(&render_statements(&stmt.body));
+        }
+        if let Some(otherwise) = &stmt.otherwise {
+            html.push_str("<div class=\"otherwise\"><span class=\"verb\">else</span></div>");
+            html.push_str(&render_statements(otherwise));
+        }
+        html.push_str("</li>\n");
+    }
+    html.push_str("</ul>\n");
     html
 }
 
@@ -299,10 +331,22 @@ code { font-family: ui-monospace, monospace; background: #efefef; padding: 0.05e
 .sidecar .address { font-family: ui-monospace, monospace; color: #999; margin-left: 0.7em; }
 .no-services { margin-top: 0.8em; font-size: 0.85em; color: #888; }
 .problem { margin-top: 0.6em; font-size: 0.85em; color: #c22; }
-.config { margin-top: 1em; font-size: 0.85em; }
-.config summary { cursor: pointer; color: #777; }
-.config pre { background: #fafafa; padding: 0.8em 1em; border-radius: 5px; overflow-x: auto;
-              margin: 0.6em 0 0 0; font-size: 0.95em; }
+.script { margin-top: 1.2em; font-size: 0.85em; }
+.script summary { cursor: pointer; color: #999; text-transform: uppercase; font-size: 0.85em;
+                  letter-spacing: 0.05em; }
+.script summary .from { text-transform: none; letter-spacing: 0; margin-left: 0.6em;
+                        font-family: ui-monospace, monospace; }
+.stmts { list-style: none; margin: 0.5em 0 0 0; padding: 0; }
+.stmts .stmts { margin: 0.25em 0 0.25em 0.6em; padding-left: 0.9em;
+                border-left: 2px solid #e3e3e3; }
+.stmts li { padding: 0.12em 0; }
+.stmts .verb { font-family: ui-monospace, monospace; font-weight: 600; color: #345; }
+.stmts .arg { font-family: ui-monospace, monospace; color: #777; margin-left: 0.6em;
+              word-break: break-word; }
+.otherwise { margin-top: 0.25em; }
+.stmts .implicit { opacity: 0.65; }
+.stmts .implicit::after { content: " implicit"; font-size: 0.85em; color: #aaa;
+                          margin-left: 0.6em; }
 .status-running { color: #2a2; }
 .status-stopped { color: #888; }
 .status-starting { color: #f90; }
@@ -323,7 +367,9 @@ code { font-family: ui-monospace, monospace; background: #efefef; padding: 0.05e
   h1, .sidecar .name { color: #aaa; }
   .project, .info-card { background: #1f2228; box-shadow: none; }
   .service { background: #23262d; border-left-color: #3a3f48; }
-  .config pre, code { background: #23262d; }
+  code { background: #23262d; }
+  .stmts .verb { color: #8fb8d8; }
+  .stmts .stmts { border-left-color: #3a3f48; }
   .answers b, .info-card .value { color: #eee; }
   .sidecar { border-left-color: #3a3f48; }
 }

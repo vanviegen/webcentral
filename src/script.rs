@@ -83,6 +83,147 @@ pub enum Stmt {
     Dashboard { admin: bool },
 }
 
+impl Template {
+    /// The template as it reads in a configuration file: literal text with `${name}` where a
+    /// variable goes. Not guaranteed to be byte-identical to what was written - quoting is gone -
+    /// but it says the same thing, which is what a status page needs.
+    pub fn source(&self) -> String {
+        let mut out = String::new();
+        for part in &self.0 {
+            match part {
+                Part::Literal(text) => out.push_str(text),
+                Part::Variable(name) => out.push_str(&format!("${{{}}}", name)),
+            }
+        }
+        out
+    }
+}
+
+impl Pattern {
+    /// As written in the file. Anchoring is baked into the regex when it is compiled, so the
+    /// wrapper that put it there is taken back off - `^(?:/x)$` is not what anybody typed.
+    pub fn source(&self) -> String {
+        match self {
+            Pattern::Literal { text, .. } => text.clone(),
+            Pattern::Regex(regex) => {
+                let source = regex.as_str();
+                source
+                    .strip_prefix("^(?:")
+                    .and_then(|rest| rest.strip_suffix(")$"))
+                    .unwrap_or(source)
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// One statement, flattened for display: what it is called, what it was given, and whatever it
+/// contains. Kept out of `Stmt` itself so the interpreter carries nothing for the dashboard's
+/// sake.
+pub struct Outline {
+    pub verb: &'static str,
+    pub args: Vec<String>,
+    pub body: Vec<Outline>,
+    /// The `else` branch, which reads as a statement of its own.
+    pub otherwise: Option<Vec<Outline>>,
+    /// Whether webcentral appended this rather than the file saying it. Worth marking: it is what
+    /// answers when nothing above does, and it is the one line a reader cannot find in the file.
+    pub implicit: bool,
+}
+
+/// Flatten a script for display, keeping the nesting. Statements from `implicit_from` on were
+/// appended by webcentral rather than written.
+pub fn outline(stmts: &[Stmt], implicit_from: usize) -> Vec<Outline> {
+    stmts
+        .iter()
+        .enumerate()
+        .map(|(index, stmt)| {
+            let mut outline = Outline::of(stmt);
+            outline.implicit = index >= implicit_from;
+            outline
+        })
+        .collect()
+}
+
+impl Outline {
+    fn of(stmt: &Stmt) -> Outline {
+        let (verb, args, body, otherwise) = match stmt {
+            Stmt::Match { subject, pattern, body, otherwise } => {
+                let mut args = vec![pattern.source()];
+                // Only worth showing when it isn't the default.
+                if subject.source() != "${path}" {
+                    args.push(format!("subject={}", subject.source()));
+                }
+                if let Pattern::Literal { anchored, .. } = pattern {
+                    args.push("matcher=literal".to_string());
+                    if !anchored {
+                        args.push("anchored=false".to_string());
+                    }
+                }
+                ("match", args, Some(body), otherwise)
+            }
+            Stmt::Set { name, value } => {
+                ("set", vec![name.clone(), value.source()], None, &None)
+            }
+            Stmt::ServeFile { path, fallthrough } => {
+                ("serve_file", with_fallthrough(vec![path.source()], *fallthrough), None, &None)
+            }
+            Stmt::ServeDir { dir, index, fallthrough } => {
+                let mut args = vec![dir.source()];
+                if index != "index.html" {
+                    args.push(format!("index={}", index));
+                }
+                ("serve_dir", with_fallthrough(args, *fallthrough), None, &None)
+            }
+            Stmt::ServeApp(name) => ("serve", vec![name.clone()], None, &None),
+            Stmt::Forward(target) => ("forward", vec![target.source()], None, &None),
+            Stmt::Proxy(target) => ("proxy", vec![target.source()], None, &None),
+            Stmt::Redirect { target, status } => {
+                ("redirect", vec![target.source(), format!("status={}", status)], None, &None)
+            }
+            Stmt::Respond { status, body, content_type } => {
+                let mut args = vec![status.to_string()];
+                if let Some(body) = body {
+                    args.push(body.source());
+                }
+                if !content_type.is_empty() {
+                    args.push(format!("type={}", content_type));
+                }
+                ("respond", args, None, &None)
+            }
+            // The secret is deliberately not shown: the page can be reached by anyone the
+            // project's script lets in, and it is the one thing on it worth stealing.
+            Stmt::CheckAuth { body, otherwise, .. } => {
+                ("check_auth", vec!["…".to_string()], Some(body), otherwise)
+            }
+            Stmt::CheckFile { path, body, otherwise } => {
+                ("check_file", vec![path.source()], Some(body), otherwise)
+            }
+            Stmt::SetHeader(name, value) => {
+                ("set_header", vec![name.clone(), value.source()], None, &None)
+            }
+            Stmt::Log(message) => ("log", vec![message.source()], None, &None),
+            Stmt::Dashboard { admin } => {
+                (if *admin { "admin_dashboard" } else { "project_dashboard" }, Vec::new(), None, &None)
+            }
+        };
+        Outline {
+            verb,
+            args,
+            body: body.map(|stmts| outline(stmts, usize::MAX)).unwrap_or_default(),
+            otherwise: otherwise.as_ref().map(|stmts| outline(stmts, usize::MAX)),
+            implicit: false,
+        }
+    }
+}
+
+fn with_fallthrough(mut args: Vec<String>, fallthrough: bool) -> Vec<String> {
+    if fallthrough {
+        args.push("fallthrough=true".to_string());
+    }
+    args
+}
+
 impl Stmt {
     pub fn is_fallible(&self) -> bool {
         matches!(self, Stmt::Match { .. } | Stmt::CheckAuth { .. } | Stmt::CheckFile { .. })

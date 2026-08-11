@@ -41,9 +41,11 @@ container config overrides, and the working directory
 project is a script, some services and their sidecars rather than one thing with a type: each
 service's image/command/state/port and counts, its sidecars nested under it with the
 `<name>.internal:<port>` their peers use, a tally of which *kind* of statement answered, and the
-configuration as parsed (`ProjectConfig::source`, which is the synthesised snippet when the
-project was auto-detected). The tally is per kind rather than per statement, so no statement has
-to carry an identity; `script::Outcome::answered_by` names it as the terminal is produced
+script itself as a nested list. The script is rendered from the AST (`script::outline`) rather
+than from the file, so it shows what actually runs - including the implicit tail, which is marked
+as such because it is the one statement a reader cannot find in the file. `check_auth`'s secret is
+never rendered. The tally is per kind rather than per statement, so no statement has to carry an
+identity; `script::Outcome::answered_by` names it as the terminal is produced
 
 `src/logger.rs` - Daily-rotated logs with configurable retention
 
@@ -148,6 +150,25 @@ Each server uses the `AppState` enum with an explicit state machine in `AppServe
 - **Failed** - Startup failed; waiting requests get a 502 and a later file change retries
 
 A project with no servers (static, proxy, redirect, forward) has no lifecycle task at all.
+
+### Reading a project
+
+A project's configuration is read when its directory appears, not when the first request arrives,
+so a configuration error reaches its log while whoever wrote it is still looking and the dashboard
+can show a project nobody has visited (`server::load_project`). Reading starts no containers - a
+request does that - but it does *prepare* images, so a global semaphore (`app_server::image_work`,
+4 permits) keeps sixty projects from pulling sixty images at once on startup.
+
+Reading is delayed by `SETTLE` (2s), because a directory usually appears because a deploy is in
+progress: reading it while its files are still landing would answer from half a project. A request
+arriving first reads it itself, which makes the delayed read a no-op. For the same reason the
+implicit static tail is *not* conditional on `public/` existing at read time - `serve_dir public`
+404s by itself when there is nothing there, and a tail chosen from an empty directory would go on
+404ing after the files arrived.
+
+A change to a project-defining file tears the project down and reads it again straight away
+(`Project::reload` -> `server::reload_project_by_dir`), rather than leaving it for the next
+request.
 
 ### Concurrency Model
 

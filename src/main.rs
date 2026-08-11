@@ -289,6 +289,7 @@ async fn main() -> Result<()> {
 
     // Initialize and start the server
     let server = Arc::new(server::Server::new(config).await?);
+    server::register(&server);
     server.clone().start().await?;
 
     // SIGTERM is what systemd and `podman stop` send; SIGINT is ctrl-c at a terminal. Handling

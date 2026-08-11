@@ -209,11 +209,11 @@ pub struct ProjectConfig {
     pub errors: Vec<String>,
     /// Things worth saying that the project still runs with, which it does not.
     pub warnings: Vec<String>,
-    /// The configuration as it was parsed, and where it came from - the file itself, or what was
-    /// detected in its absence. Kept so the dashboard can show a project as it is written rather
-    /// than as a summary of itself.
-    pub source: String,
+    /// Where the configuration came from - the file itself, or what was detected in its absence.
     pub source_name: String,
+    /// Where the implicit tail starts in `script` - everything from here was appended by
+    /// webcentral rather than written in the file.
+    pub implicit_from: usize,
 }
 
 impl ProjectConfig {
@@ -240,7 +240,6 @@ impl ProjectConfig {
         let source = if config_path.exists() { fs::read_to_string(&config_path)? } else { String::new() };
 
         let mut config = parse(&source, Some(dir));
-        config.source = source.clone();
         config.source_name = CONFIG_FILE.to_string();
 
         // A configuration that declares no server and never says how to answer a request leaves
@@ -251,12 +250,6 @@ impl ProjectConfig {
             if let Some(snippet) = auto_detect(dir) {
                 let parsed = parse(&snippet, Some(dir));
                 config.source_name = format!("{} (detected)", detected_from(dir));
-                config.source = if config.source.trim().is_empty() {
-                    snippet.clone()
-                } else {
-                    format!("{}\n# detected, because nothing above says how to answer a request:\n{}",
-                            config.source.trim_end(), snippet)
-                };
                 config.servers = parsed.servers;
                 config.errors.extend(parsed.errors);
                 config.warnings.extend(parsed.warnings);
@@ -303,7 +296,7 @@ impl ProjectConfig {
             config.errors.extend(errors);
         }
 
-        add_implicit_tail(&mut config, dir);
+        add_implicit_tail(&mut config);
 
         // Reload rules fall back to the project's settings and then to everything, and are only
         // resolved now because a `settings` block may come after the servers it applies to.
@@ -364,19 +357,24 @@ fn serves_anything(stmts: &[Stmt]) -> bool {
 }
 
 /// The implicit tail appended to every script: a `default` server if there is one, else the
-/// `public` directory if it exists, else nothing (which leaves the interpreter's own 404).
+/// `public` directory (which answers 404 by itself when there is nothing there).
 /// Appending it unconditionally means one rule to learn rather than a special case for scripts
 /// that already end in a terminal statement.
-fn add_implicit_tail(config: &mut ProjectConfig, dir: &Path) {
+fn add_implicit_tail(config: &mut ProjectConfig) {
+    config.implicit_from = config.script.len();
     if config.server("default").is_some() {
         config.script.push(Stmt::ServeApp("default".to_string()));
-    } else if dir.join("public").is_dir() {
-        config.script.push(Stmt::ServeDir {
-            dir: Template::literal("public"),
-            index: "index.html".to_string(),
-            fallthrough: false,
-        });
+        return;
     }
+    // Not conditional on the directory existing *now*: the configuration is read when a project
+    // appears, which for a deploy is before its files have landed, and a tail chosen then would
+    // go on 404ing after they did. `serve_dir` on a directory that isn't there answers 404 by
+    // itself, which is what the alternative did anyway.
+    config.script.push(Stmt::ServeDir {
+        dir: Template::literal("public"),
+        index: "index.html".to_string(),
+        fallthrough: false,
+    });
 }
 
 /// Synthesise a server declaration for a project that doesn't configure one, from its
@@ -592,8 +590,8 @@ pub fn parse(source: &str, dir: Option<&Path>) -> ProjectConfig {
             reload_exclude: Vec::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
-            source: source.to_string(),
             source_name: CONFIG_FILE.to_string(),
+            implicit_from: 0,
         },
         vars: Vars::default(),
         referenced: Vec::new(),

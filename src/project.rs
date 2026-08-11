@@ -194,6 +194,10 @@ impl Project {
             ),
         );
         self.shutdown();
+        // Read again straight away rather than at the next request, for the same reason as at
+        // startup: a configuration error should reach the log when it is written, not when
+        // somebody happens to visit.
+        crate::server::reload_project_by_dir(&self.dir);
         true
     }
 

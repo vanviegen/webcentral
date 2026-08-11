@@ -63,6 +63,14 @@ pub struct AppConnection {
     pub connector: AnyConnector,
 }
 
+/// How many images may be pulled or built at the same time, across every project. Enough to keep
+/// a slow registry from serialising everything, few enough that a restart is not a thundering
+/// herd.
+fn image_work() -> &'static tokio::sync::Semaphore {
+    static LIMIT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    LIMIT.get_or_init(|| tokio::sync::Semaphore::new(4))
+}
+
 /// What a service needs settled before it can be started, and only needs settling once.
 #[derive(Debug, Clone)]
 struct Prepared {
@@ -1262,6 +1270,12 @@ impl AppServer {
     /// another command in the same environment, or layers `packages` on top of it - and to
     /// `alpine` for a top-level service.
     async fn prepare_image(&self, config: &ServerConfig, parent_image: Option<&str>) -> Result<String> {
+        // Every project prepares its images as soon as it is read, and every project is read at
+        // startup - so without a cap, starting webcentral on a host with sixty projects would ask
+        // podman to pull or build sixty images at once, and a registry or a disk would be the
+        // thing that decided how that went. The work still happens, just a few at a time.
+        let _permit = image_work().acquire().await;
+
         let base = match (&config.base, parent_image) {
             (Some(base), _) => base.clone(),
             (None, Some(parent)) => parent.to_string(),

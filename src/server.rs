@@ -137,6 +137,53 @@ fn file_changed(changed: &std::path::Path) {
 }
 
 /// Forget the project registered for `dir`, whatever domain it is under.
+/// The running server, for the few things that have to reach it from outside a request: a project
+/// asking to be read again after its configuration changed. A `Weak`, so that dropping the server
+/// in a test or on shutdown does not keep it alive.
+static SERVER: std::sync::OnceLock<std::sync::Weak<Server>> = std::sync::OnceLock::new();
+
+/// Remember the server, so a project can ask to be read again from outside a request.
+pub fn register(server: &Arc<Server>) {
+    let _ = SERVER.set(Arc::downgrade(server));
+}
+
+/// How long a project directory is left alone before its configuration is read unasked. A
+/// directory usually appears because a deploy is in progress, and reading it while its files are
+/// still landing would answer requests from half of it - so it is given a moment to stop moving.
+/// A request arriving first reads it itself, which makes this a no-op for anything busy.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Read a project's configuration without waiting for somebody to make a request first, so its
+/// problems reach its log while whoever wrote them is still looking, and the dashboard can show a
+/// project nobody has visited. Reading starts no containers - a service is started by a request -
+/// though it does prepare their images, which `image_work` keeps to a few at a time.
+///
+/// Errors are already reported by `Project::new` into the project's own log; there is nothing
+/// useful to do with them here.
+pub fn load_project(domain: &str) {
+    let Some(server) = SERVER.get().and_then(|weak| weak.upgrade()) else { return };
+    let domain = domain.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(SETTLE).await;
+        // Read by a request in the meantime, which is the common case for a busy domain.
+        if DOMAINS.get(&domain).is_some_and(|info| info.project.is_some()) {
+            return;
+        }
+        let _ = server.get_project_for_domain(&domain).await;
+    });
+}
+
+/// Read it again after the configuration that built it changed. The old one is torn down first -
+/// its containers are stopped by `Project::shutdown` before this is called - so the new one finds
+/// no container of its own still running.
+pub fn reload_project_by_dir(dir: &std::path::Path) {
+    let dir = dir.to_string_lossy().to_string();
+    let domain = DOMAINS.iter().find(|entry| entry.directory == dir).map(|e| e.key().clone());
+    if let Some(domain) = domain {
+        load_project(&domain);
+    }
+}
+
 pub fn deregister_project_by_dir(dir: &std::path::Path) {
     let dir = dir.to_string_lossy();
     let domain = DOMAINS.iter().find(|entry| entry.directory == dir).map(|e| e.key().clone());
@@ -170,11 +217,12 @@ pub fn get_domain_status() -> Vec<DomainStatus> {
             Some(project) => DomainStatus {
                 domain,
                 directory,
+                loaded: true,
                 servers: project.get_server_status(),
                 total_requests: project.get_total_requests(),
                 answers: project.get_answers(),
                 cert_status,
-                source: project.config.source.clone(),
+                script: crate::script::outline(&project.config.script, project.config.implicit_from),
                 source_name: project.config.source_name.clone(),
                 problems: project
                     .config
@@ -188,13 +236,14 @@ pub fn get_domain_status() -> Vec<DomainStatus> {
             None => DomainStatus {
                 domain,
                 directory,
+                loaded: false,
                 servers: Vec::new(),
                 total_requests: 0,
                 answers: Vec::new(),
                 cert_status,
-                source: String::new(),
+                script: Vec::new(),
                 source_name: String::new(),
-                problems: vec!["Not loaded; the next request will read it again.".to_string()],
+                problems: Vec::new(),
             },
         }
     }).collect();
@@ -1004,8 +1053,9 @@ impl Server {
         });
 
         println!("Domain {} added ({:?})", &domain, directory);
-        DOMAINS.insert(domain, DomainInfo::new(directory, cert_task));
+        DOMAINS.insert(domain.clone(), DomainInfo::new(directory, cert_task));
         self.schedule_write_bindings();
+        load_project(&domain);
     }
 
     /// Whether `domain` resolves to this very process on port 80, verified by fetching a path

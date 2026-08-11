@@ -85,23 +85,24 @@ Point DNS for `someapp.yourdomain.com` at your server. Up and running!
 | Feature | Webcentral | Caddy | Traefik | Nginx | Dokku | Coolify |
 |---------|------------|-------|---------|-------|-------|-------|
 | Auto HTTPS (Let's Encrypt) | ✓ | ✓ | ✓ | Manual | ✓ (plugin) | ✓ |
+| Zero-config `Dockerfile` apps | ✓ | ✗ | ✗ | ✗ | ✓ (git&nbsp;push) | ✓ |
+| Zero-config `npm start` apps | ✓ | ✗ | ✗ | ✗ | ✓ (buildpack) | ✓ (buildpack) |
 | Zero-config static sites | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | On-demand app startup | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Multi-user (shared port 80/443) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Per-project config, owned by its user | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Auto-reload on file change | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ (git&nbsp;push) |
 | Idle shutdown | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| Multi-user (shared port 80/443) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Runs apps in containers | Podman | ✗ | ✗ | ✗ | Docker | Docker |
-| Apps run as their owner (rootless) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| Builds from a `Dockerfile` | ✓ | ✗ | ✗ | ✗ | ✓ | ✓ |
-| Database/worker alongside an app | ✓ | ✗ | ✗ | ✗ | ✓ (plugins) | ✓ |
-| Per-project config, owned by its user | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| Config complexity | Minimal | Low | Medium | High | Medium | Medium |
-| Container orchestration | ✗ | ✗ | ✓ | ✗ | ✓ | ✓ |
+| Supporting services (db, cache, worker) | ✓ (per&nbsp;app) | ✗ | ✗ | ✗ | ✓ (plugins) | ✓ |
+| Multi-host scheduling & scaling | ✗ | ✗ | ✓ | ✗ | ✗ | ✓ |
 | HTTP/3 (QUIC) | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
 
 **Caddy/Nginx/Traefik** are pure reverse proxies—they route traffic but don't manage application lifecycles. You need separate tools (systemd, Docker Compose, Kubernetes) to run your apps. Traefik reads container labels to discover what is already running; it doesn't start or stop anything itself.
 
 **Dokku/Coolify** are self-hosted PaaS platforms with git-push deployment, but require more setup and resources. They're better suited for team environments with CI/CD pipelines.
+
+**"Supporting services" vs "scheduling & scaling"** are two different things that both get called orchestration. Webcentral does the first: a project declares the database, cache or worker it needs, and they start and stop with it on a private network. It deliberately does not do the second - no scheduling across hosts, no replicas, no rolling deploys, no health-check-driven restarts. One machine, one instance of each service, started when a request arrives.
 
 **Webcentral** fills the gap for developers who want to quickly host multiple small apps/sites on a single server/VPS without container orchestration overhead. Just drop files in a folder and go. It allows multiple (non-privileged) users to share a single server. Unused apps don't consume resources.
 
@@ -209,7 +210,8 @@ statement. `serve_file` and `serve_dir` answer 404 when they find nothing, unles
 `fallthrough=true` tells them to leave the request to the statements below instead.
 
 An implicit tail is appended to every script: `serve` if a service named `default` exists,
-otherwise `serve_dir public` if that directory exists, otherwise a 404.
+otherwise `serve_dir public` - which answers 404 by itself when there is no such directory. The
+dashboard shows it, marked as implicit.
 
 #### match
 
@@ -392,11 +394,11 @@ match /webhook/(.*) {
 
 #### project_dashboard and admin_dashboard
 
-`project_dashboard` serves the built-in status page for this project alone: a section per project
-naming each service, the image and command it runs, whether it is up and on which port, its
-request and idle counts, the sidecars hanging off it with the `<name>.internal:<port>` address
-their peers use, a tally of which kind of statement answered the requests, and the configuration
-as it was read.
+`project_dashboard` serves the built-in status page for this project alone: each service with the
+image and command it runs, whether it is up and on which port, its request and idle counts, the
+sidecars hanging off it with the `<name>.internal:<port>` address their peers use, a tally of
+which kind of statement answered the requests, and the routing script itself as a nested list -
+including the implicit tail, marked as such, since that is the one statement no file mentions.
 
 `admin_dashboard` serves the same page for *every* domain on the server, with server-wide numbers
 on top. Since that shows everyone's projects, it only answers (with anything but a 403) from a
@@ -1031,6 +1033,7 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
   - **Everything runs in a container.** Firejail support and the unsandboxed path are gone, leaving one keyword, `service`, and podman as the only external dependency. A project can declare several, each with its own image, port, lifecycle and reload rules, started only when a request is routed to it. A nested `service` is a *sidecar* sharing its parent's lifetime, image and environment - which is what replaced workers
   - A project with a **`Dockerfile`** is built and run from it, in any language and with no configuration at all. Its build context cannot reach outside the project directory, which is what makes it safe on a shared machine
   - **Authentication belongs to the application.** Accounts, password hashes and the auth cookie are gone. What remains is `check_auth <secret>` for guarding something small, and `X-Accel-Redirect`, which lets an application authorise a request and hand the delivery back to webcentral
+  - A project is **read when it appears**, not when it is first visited, so a configuration error reaches its log while whoever wrote it is still looking - and the dashboard, now a section per project showing each service, its sidecars and the routing script itself, can show a project nobody has requested yet
   - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. `webcentral check` parses a project without starting anything
   - Request bodies and static files are **streamed**, and static files support `Range`, so uploads and video seeking work at any size
   - `env_file` keeps secrets out of the configuration, and they reach a container through podman's own environment rather than its command line, which `ps` exposes to every user on the machine
