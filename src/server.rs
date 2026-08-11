@@ -72,6 +72,12 @@ lazy_static::lazy_static! {
     static ref SELF_CHECK_TOKEN: String = format!("{:032x}", rand::random::<u128>());
 }
 
+/// What `redirect_http` means for a project that doesn't say, filled in by `Server::new`. The
+/// dashboard shows what a request actually does rather than the word "unset", and the default is
+/// a webcentral-wide flag rather than anything the project owner can change.
+static REDIRECT_HTTP_DEFAULT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Path serving `SELF_CHECK_TOKEN`, used to verify a domain resolves to this server (see
 /// `Server::points_at_us`).
 const SELF_CHECK_PATH: &str = "/.well-known/webcentral-self-check";
@@ -215,15 +221,26 @@ pub fn get_domain_status() -> Vec<DomainStatus> {
         let cert_status = CERT_STATUS.get(&domain).map(|s| s.clone());
         match &entry.project {
             Some(project) => DomainStatus {
+                // The set of files that reload the project includes the ones it would be defined
+                // by if they appeared - naming those would read as a claim that they are there.
+                config_files: project
+                    .config
+                    .config_files
+                    .iter()
+                    .filter(|file| PathBuf::from(&directory).join(file).exists())
+                    .cloned()
+                    .collect(),
                 domain,
                 directory,
                 loaded: true,
-                servers: project.get_server_status(),
+                services: project.get_service_status(),
                 total_requests: project.get_total_requests(),
-                answers: project.get_answers(),
                 cert_status,
-                script: crate::script::outline(&project.config.script, project.config.implicit_from),
+                script: project.get_script(),
                 source_name: project.config.source_name.clone(),
+                settings: project_settings(&project.config),
+                read_headers: project.config.read_headers.clone(),
+                owner: project.owner_name(),
                 problems: project
                     .config
                     .errors
@@ -237,18 +254,41 @@ pub fn get_domain_status() -> Vec<DomainStatus> {
                 domain,
                 directory,
                 loaded: false,
-                servers: Vec::new(),
+                services: Vec::new(),
                 total_requests: 0,
-                answers: Vec::new(),
                 cert_status,
                 script: Vec::new(),
                 source_name: String::new(),
+                config_files: Vec::new(),
+                settings: Vec::new(),
+                read_headers: Vec::new(),
+                owner: String::new(),
                 problems: Vec::new(),
             },
         }
     }).collect();
     result.sort_by(|a, b| a.domain.cmp(&b.domain));
     result
+}
+
+/// The project-wide settings as they actually behave: what the `settings` block said, or what
+/// webcentral falls back to when it said nothing.
+fn project_settings(config: &crate::config::ProjectConfig) -> Vec<crate::dashboard::Setting> {
+    let redirect_http = config
+        .redirect_http
+        .unwrap_or_else(|| REDIRECT_HTTP_DEFAULT.load(std::sync::atomic::Ordering::Relaxed));
+    vec![
+        crate::dashboard::Setting {
+            name: "redirect_http",
+            value: if redirect_http { "to https" } else { "off" }.to_string(),
+            explicit: config.redirect_http.is_some(),
+        },
+        crate::dashboard::Setting {
+            name: "redirect_https",
+            value: if config.redirect_https == Some(true) { "to http" } else { "off" }.to_string(),
+            explicit: config.redirect_https.is_some(),
+        },
+    ]
 }
 
 pub use crate::dashboard::DomainStatus;
@@ -278,6 +318,8 @@ impl Server {
     pub async fn new(config: crate::GlobalConfig) -> Result<Self> {
         // Initialize SERVER_START_TIME, as otherwise it will initialize when we first open the dashoard
         let _ = *SERVER_START_TIME;
+        REDIRECT_HTTP_DEFAULT
+            .store(config.redirect_http(), std::sync::atomic::Ordering::Relaxed);
 
         // Create certificate manager if HTTPS is enabled
         let cert_manager = if config.https > 0 {

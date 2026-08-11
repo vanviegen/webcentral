@@ -109,7 +109,6 @@ pub struct AppServer {
     finished_rx: watch::Receiver<bool>,
     pending_requests: AtomicU64,
     active_upgrades: AtomicU64,
-    total_requests: AtomicU64,
     last_activity: Mutex<Instant>,
     state_changed: Notify,
 }
@@ -140,7 +139,6 @@ impl AppServer {
             finished_rx,
             pending_requests: 0.into(),
             active_upgrades: 0.into(),
-            total_requests: 0.into(),
             last_activity: Mutex::new(Instant::now()),
             state_changed: Notify::new(),
         });
@@ -201,10 +199,6 @@ impl AppServer {
         self.connection.try_lock().ok().and_then(|c| c.as_ref().map(|c| c.port))
     }
 
-    pub fn total_requests(&self) -> u64 {
-        self.total_requests.load(Ordering::Relaxed)
-    }
-
     pub fn pending_requests(&self) -> u64 {
         self.pending_requests.load(Ordering::Relaxed)
     }
@@ -232,7 +226,6 @@ impl AppServer {
 
     fn track_request(&self) {
         self.pending_requests.fetch_add(1, Ordering::SeqCst);
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.state_changed.notify_one();
     }
 

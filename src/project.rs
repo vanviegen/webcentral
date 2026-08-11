@@ -9,7 +9,7 @@
 use crate::app_server::{AppServer, AppState, StopReason};
 use crate::owner::Owner;
 use crate::config::ProjectConfig;
-use crate::dashboard::ServerStatus;
+use crate::dashboard::ServiceStatus;
 use crate::logger::Logger;
 use crate::script::{self, Terminal};
 use crate::server::SHARED_EXECUTOR;
@@ -49,6 +49,66 @@ fn proxy_connector(target: &str) -> AnyConnector {
     }
 }
 
+/// A container's environment with the middle of each value replaced, so the dashboard can show
+/// that a variable is set, and roughly to what, without handing over a token to whoever can reach
+/// the page. Short values are shown as they are: they are almost always a port, a hostname or a
+/// mode, and a masked one that tells you nothing is worse than none at all - so anything short
+/// enough to be worth hiding should not be a secret in the first place.
+fn masked_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    env.iter().map(|(name, value)| (name.clone(), mask(value))).collect()
+}
+
+fn mask(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() < 12 {
+        return value.to_string();
+    }
+    format!(
+        "{}…{}",
+        chars[..4].iter().collect::<String>(),
+        chars[chars.len() - 4..].iter().collect::<String>()
+    )
+}
+
+/// Everything a service says about itself that is the same whether or not it has a lifecycle of
+/// its own. What is left is filled in by the caller: a sidecar has no state, no timeouts and no
+/// reload rules, because it is started and stopped with its parent.
+fn describe_service(config: &crate::config::ServerConfig, grouped: bool) -> ServiceStatus {
+    ServiceStatus {
+        name: config.name.clone(),
+        image: describe_image(config, None),
+        command: config.command.clone(),
+        state: None,
+        host_port: None,
+        pending_requests: 0,
+        active_upgrades: 0,
+        idle_seconds: None,
+        port: config.port,
+        address: grouped.then(|| format!("{}.internal:{}", config.name, config.port)),
+        app_dir: config.app_dir.clone(),
+        user: config.user.clone(),
+        mounts: config.mounts.clone(),
+        packages: config.packages.clone(),
+        build: config.build.clone(),
+        copy: config.copy.clone(),
+        shutdown_time: None,
+        startup_time: None,
+        reload_include: Vec::new(),
+        reload_exclude: Vec::new(),
+        env: masked_env(&config.env),
+        sidecars: Vec::new(),
+    }
+}
+
+/// A reload list with each pattern marked as webcentral's or the service's own, so the page can
+/// say which is which without printing the word "default" forty times. Only marked when the whole
+/// default set is there: a service that named `src` itself said so, and calling that a default
+/// because webcentral's own list happens to contain it would be a lie.
+fn mark_defaults(patterns: &[String], defaults: &[String]) -> Vec<(String, bool)> {
+    let all = defaults.iter().all(|d| patterns.contains(d));
+    patterns.iter().map(|p| (p.clone(), all && defaults.contains(p))).collect()
+}
+
 /// What a service runs, said the way the configuration says it: its own image, the Dockerfile it
 /// builds, or - for a sidecar that names none - its parent's.
 fn describe_image(
@@ -75,15 +135,17 @@ pub struct Project {
     /// Clients for `forward`/`proxy` targets, built on first use and reused after that.
     targets: dashmap::DashMap<String, (AnyConnector, Client<AnyConnector, StreamBody>)>,
     total_requests: AtomicU64,
-    /// How many requests each kind of statement answered, for the dashboard. Kept per kind rather
-    /// than per statement: it says where requests end up without the AST having to carry an
-    /// identity for every line.
-    answers: dashmap::DashMap<&'static str, u64>,
+    /// How many requests reached each statement, indexed by `Stmt::id`. A flat slice rather than a
+    /// map, so counting a statement is one relaxed atomic add and the dashboard can say what the
+    /// script actually does rather than what it says.
+    stmt_counts: Box<[AtomicU64]>,
     /// The project files' mtimes from just before the configuration was read, so an event that
     /// merely reports the write this project was built from can be told from a real change.
     project_file_mtimes: Vec<(PathBuf, Option<std::time::SystemTime>)>,
     /// The configuration's constants plus `$domain`, copied into every request.
     vars: script::Vars,
+    /// Who the project belongs to, and so who its containers run as.
+    owner: Arc<Owner>,
     /// Whether `admin_dashboard` may be served: only for projects owned by the user webcentral
     /// runs as, since that page shows every user's domains.
     admin_allowed: bool,
@@ -104,6 +166,7 @@ impl Project {
             })
             .collect();
         let config = ProjectConfig::load(dir)?;
+        let stmt_counts = (0..config.stmt_count).map(|_| AtomicU64::new(0)).collect();
         let owner = Owner::of(dir);
         let (uid, gid) = (owner.uid, owner.gid);
 
@@ -143,7 +206,8 @@ impl Project {
             servers,
             targets: dashmap::DashMap::new(),
             total_requests: 0.into(),
-            answers: dashmap::DashMap::new(),
+            stmt_counts,
+            owner: owner.clone(),
             project_file_mtimes,
             vars,
             admin_allowed: uid == nix::unistd::geteuid().as_raw(),
@@ -224,48 +288,64 @@ impl Project {
     // --- Status, for the dashboard ---
 
 
+    pub fn owner_name(&self) -> String {
+        self.owner.name.clone()
+    }
+
     pub fn get_total_requests(&self) -> u64 {
         self.total_requests.load(Ordering::Relaxed)
     }
 
-    /// Which statements answered, busiest first.
-    pub fn get_answers(&self) -> Vec<(String, u64)> {
-        let mut answers: Vec<(String, u64)> =
-            self.answers.iter().map(|e| (e.key().to_string(), *e.value())).collect();
-        answers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        answers
+    /// The script as it reads, with how often each statement has run.
+    pub fn get_script(&self) -> Vec<script::Outline> {
+        script::outline(&self.config.script, self.config.implicit_from, &self.stmt_counts)
     }
 
-    pub fn get_server_status(&self) -> Vec<ServerStatus> {
+    /// Every service the project declares, each with its sidecars nested inside it - which is
+    /// how the status page reads them, since a sidecar is a service that borrows its parent's
+    /// lifetime rather than a thing of another kind.
+    pub fn get_service_status(&self) -> Vec<ServiceStatus> {
+        let includes: Vec<String> =
+            crate::config::DEFAULT_INCLUDES.iter().map(|s| s.to_string()).collect();
+        // What is appended to every service's excludes, whatever it asked for.
+        let excludes: Vec<String> = crate::config::DEFAULT_EXCLUDES
+            .iter()
+            .map(|s| s.to_string())
+            .chain(crate::config::PROJECT_FILES.iter().map(|f| format!("/{}", f)))
+            .collect();
         self.servers
             .iter()
-            .map(|server| ServerStatus {
-                name: server.name().to_string(),
-                image: describe_image(&server.config, None),
-                command: server.config.command.clone(),
-                sidecars: server
-                    .config
-                    .sidecars
-                    .iter()
-                    .map(|sidecar| crate::dashboard::SidecarStatus {
-                        name: sidecar.name.clone(),
-                        image: describe_image(sidecar, Some(&server.config)),
-                        command: sidecar.command.clone(),
-                        port: sidecar.port,
-                    })
-                    .collect(),
-                state: match server.state() {
-                    AppState::Stopped => "Stopped",
-                    AppState::Starting => "Starting",
-                    AppState::Running => "Running",
-                    AppState::Failed => "Failed",
+            .map(|server| {
+                let config = &server.config;
+                let grouped = !config.sidecars.is_empty();
+                ServiceStatus {
+                    state: Some(
+                        match server.state() {
+                            AppState::Stopped => "Stopped",
+                            AppState::Starting => "Starting",
+                            AppState::Running => "Running",
+                            AppState::Failed => "Failed",
+                        }
+                        .to_string(),
+                    ),
+                    host_port: server.port(),
+                    pending_requests: server.pending_requests(),
+                    active_upgrades: server.active_upgrades(),
+                    idle_seconds: server.idle_seconds(),
+                    shutdown_time: Some(config.shutdown_time),
+                    startup_time: Some(config.startup_time),
+                    reload_include: mark_defaults(&config.reload_include, &includes),
+                    reload_exclude: mark_defaults(&config.reload_exclude, &excludes),
+                    sidecars: config
+                        .sidecars
+                        .iter()
+                        .map(|sidecar| ServiceStatus {
+                            image: describe_image(sidecar, Some(config)),
+                            ..describe_service(sidecar, true)
+                        })
+                        .collect(),
+                    ..describe_service(config, grouped)
                 }
-                .to_string(),
-                port: server.port(),
-                total_requests: server.total_requests(),
-                pending_requests: server.pending_requests(),
-                active_upgrades: server.active_upgrades(),
-                idle_seconds: server.idle_seconds(),
             })
             .collect()
     }
@@ -405,10 +485,10 @@ impl Project {
             logger: &self.logger,
             domain: &self.domain,
             admin_allowed: self.admin_allowed,
+            read_headers: &self.config.read_headers,
+            counts: &self.stmt_counts,
         };
-        let outcome = script::run(&self.config.script, env, vars, req).await?;
-        *self.answers.entry(outcome.answered_by).or_insert(0) += 1;
-        Ok(outcome)
+        script::run(&self.config.script, env, vars, req).await
     }
 
     /// Perform whatever the script decided, for a request that is not being upgraded.

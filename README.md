@@ -4,14 +4,13 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 > ### 🎉 3.0 is here - and it breaks just about everything
 >
-> What a project does is now written in one small language: `webcentral.conf` holds a script, run
-> top to bottom for every request, and a project can declare as many services - each its own
-> container, with sidecars for the database and the queue runner - as it needs. Containers always
-> run rootless, as the person who owns the project. A project with a `Dockerfile` usually needs no
-> configuration at all. The catch is in the title: `webcentral.ini` is not read any more, Procfile
-> support is gone, firejail and the unsandboxed path are gone, webcentral's own accounts and
-> passwords are gone, and what restarts an application has changed. See
-> **[MIGRATION-v3.md](MIGRATION-v3.md)**, and the changelog for the full list.
+> **Gained:** way more flexibility in how project requests are handled, multiple services per project, much-improved dashboards, using `Dockerfile`s (without futher config needed), X-Accel-Redirect support, `.env` file support, https proxy targets.
+>
+> **Dropped:** Firejail and bare-metal runtimes, `Procfile` support, cookie auth mechanism.
+>
+> **Changed:** default reload watch include/exclude patterns.
+>
+> Read the **[migration guide](MIGRATION-v3.md)** and [changelog](#changelog) for more.
 
 ## Features
 
@@ -382,23 +381,32 @@ match .*\.(js|css|woff2) {
 
 #### log
 
-`log <message>` writes a line to the project's log - handy for working out why a request went
-where it did.
+`log [message]` writes a line to the project's log. With nothing to say it writes the request -
+`GET /path` - so a bare `log` at the top of a script is a request log:
+
+```ini
+log
+```
+
+With a message it writes that instead, which is more useful further down, where only some requests
+reach it:
 
 ```ini
 match /webhook/(.*) {
-  log "webhook ${1} from ${host}"
+  log "webhook ${1} from ${header:User-Agent}"
   forward 4000
 }
 ```
 
 #### project_dashboard and admin_dashboard
 
-`project_dashboard` serves the built-in status page for this project alone: each service with the
-image and command it runs, whether it is up and on which port, its request and idle counts, the
-sidecars hanging off it with the `<name>.internal:<port>` address their peers use, a tally of
-which kind of statement answered the requests, and the routing script itself as a nested list -
-including the implicit tail, marked as such, since that is the one statement no file mentions.
+`project_dashboard` serves the built-in status page for this project alone: where it lives, who
+owns it, what its settings come to, a row per service - and, nested inside it, per sidecar -
+saying what each runs, whether it is up, which port it answers on and how it is reached, what it
+persists, what restarts it and what its environment holds with the middle of every value masked,
+and the routing script itself as a nested list with a count against each statement saying how
+often it ran. That includes the implicit tail, marked as such, since it is the one statement no
+file mentions.
 
 `admin_dashboard` serves the same page for *every* domain on the server, with server-wide numbers
 on top. Since that shows everyone's projects, it only answers (with anything but a 403) from a
@@ -477,7 +485,7 @@ service {                         # no name, so it is called "default"
 | `user` | Who the container runs as *inside* - see **Container user** below. |
 | `shutdown_time` | Idle time before stopping again. `0` keeps it running. Default `300` (seconds; `90s`, `5m` and `2h` also work). |
 | `startup_time` | How long to wait for the port to answer before giving up. Default `60`. |
-| `reload_include` | Which files restart it. Defaults to the project's `settings`, then to the built-in list below. |
+| `reload_include` | Which files restart it. Defaults to the built-in list below, or to everything for a `dockerfile` service. |
 | `reload_exclude` | Which of those to ignore anyway. |
 | `env { }` | Environment variables for the command. |
 | `service <name> { }` | A *sidecar*: another service sharing this one's lifetime - see **Sidecars** below. Without a `base` of its own it runs in this service's image, which is how an extra worker process is declared. |
@@ -643,9 +651,9 @@ the server above them.
 
 ### Reload rules
 
-`reload_include` and `reload_exclude` decide which changes restart a service. In `settings` they
-are the default for every service in the project; a service can name its own instead, which is how
-a change to a PHP file can restart the PHP service and leave the asset builder running:
+`reload_include` and `reload_exclude` decide which changes restart a service, and are named inside
+the service they restart - which is how a change to a PHP file can restart the PHP service and
+leave the asset builder running:
 
 ```ini
 service api {
@@ -701,8 +709,6 @@ owner cannot touch, and `initdb` fails outright because the directory webcentral
 it is the owner's. Naming the id brings it back under the guarantee:
 
 ```ini
-env_file .env
-
 service app {
   command = ./app
   service db {
@@ -711,7 +717,7 @@ service app {
     user = 999:999          # what the postgres image switches to at run time
     app_dir = none
     mounts = /var/lib/postgresql/data
-    env { POSTGRES_PASSWORD = ${DB_PASSWORD} }
+    env { POSTGRES_PASSWORD = ${env:DB_PASSWORD} }
   }
 }
 serve app
@@ -816,6 +822,14 @@ These are always there, describing the request as it stands *now*:
 | `${method}` | `GET`, `POST`, ... |
 | `${host}` | the `Host` header - what the client asked for |
 | `${domain}` | the domain this project is registered under - what it really is |
+| `${header:Name}` | a header the request arrived with, `Name` matched case-insensitively |
+
+`${header:...}` reads whatever the request carried, and is empty when it carried no such header -
+there is nothing to check a header name against, so nothing is reported for one that never turns
+up. Webcentral sets `X-Forwarded-For` to the client's address before the script runs, which makes
+`log "${header:X-Forwarded-For} ${method} ${path}"` an access log. Headers are read-only:
+`set_header` writes one on the *response*, and `set header:...` is refused rather than silently
+doing something else.
 
 **The first two are the request, not a copy of it**: reading `${path}` gives the path being
 served, and assigning it re-points what gets served or forwarded - see **set path** above. The
@@ -867,16 +881,14 @@ otherwise silently be empty, which is a typo far more often than it is intent.
 ### Secrets
 
 A password does not belong in `webcentral.conf`, which lives in the project directory and usually
-in git. `env_file` reads `KEY=value` lines from somewhere else and makes them constants, so they
-reach exactly what names them and nothing else:
+in git. A `.env` beside it is read without being asked, and its `KEY=value` lines become constants
+named `${env:KEY}`, so they reach exactly what names them and nothing else:
 
 ```ini
-env_file .env
-
 service {
   command = ./app
   env {
-    DATABASE_URL = postgres://app:${DB_PASSWORD}@db.internal:5432/app
+    DATABASE_URL = postgres://app:${env:DB_PASSWORD}@db.internal:5432/app
   }
   service db {
     base = postgres:16
@@ -885,27 +897,55 @@ service {
     app_dir = none
     mounts = /var/lib/postgresql/data
     env {
-      POSTGRES_PASSWORD = ${DB_PASSWORD}
+      POSTGRES_PASSWORD = ${env:DB_PASSWORD}
       POSTGRES_USER = app
       POSTGRES_DB = app
     }
   }
 }
-check_auth ${DASHBOARD_SECRET} { project_dashboard }
+check_auth ${env:DASHBOARD_SECRET} { project_dashboard }
 serve
 ```
 
 Nothing is injected anywhere by itself: a value reaches a service only where you write
 `${NAME}`, so a sidecar never sees a secret it has no use for. Blank lines and `#` comments are
 skipped, a leading `export ` is ignored, and one layer of surrounding quotes comes off the value.
-The file must live inside the project directory, is read in the order it appears (like `set`), and
-changing it reloads the project. Values from it are never re-substituted - a secret is not a
-template.
+Values are never re-substituted - a secret is not a template - and changing the file reloads the
+project.
+
+`env_file` reads another one. It must live inside the project directory and is read in the order
+it appears, like `set`:
+
+```ini
+env_file secrets/production.env
+```
 
 A container's environment is handed to podman through *its* environment rather than its command
 line, because `podman run` stays alive for as long as the container does and anyone on the machine
 can read another process's command line with `ps`. Nothing is written to disk for it, and the
 startup log line records the variable's name without its value.
+
+The `env:` prefix says where a value came from, and keeps a file's keys from colliding with a
+constant or with another file's. `prefix=` names a different one, and `prefix=` on its own drops it:
+
+```ini
+env_file secrets/stripe.env prefix=stripe:
+
+respond 200 "${env:GREETING} ${stripe:PUBLISHABLE_KEY}"
+```
+
+Passing one on to a container usually means writing the same name three times, so a bare name in
+an `env` block is shorthand for exactly that - `STRIPE_KEY` means `STRIPE_KEY = ${env:STRIPE_KEY}`:
+
+```ini
+service {
+  command = ./app
+  env {
+    STRIPE_KEY                          # the same as STRIPE_KEY = ${env:STRIPE_KEY}
+    LOG_LEVEL = debug
+  }
+}
+```
 
 Keep the file out of git (`.gitignore`) and readable only by the project owner.
 
@@ -936,21 +976,19 @@ request streaming.
 
 ### Project settings
 
-The four things that belong to the project rather than to a service or a request:
+The two things that belong to the project rather than to a service or a request:
 
 ```ini
 settings {
   redirect_http = false       # don't redirect http:// to https:// for this project
   redirect_https = true       # ...redirect the other way around instead
-  reload_include = src public "file with spaces"
-  reload_exclude = src/build **/*.bak
 }
 ```
 
 `redirect_http` overrides the server-wide `--redirect-http` for this project alone - useful for a
 domain that has to stay reachable over plain HTTP. `redirect_https = true` goes the other way,
-sending HTTPS visitors to the plain-HTTP site; there is no server-wide version of that. The two
-`reload_` lists are the defaults for services that name none of their own - see **Reload rules**.
+sending HTTPS visitors to the plain-HTTP site; there is no server-wide version of that. Reload
+rules are not here: what restarts a service belongs to that service - see **Reload rules**.
 
 There is no `log_requests`: a `log` statement at the top of the script does it, and says what you
 want said rather than what webcentral guessed.
@@ -1036,178 +1074,185 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
-2026-08-11 (3.0.0):
-  - **`webcentral.ini` is replaced by `webcentral.conf`**, a small configuration language. A project's requests are handled by a routing script run top to bottom - `match`, `serve`, `serve_dir`, `check_file`, `forward`, `proxy`, `respond` and friends - which subsumes what used to be fixed project types: a redirect project is now the one-line script `redirect https://example.com status=301`. Nearly every 2.x project needs converting; see [MIGRATION-v3.md](MIGRATION-v3.md)
-  - **Containers always run rootless, as the project's owner**, whether webcentral itself runs as root or not. A container - and more sharply a `build` step, which is arbitrary code from somebody else's project - has at worst that person's privileges, and "what a container writes is owned by the project owner" stops being a hand-built uid mapping and becomes what podman does by itself
-  - **Everything runs in a container.** Firejail support and the unsandboxed path are gone, leaving one keyword, `service`, and podman as the only external dependency. A project can declare several, each with its own image, port, lifecycle and reload rules, started only when a request is routed to it. A nested `service` is a *sidecar* sharing its parent's lifetime, image and environment - which is what replaced workers
-  - A project with a **`Dockerfile`** is built and run from it, in any language and with no configuration at all. Its build context cannot reach outside the project directory, which is what makes it safe on a shared machine
-  - **Authentication belongs to the application.** Accounts, password hashes and the auth cookie are gone. What remains is `check_auth <secret>` for guarding something small, and `X-Accel-Redirect`, which lets an application authorise a request and hand the delivery back to webcentral
-  - A project is **read when it appears**, not when it is first visited, so a configuration error reaches its log while whoever wrote it is still looking - and the dashboard, now a section per project showing each service, its sidecars and the routing script itself, can show a project nobody has requested yet
-  - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. `webcentral check` parses a project without starting anything
-  - Request bodies and static files are **streamed**, and static files support `Range`, so uploads and video seeking work at any size
-  - `env_file` keeps secrets out of the configuration, and they reach a container through podman's own environment rather than its command line, which `ps` exposes to every user on the machine
-  - **What restarts an application has been inverted**: 2.x watched every file except a short exclusion list, 3.0 watches a whitelist of source directories, source extensions and dependency manifests. A restart is disruptive and most files in a project are not program text - but a project whose application reads a `config.yaml` or a template at startup has to say so with `reload_include`
-  - The whole projects tree is watched with **one** inotify instance rather than one per project (60 projects went from 61 to 2)
-  - `proxy` speaks **https**, verifying the upstream against the system trust store, and a `VOLUME` an image declares is given a directory that outlives the container instead of being discarded with it
-  - `Procfile` is no longer detected: it supplied a command but never the runtime or the dependencies its commands assume, so the compatibility failed at run time rather than when the file was read. `package.json` with a `start` script still is
-  - Fix containers being orphaned on shutdown, both because only SIGINT was handled - not the SIGTERM systemd sends - and because the stop was never waited for
-  - Fix services being unreachable on IPv6 hosts: ports are published on `127.0.0.1` and addressed that way
+2026-08-12 (3.0.0):
+  - **`webcentral.ini` is replaced by `webcentral.conf`**, a small configuration language. A project's requests are handled by a routing script run top to bottom - `match`, `serve`, `serve_dir`, `check_file`, `forward`, `proxy`, `respond` and friends - which subsumes what used to be fixed project types: a redirect project is now the one-line script `redirect https://example.com status=301`. Nearly every 2.x project needs converting; see [MIGRATION-v3.md](MIGRATION-v3.md).
+  - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. `webcentral check <dir>` parses a project and prints every problem without starting anything.
+  - **Everything runs in a container.** Firejail support and the unsandboxed path are gone, leaving podman as the only external dependency.
+  - **A project can declare any number of services**, each with its own image, port, lifecycle and reload rules, started only when a request is routed to it.
+  - A nested `service` is a **sidecar**, sharing its parent's lifetime and image and reachable by its peers at `<name>.internal` - which is what replaced workers.
+  - **Containers always run rootless, as the project's owner**, whether webcentral itself runs as root or not. A container - and more sharply a `build` step, which is arbitrary code from somebody else's project - has at worst that person's privileges.
+  - A project with a **`Dockerfile`** is built and run from it, in any language and with no configuration at all. Its build context cannot reach outside the project directory, which is what makes it safe on a shared machine.
+  - A `VOLUME` an image declares is given a directory that outlives the container, instead of being discarded with it on the first restart.
+  - **Secrets live outside `webcentral.conf`**: a `.env` beside it is read by itself, and `env_file` reads any other. Keys are named `${env:KEY}`, so a value reaches exactly what names it and nothing is injected into a process by itself. What does reach a container is handed to podman through *its* environment rather than its command line, which `ps` exposes to every user on the machine.
+  - `${header:Name}` reads a request header, case-insensitively, so a script can route on a `User-Agent` or log an `X-Forwarded-For`.
+  - A bare `log` writes the request, which is what `log_requests` used to do less well - and behind a `match`, when only some requests are worth recording.
+  - Request bodies and static files are **streamed**, and static files support `Range`, so uploads and video seeking work at any size.
+  - **`X-Accel-Redirect`** lets an application authorise or account for a request and hand the delivery itself back to webcentral.
+  - `proxy` speaks **https**, verifying the upstream against the system trust store.
+  - A project is **read when it appears**, not when it is first visited, so a configuration error reaches its log while whoever wrote it is still looking.
+  - **The status page** is a table per project: where it lives, who owns it, what its settings come to, a row per service with its sidecars nested inside, and the routing script with a count against every statement saying how often it ran.
+  - The whole projects tree is watched with **one** inotify instance rather than one per project, which is the per-user limit a busy server runs into first.
+  - **Authentication belongs to the application.** Accounts, password hashes and the auth cookie are gone; what remains is `check_auth <secret>` for guarding something small.
+  - **What restarts an application has been inverted**: 2.x watched every file except a short exclusion list, 3.0 watches a whitelist of source directories, source extensions and dependency manifests. A project whose application reads a `config.yaml` or a template at startup has to say so with `reload_include`.
+  - `Procfile` is no longer detected: the Heroku compatibility was always just superficial at best. `package.json` with a `start` script still is.
+  - Fix containers being orphaned on shutdown, both because only SIGINT was handled - not the SIGTERM systemd sends - and because the stop was never waited for.
+  - Fix services being unreachable on IPv6 hosts: ports are published on `127.0.0.1` and addressed that way.
 
 2026-08-05 (2.6.1):
-  - **Security:** fix a path traversal in static file serving. `GET /../../etc/passwd` escaped the project's `public/` directory and served any file readable by webcentral (root, in the usual setup). The containment check compared path components without resolving `..`, which the kernel then resolved on open. Request paths are now percent-decoded and normalized before the filesystem is touched. Only projects serving static files were affected
-  - Static files whose names need percent-encoding (`/my%20file.txt`) are served instead of 404'd, as the path was previously used raw
-  - Fix `[rewrite]` rules never rewriting anything: the rewritten path was computed and then thrown away, so only the redirect form (a target that isn't a path) had any effect. The rewritten path now replaces the request's, for every project type, carrying the query string over
-  - `[rewrite]` rules are now really applied in the documented file order, instead of the arbitrary order of a hash map, so a catch-all as the last rule no longer sometimes swallows the rules above it
-  - Rewrite patterns are compiled once at load instead of on every request, and an unparsable one is now reported in the project log instead of silently skipped
+  - **Security:** fix a path traversal in static file serving. `GET /../../etc/passwd` escaped the project's `public/` directory and served any file readable by webcentral (root, in the usual setup). The containment check compared path components without resolving `..`, which the kernel then resolved on open. Request paths are now percent-decoded and normalized before the filesystem is touched. Only projects serving static files were affected.
+  - Static files whose names need percent-encoding (`/my%20file.txt`) are served instead of 404'd, as the path was previously used raw.
+  - Fix `[rewrite]` rules never rewriting anything: the rewritten path was computed and then thrown away, so only the redirect form (a target that isn't a path) had any effect. The rewritten path now replaces the request's, for every project type, carrying the query string over.
+  - `[rewrite]` rules are now really applied in the documented file order, instead of the arbitrary order of a hash map, so a catch-all as the last rule no longer sometimes swallows the rules above it.
+  - Rewrite patterns are compiled once at load instead of on every request, and an unparsable one is now reported in the project log instead of silently skipped.
 
 That's a lot of nastiness that needed to be cleaned up. I guess that's what you get for having an agent port your code to a new language and not thoroughly studying every single line it outputs. :-(
 
 2026-07-31 (2.6.0):
-  - Containers are now always run with podman; docker support is dropped. The config section is renamed to `[podman]`, with `[docker]` still accepted as an alias
-  - Host-side file ownership is now a promise instead of an accident: whatever user the container runs as inside, everything it writes into the project directory or `mounts[]` lands owned by the project owner. A root webcentral gives the container a per-container uid/gid mapping between its user and the owner; a non-root webcentral (rootless podman) represents the owner as container root and maps explicitly requested other users onto them via `keep-id` (projects owned by anyone else are warned about, being the one thing rootless podman cannot express)
-  - New `[podman] user`, deciding who the container runs as *inside*: `project` (default when the project directory is mounted) runs as the project owner - added to the image as a real user named `webcentral` (with `$HOME` in `_webcentral_data/home`) under a root webcentral, or as rootless podman's container root under a non-root one; `image` (default otherwise) keeps whatever the image declares; or give a numeric `uid:gid` or an image-defined user name. A bare uid is rejected as ambiguous. This replaces the `--user` flag plus a bind-mount of the host's `/etc/passwd` over the image's, which broke images defining their own users
-  - Fix `EACCES` in `mounts[]`: those host directories were created owned by webcentral (often root) rather than by the project owner the container writes as
-  - Fix `[podman] packages` being silently ignored since 2.1.0, installing nothing
-  - Skip the image build entirely when the configuration and the base image are unchanged, instead of paying for a cached build on every on-demand start; a pulled base update still triggers a rebuild, and images left behind by older configurations are cleaned up
-  - Fix a container outliving its webcentral wedging the project for good, as `run` then hit a name conflict on every restart
+  - Containers are now always run with podman; docker support is dropped. The config section is renamed to `[podman]`, with `[docker]` still accepted as an alias.
+  - Host-side file ownership is now a promise instead of an accident: whatever user the container runs as inside, everything it writes into the project directory or `mounts[]` lands owned by the project owner. A root webcentral gives the container a per-container uid/gid mapping between its user and the owner; a non-root webcentral (rootless podman) represents the owner as container root and maps explicitly requested other users onto them via `keep-id` (projects owned by anyone else are warned about, being the one thing rootless podman cannot express).
+  - New `[podman] user`, deciding who the container runs as *inside*: `project` (default when the project directory is mounted) runs as the project owner - added to the image as a real user named `webcentral` (with `$HOME` in `_webcentral_data/home`) under a root webcentral, or as rootless podman's container root under a non-root one; `image` (default otherwise) keeps whatever the image declares; or give a numeric `uid:gid` or an image-defined user name. A bare uid is rejected as ambiguous. This replaces the `--user` flag plus a bind-mount of the host's `/etc/passwd` over the image's, which broke images defining their own users.
+  - Fix `EACCES` in `mounts[]`: those host directories were created owned by webcentral (often root) rather than by the project owner the container writes as.
+  - Fix `[podman] packages` being silently ignored since 2.1.0, installing nothing.
+  - Skip the image build entirely when the configuration and the base image are unchanged, instead of paying for a cached build on every on-demand start; a pulled base update still triggers a rebuild, and images left behind by older configurations are cleaned up.
+  - Fix a container outliving its webcentral wedging the project for good, as `run` then hit a name conflict on every restart.
 
 2026-07-28 (2.4.20):
-  - Added `--version` (`-V`), printing just the version number, and a `Starting webcentral <version>` line at the top of every run's log, so the running version can be identified from the logs
+  - Added `--version` (`-V`), printing just the version number, and a `Starting webcentral <version>` line at the top of every run's log, so the running version can be identified from the logs.
 
 2026-07-28 (2.4.19):
-  - Check that a domain actually resolves to this server (by fetching a token only this process can produce, over port 80) before ordering a certificate for it, instead of retrying ACME orders that can only fail. Reported per domain, and rechecked while a certificate is still valid, so a domain that stops pointing here is flagged long before its renewal fails
-  - The www/non-www counterpart is included in the domain's certificate only when it too points at this server, which is what made 2.4.18 downgrade to separate certificates. It is added (or dropped) on the next check, without waiting for renewal
-  - Fix requests still reaching the outgoing project for a moment after a file change was detected
-  - Connection and TLS handshake errors now name the client address they came from (and, for HTTPS, the requested domain), instead of only the error
-  - One log line per certificate per cycle, instead of one for the check, one for the validity and one for the acquisition
+  - Check that a domain actually resolves to this server (by fetching a token only this process can produce, over port 80) before ordering a certificate for it, instead of retrying ACME orders that can only fail. Reported per domain, and rechecked while a certificate is still valid, so a domain that stops pointing here is flagged long before its renewal fails.
+  - The www/non-www counterpart is included in the domain's certificate only when it too points at this server, which is what made 2.4.18 downgrade to separate certificates. It is added (or dropped) on the next check, without waiting for renewal.
+  - Fix requests still reaching the outgoing project for a moment after a file change was detected.
+  - Connection and TLS handshake errors now name the client address they came from (and, for HTTPS, the requested domain), instead of only the error.
+  - One log line per certificate per cycle, instead of one for the check, one for the validity and one for the acquisition.
 
 2026-07-28 (2.4.18):
-  - Request a separate certificate for the www/non-www counterpart of a domain instead of adding it as a second name on the domain's own certificate, which failed whenever that name wasn't pointed at this server. The counterpart certificate is requested on demand, the first time a TLS handshake asks for that name (so the first such handshake still fails, and the next one succeeds)
-  - Updated deps, fixing a remotely triggerable memory exhaustion in `quinn-proto` (RUSTSEC-2026-0185, high) that affects the HTTP/3 listener
+  - Request a separate certificate for the www/non-www counterpart of a domain instead of adding it as a second name on the domain's own certificate, which failed whenever that name wasn't pointed at this server. The counterpart certificate is requested on demand, the first time a TLS handshake asks for that name (so the first such handshake still fails, and the next one succeeds).
+  - Updated deps, fixing a remotely triggerable memory exhaustion in `quinn-proto` (RUSTSEC-2026-0185, high) that affects the HTTP/3 listener.
 
 2026-07-27 (2.4.17):
-  - Fix the HTTP/HTTPS listeners permanently going away after a transient `accept()` error (such as `EMFILE`): the accept loop returned, dropping the listening socket, while the process stayed alive so systemd never restarted it. Accept errors are now logged and retried, backing off 500ms on resource exhaustion
-  - Raise the open-file soft limit to the hard limit at startup, since systemd defaults services to 1024
+  - Fix the HTTP/HTTPS listeners permanently going away after a transient `accept()` error (such as `EMFILE`): the accept loop returned, dropping the listening socket, while the process stayed alive so systemd never restarted it. Accept errors are now logged and retried, backing off 500ms on resource exhaustion.
+  - Raise the open-file soft limit to the hard limit at startup, since systemd defaults services to 1024.
 
 2026-06-15 (2.4.16):
-  - Fix a freeze where a process ignoring SIGTERM was never SIGKILLed (the async `kill()` future was dropped), wedging the lifecycle so the app could not restart or reload
-  - Process kills can no longer block the lifecycle indefinitely
-  - Restart an app whose port has become unreachable on the next request, instead of disabling the domain
-  - Single startup attempt bounded by `startup_deadline` (default 30s → 60s); no forced early error while a startup is still in progress
+  - Fix a freeze where a process ignoring SIGTERM was never SIGKILLed (the async `kill()` future was dropped), wedging the lifecycle so the app could not restart or reload.
+  - Process kills can no longer block the lifecycle indefinitely.
+  - Restart an app whose port has become unreachable on the next request, instead of disabling the domain.
+  - Single startup attempt bounded by `startup_deadline` (default 30s → 60s); no forced early error while a startup is still in progress.
 
 2026-06-15 (2.4.15):
-  - Tear down a domain's watcher and lifecycle on removal/re-registration, instead of leaking zombie watchers
-  - Reload config changed while an app is idle, and deregister a domain when its directory is deleted
+  - Tear down a domain's watcher and lifecycle on removal/re-registration, instead of leaking zombie watchers.
+  - Reload config changed while an app is idle, and deregister a domain when its directory is deleted.
 
 2026-06-01 (2.4.14):
-  - Add www-prefixed variant to certificate for redirect
-  - Updates deps
+  - Add www-prefixed variant to certificate for redirect.
+  - Updates deps.
 
 2026-02-18 (2.4.13):
-  - Added X-Forwarded-For header and now also send X-Forwarded-Proto header when only doing forwarding (as opposed to proxying)
+  - Added X-Forwarded-For header and now also send X-Forwarded-Proto header when only doing forwarding (as opposed to proxying).
 
 2026-02-16 (2.4.12):
-  - Fix change-reload for symlinked project directories
+  - Fix change-reload for symlinked project directories.
 
 2026-02-11 (2.4.11):
- - Fix concurrent certificate acquisition bug where one domain's validation completion would clear HTTP-01 challenges for all in-flight domains
- - Improve ACME error logging to show full error chains
+ - Fix concurrent certificate acquisition bug where one domain's validation completion would clear HTTP-01 challenges for all in-flight domains.
+ - Improve ACME error logging to show full error chains.
 
 2026-01-19 (2.4.10):
- - Ensure webcentral.ini is always watched for changes, even when custom reload.include is specified
- - Don't log spurious errors when clients drop connections
+ - Ensure webcentral.ini is always watched for changes, even when custom reload.include is specified.
+ - Don't log spurious errors when clients drop connections.
 
 2026-01-16 (2.4.9):
  - When using Firejail, set $HOME to a volatile directory outside the project directory.
  - Show correct running time in dashboard.
 
 2026-01-15 (2.4.8):
- - Add `startup_deadline` config option (default 30s) for application startup timeout
- - Fix startup timeout blocking forever on hung applications
+ - Add `startup_deadline` config option (default 30s) for application startup timeout.
+ - Fix startup timeout blocking forever on hung applications.
 
 2026-01-15 (2.4.7):
- - Hardened Firejail sandboxing by using private-etc and more restrictive filesystem rules
- - Fix firejail UID handling when running as root
+ - Hardened Firejail sandboxing by using private-etc and more restrictive filesystem rules.
+ - Fix firejail UID handling when running as root.
 
 2026-01-10 (2.4.6):
- - WebSocket connections now prevent inactivity shutdown
- - Dashboard Idle column now shows number of active WebSockets
+ - WebSocket connections now prevent inactivity shutdown.
+ - Dashboard Idle column now shows number of active WebSockets.
 
 2026-01-06 (2.4.5):
- - Simplified release builds to musl-only static binaries
+ - Simplified release builds to musl-only static binaries.
 
 2026-01-06 (2.4.4):
- - Add `--systemd` flag to create and enable systemd service automatically
- - Changed default build target from musl to native for faster development builds
+ - Add `--systemd` flag to create and enable systemd service automatically.
+ - Changed default build target from musl to native for faster development builds.
 
 2026-01-06 (2.4.3):
- - Default to static musl builds for universal Linux compatibility
- - Updated README with pre-built binary installation instructions
+ - Default to static musl builds for universal Linux compatibility.
+ - Updated README with pre-built binary installation instructions.
 
 2026-01-06 (2.4.2):
- - Log directories and files now created with correct ownership (matching project user)
+ - Log directories and files now created with correct ownership (matching project user).
 
 2026-01-05 (2.4.1):
- - Dashboard shows port number for running apps
+ - Dashboard shows port number for running apps.
 
 2026-01-05 (2.4.0):
- - Add basic authentication with argon2 password hashing (`[auth]` section)
- - Persistent sessions via HTTP-only subdomain-scoped cookies
- - Logout endpoint at `/webcentral/logout`
- - `webcentral hash <password>` subcommand to generate password hashes
- - Disable 0-RTT resumption as it caused issues in some cases
+ - Add basic authentication with argon2 password hashing (`[auth]` section).
+ - Persistent sessions via HTTP-only subdomain-scoped cookies.
+ - Logout endpoint at `/webcentral/logout`.
+ - `webcentral hash <password>` subcommand to generate password hashes.
+ - Disable 0-RTT resumption as it caused issues in some cases.
 
 2026-01-04 (2.3.0):
- - Add dashboard project type (`type=dashboard`) showing server status, domain list, request counts, TLS certificate status, and uptime
+ - Add dashboard project type (`type=dashboard`) showing server status, domain list, request counts, TLS certificate status, and uptime.
 
 2026-01-04 (2.2.3):
- - Log which file triggered reload on file change
+ - Log which file triggered reload on file change.
 
 2026-01-04 (2.2.2):
- - Enable TLS 1.3 0-RTT session resumption for HTTPS and HTTP/3
+ - Enable TLS 1.3 0-RTT session resumption for HTTPS and HTTP/3.
 
 2026-01-04 (2.2.1):
- - Add HSTS header to all HTTPS responses
+ - Add HSTS header to all HTTPS responses.
 
 2026-01-04 (2.2.0):
- - HTTP/3 (QUIC) support - automatically enabled when HTTPS is active
- - HTTP/2 support via ALPN negotiation
+ - HTTP/3 (QUIC) support - automatically enabled when HTTPS is active.
+ - HTTP/2 support via ALPN negotiation.
 
 2026-01-03 (2.1.6):
- - Stream response bodies to clients (lower latency and memory usage)
+ - Stream response bodies to clients (lower latency and memory usage).
 
 2025-12-28 (2.1.5):
- - Fix potential app reload hang
+ - Fix potential app reload hang.
 
 2025-12-10 (2.1.4):
- - Static file server now sends MIME types based on file extensions
+ - Static file server now sends MIME types based on file extensions.
 
 2025-12-08 (2.1.3):
- - Fix config reload on file change (was reusing stale config)
- - Simplified process lifecycle: new Project replaces old, waits for predecessor to stop
+ - Fix config reload on file change (was reusing stale config).
+ - Simplified process lifecycle: new Project replaces old, waits for predecessor to stop.
 
 2025-12-08 (2.1.2):
- - Await process shutdown before restarting
- - More robust process lifecycle management
+ - Await process shutdown before restarting.
+ - More robust process lifecycle management.
 
 2025-12-02 (2.1.1):
- - Keep bindings.json up-to-date when domains are added/removed
- - Code reduction
+ - Keep bindings.json up-to-date when domains are added/removed.
+ - Code reduction.
 
 2025-11-27 (2.1.0):
- - Fix for unnecessary inotify watchers
- - Docker configurations without custom RUN commands or packages don't use a custom build anymore
- - Use Podman (preferred) it it's installed
- - No more Docker user mapping - root inside the container for compatibility
- - Exit immediately if ports cannot be bound
+ - Fix for unnecessary inotify watchers.
+ - Docker configurations without custom RUN commands or packages don't use a custom build anymore.
+ - Use Podman (preferred) it it's installed.
+ - No more Docker user mapping - root inside the container for compatibility.
+ - Exit immediately if ports cannot be bound.
 
 2025-11-26 (2.0.0):
  - Initial AI-driven Rust reimplementation of the [original Node.js version](https://github.com/vanviegen/webcentral/tree/nodejs). It was born out of Node.js dependency rot frustration. It also adds multi-threading, and should be fully compatible with original configuration format and project structure.
  - Added a test suite, mostly for catching configuration-change race conditions.
- - Configurable log retention (`--prune-logs`)
- - Proactive certificate acquisition for newly created projects (no longer awaiting the first request)
- - Added Procfile support (though no `release:` yet)
- - Added support for worker processes alongside main app process (not for Docker yet)
+ - Configurable log retention (`--prune-logs`).
+ - Proactive certificate acquisition for newly created projects (no longer awaiting the first request).
+ - Added Procfile support (though no `release:` yet).
+ - Added support for worker processes alongside main app process (not for Docker yet).
 
 See `git log` for further changes.
 

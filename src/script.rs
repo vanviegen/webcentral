@@ -21,6 +21,7 @@ use http::{HeaderName, HeaderValue, Request, Response};
 use http_body_util::combinators::BoxBody;
 use regex::Regex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::{Path, PathBuf};
 
 /// How a `match` compares: as a regex or as plain text, anchored to the whole value or not. The
@@ -33,8 +34,17 @@ pub enum Pattern {
     Literal { text: String, anchored: bool },
 }
 
+/// A statement, and the number that identifies it. The number is its index into the project's
+/// counters: every statement the interpreter reaches bumps one, which is what lets the status page
+/// say how often each line ran without the interpreter carrying anything else for its sake.
 #[derive(Debug, Clone)]
-pub enum Stmt {
+pub struct Stmt {
+    pub action: Action,
+    pub id: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum Action {
     Match {
         /// What is being tested - `$path` unless `subject=` says otherwise. An ordinary argument,
         /// so `subject=$host$path` tests the two joined together.
@@ -117,9 +127,9 @@ impl Pattern {
     }
 }
 
-/// One statement, flattened for display: what it is called, what it was given, and whatever it
-/// contains. Kept out of `Stmt` itself so the interpreter carries nothing for the dashboard's
-/// sake.
+/// One statement, flattened for display: what it is called, what it was given, whatever it
+/// contains, and how often it has run. Kept out of `Stmt` itself so the interpreter carries
+/// nothing for the dashboard's sake.
 pub struct Outline {
     pub verb: &'static str,
     pub args: Vec<String>,
@@ -129,16 +139,20 @@ pub struct Outline {
     /// Whether webcentral appended this rather than the file saying it. Worth marking: it is what
     /// answers when nothing above does, and it is the one line a reader cannot find in the file.
     pub implicit: bool,
+    /// How many times the statement ran. A conditional counts as run whether or not it held -
+    /// what it let through is the count on the statements inside it.
+    pub count: u64,
 }
 
 /// Flatten a script for display, keeping the nesting. Statements from `implicit_from` on were
-/// appended by webcentral rather than written.
-pub fn outline(stmts: &[Stmt], implicit_from: usize) -> Vec<Outline> {
+/// appended by webcentral rather than written; `counts` is the project's per-statement tally,
+/// indexed by `Stmt::id`.
+pub fn outline(stmts: &[Stmt], implicit_from: usize, counts: &[AtomicU64]) -> Vec<Outline> {
     stmts
         .iter()
         .enumerate()
         .map(|(index, stmt)| {
-            let mut outline = Outline::of(stmt);
+            let mut outline = Outline::of(stmt, counts);
             outline.implicit = index >= implicit_from;
             outline
         })
@@ -146,9 +160,9 @@ pub fn outline(stmts: &[Stmt], implicit_from: usize) -> Vec<Outline> {
 }
 
 impl Outline {
-    fn of(stmt: &Stmt) -> Outline {
-        let (verb, args, body, otherwise) = match stmt {
-            Stmt::Match { subject, pattern, body, otherwise } => {
+    fn of(stmt: &Stmt, counts: &[AtomicU64]) -> Outline {
+        let (verb, args, body, otherwise) = match &stmt.action {
+            Action::Match { subject, pattern, body, otherwise } => {
                 let mut args = vec![pattern.source()];
                 // Only worth showing when it isn't the default.
                 if subject.source() != "${path}" {
@@ -162,26 +176,26 @@ impl Outline {
                 }
                 ("match", args, Some(body), otherwise)
             }
-            Stmt::Set { name, value } => {
+            Action::Set { name, value } => {
                 ("set", vec![name.clone(), value.source()], None, &None)
             }
-            Stmt::ServeFile { path, fallthrough } => {
+            Action::ServeFile { path, fallthrough } => {
                 ("serve_file", with_fallthrough(vec![path.source()], *fallthrough), None, &None)
             }
-            Stmt::ServeDir { dir, index, fallthrough } => {
+            Action::ServeDir { dir, index, fallthrough } => {
                 let mut args = vec![dir.source()];
                 if index != "index.html" {
                     args.push(format!("index={}", index));
                 }
                 ("serve_dir", with_fallthrough(args, *fallthrough), None, &None)
             }
-            Stmt::ServeApp(name) => ("serve", vec![name.clone()], None, &None),
-            Stmt::Forward(target) => ("forward", vec![target.source()], None, &None),
-            Stmt::Proxy(target) => ("proxy", vec![target.source()], None, &None),
-            Stmt::Redirect { target, status } => {
+            Action::ServeApp(name) => ("serve", vec![name.clone()], None, &None),
+            Action::Forward(target) => ("forward", vec![target.source()], None, &None),
+            Action::Proxy(target) => ("proxy", vec![target.source()], None, &None),
+            Action::Redirect { target, status } => {
                 ("redirect", vec![target.source(), format!("status={}", status)], None, &None)
             }
-            Stmt::Respond { status, body, content_type } => {
+            Action::Respond { status, body, content_type } => {
                 let mut args = vec![status.to_string()];
                 if let Some(body) = body {
                     args.push(body.source());
@@ -193,26 +207,27 @@ impl Outline {
             }
             // The secret is deliberately not shown: the page can be reached by anyone the
             // project's script lets in, and it is the one thing on it worth stealing.
-            Stmt::CheckAuth { body, otherwise, .. } => {
+            Action::CheckAuth { body, otherwise, .. } => {
                 ("check_auth", vec!["…".to_string()], Some(body), otherwise)
             }
-            Stmt::CheckFile { path, body, otherwise } => {
+            Action::CheckFile { path, body, otherwise } => {
                 ("check_file", vec![path.source()], Some(body), otherwise)
             }
-            Stmt::SetHeader(name, value) => {
+            Action::SetHeader(name, value) => {
                 ("set_header", vec![name.clone(), value.source()], None, &None)
             }
-            Stmt::Log(message) => ("log", vec![message.source()], None, &None),
-            Stmt::Dashboard { admin } => {
+            Action::Log(message) => ("log", vec![message.source()], None, &None),
+            Action::Dashboard { admin } => {
                 (if *admin { "admin_dashboard" } else { "project_dashboard" }, Vec::new(), None, &None)
             }
         };
         Outline {
             verb,
             args,
-            body: body.map(|stmts| outline(stmts, usize::MAX)).unwrap_or_default(),
-            otherwise: otherwise.as_ref().map(|stmts| outline(stmts, usize::MAX)),
+            body: body.map(|stmts| outline(stmts, usize::MAX, counts)).unwrap_or_default(),
+            otherwise: otherwise.as_ref().map(|stmts| outline(stmts, usize::MAX, counts)),
             implicit: false,
+            count: counts.get(stmt.id).map_or(0, |c| c.load(Ordering::Relaxed)),
         }
     }
 }
@@ -226,16 +241,16 @@ fn with_fallthrough(mut args: Vec<String>, fallthrough: bool) -> Vec<String> {
 
 impl Stmt {
     pub fn is_fallible(&self) -> bool {
-        matches!(self, Stmt::Match { .. } | Stmt::CheckAuth { .. } | Stmt::CheckFile { .. })
+        matches!(self.action, Action::Match { .. } | Action::CheckAuth { .. } | Action::CheckFile { .. })
     }
 
     /// Attach an `else` branch. Fails for statements that can never decline, which would make the
     /// branch dead code.
     pub fn set_otherwise(&mut self, branch: Vec<Stmt>) -> bool {
-        match self {
-            Stmt::Match { otherwise, .. }
-            | Stmt::CheckAuth { otherwise, .. }
-            | Stmt::CheckFile { otherwise, .. } => *otherwise = Some(branch),
+        match &mut self.action {
+            Action::Match { otherwise, .. }
+            | Action::CheckAuth { otherwise, .. }
+            | Action::CheckFile { otherwise, .. } => *otherwise = Some(branch),
             _ => return false,
         }
         true
@@ -340,6 +355,15 @@ impl Template {
         Template(vec![Part::Variable(name.to_string())])
     }
 
+    /// What a bare `log` writes: the request, which is what a request log is for.
+    pub fn request_line() -> Template {
+        Template(vec![
+            Part::Variable("method".to_string()),
+            Part::Literal(" ".to_string()),
+            Part::Variable("path".to_string()),
+        ])
+    }
+
     pub fn render(&self, vars: &Vars) -> String {
         let mut out = String::new();
         for part in &self.0 {
@@ -358,13 +382,50 @@ impl Template {
 #[derive(Debug, Clone, Default)]
 pub struct Vars(HashMap<String, String>);
 
+/// The prefix that makes a variable a request header rather than a name somebody set.
+pub const HEADER_PREFIX: &str = "header:";
+
 impl Vars {
     pub fn get(&self, name: &str) -> &str {
+        // Header names are case-insensitive, so `${header:X-Forwarded-For}` and
+        // `${header:x-forwarded-for}` are the same variable; they are stored folded.
+        if let Some(header) = name.strip_prefix(HEADER_PREFIX) {
+            let folded = format!("{}{}", HEADER_PREFIX, header.to_ascii_lowercase());
+            return self.0.get(&folded).map(String::as_str).unwrap_or("");
+        }
         self.0.get(name).map(String::as_str).unwrap_or("")
     }
 
     pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
         self.0.insert(name.into(), value.into());
+    }
+
+    /// Copy in the headers the script actually reads, as `header:<name>`. Only those: a request
+    /// carries twenty of them and a script reads none, so copying them all would be a string
+    /// allocation apiece for nothing. Which ones are read is known when the file is parsed,
+    /// because a `${header:...}` name is always a literal.
+    ///
+    /// A header sent more than once is joined with `, `, which is what the HTTP specification says
+    /// a repeated field is equivalent to.
+    fn set_headers<B>(&mut self, req: &Request<B>, wanted: &[String]) {
+        for name in wanted {
+            let Ok(header) = http::header::HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            let mut values =
+                req.headers().get_all(&header).iter().filter_map(|value| value.to_str().ok());
+            let Some(first) = values.next() else { continue };
+            // The overwhelmingly common case is one value, which should not pay for a Vec.
+            let joined = match values.next() {
+                None => first.to_string(),
+                Some(second) => std::iter::once(first)
+                    .chain(std::iter::once(second))
+                    .chain(values)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            self.set(format!("{}{}", HEADER_PREFIX, name), joined);
+        }
     }
 
     /// Refresh the request's own variables. Called before the script runs and after every
@@ -425,34 +486,36 @@ pub struct Env<'a> {
     /// Whether this project may serve the server-wide dashboard: true when the project belongs
     /// to the user webcentral runs as, since that page shows every user's domains.
     pub admin_allowed: bool,
+    /// The request headers this project's script reads, and so the only ones worth copying.
+    pub read_headers: &'a [String],
+    /// One counter per statement, indexed by `Stmt::id`: an atomic increment on a slice element,
+    /// which is what makes counting every statement cheap enough to do on every request.
+    pub counts: &'a [AtomicU64],
 }
 
 /// The result of a run: what to do, plus response decorations gathered along the way.
 pub struct Outcome {
     pub terminal: Terminal,
     pub headers: Vec<(HeaderName, HeaderValue)>,
-    /// The kind of statement that decided this request, for the dashboard's tally. A name rather
-    /// than a line, because one flat count per kind says where requests go without the AST having
-    /// to carry an identity for every statement.
-    pub answered_by: &'static str,
 }
 
 struct Run<'a> {
     env: Env<'a>,
     vars: Vars,
     headers: Vec<(HeaderName, HeaderValue)>,
-    answered_by: &'static str,
 }
 
 /// Run `script` against `req`, mutating its URI as `rewrite` statements ask.
 pub async fn run<B>(script: &[Stmt], env: Env<'_>, vars: Vars, req: &mut Request<B>) -> Result<Outcome> {
-    let mut run = Run { env, vars, headers: Vec::new(), answered_by: "not found" };
+    let read_headers = env.read_headers;
+    let mut run = Run { env, vars, headers: Vec::new() };
+    run.vars.set_headers(req, read_headers);
     run.vars.set_request(req);
     let terminal = match run.block(script, req).await? {
         Some(terminal) => terminal,
         None => Terminal::Response(status_response(404, "Not Found")?),
     };
-    Ok(Outcome { terminal, headers: run.headers, answered_by: run.answered_by })
+    Ok(Outcome { terminal, headers: run.headers })
 }
 
 impl<'a> Run<'a> {
@@ -467,8 +530,11 @@ impl<'a> Run<'a> {
     }
 
     async fn stmt<B>(&mut self, stmt: &Stmt, req: &mut Request<B>) -> Result<Option<Terminal>> {
-        match stmt {
-            Stmt::Match { subject, pattern, body, otherwise } => {
+        if let Some(count) = self.env.counts.get(stmt.id) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        match &stmt.action {
+            Action::Match { subject, pattern, body, otherwise } => {
                 let value = subject.render(&self.vars);
                 let matched = match pattern {
                     Pattern::Regex(regex) => match regex.captures(&value) {
@@ -492,7 +558,7 @@ impl<'a> Run<'a> {
                 }
             }
 
-            Stmt::Set { name, value } => {
+            Action::Set { name, value } => {
                 let rendered = value.render(&self.vars);
                 // `path`, `query` and `uri` are not copies of the request - they *are* the
                 // request, so assigning one changes what gets served or forwarded. Everything
@@ -507,7 +573,7 @@ impl<'a> Run<'a> {
                 Ok(None)
             }
 
-            Stmt::ServeFile { path, fallthrough } => {
+            Action::ServeFile { path, fallthrough } => {
                 let rendered = path.render(&self.vars);
                 let file = match resolve_below(self.env.dir, &rendered) {
                     Some(file) => file,
@@ -515,14 +581,13 @@ impl<'a> Run<'a> {
                 };
                 match read_file(&file, req).await? {
                     Some(response) => {
-                        self.answered_by = "serve_file";
                         Ok(Some(Terminal::Response(response)))
                     }
                     None => self.not_found(*fallthrough),
                 }
             }
 
-            Stmt::ServeDir { dir, index, fallthrough } => {
+            Action::ServeDir { dir, index, fallthrough } => {
                 let rendered = dir.render(&self.vars);
                 let Some(base) = resolve_below(self.env.dir, &rendered) else {
                     return self.not_found(*fallthrough);
@@ -544,38 +609,32 @@ impl<'a> Run<'a> {
 
                 match read_file(&file, req).await? {
                     Some(response) => {
-                        self.answered_by = "serve_dir";
                         Ok(Some(Terminal::Response(response)))
                     }
                     None => self.not_found(*fallthrough),
                 }
             }
 
-            Stmt::ServeApp(name) => {
-                self.answered_by = "serve";
+            Action::ServeApp(name) => {
                 Ok(Some(Terminal::ServeApp(name.clone())))
             },
 
-            Stmt::Forward(target) => {
-                self.answered_by = "forward";
+            Action::Forward(target) => {
                 Ok(Some(Terminal::Forward(target.render(&self.vars))))
             },
 
-            Stmt::Proxy(target) => {
-                self.answered_by = "proxy";
+            Action::Proxy(target) => {
                 Ok(Some(Terminal::Proxy(target.render(&self.vars))))
             },
 
-            Stmt::Redirect { target, status } => {
-                self.answered_by = "redirect";
+            Action::Redirect { target, status } => {
                 let location = target.render(&self.vars);
                 Ok(Some(Terminal::Response(
                     Response::builder().status(*status).header("Location", location).body(empty_body())?,
                 )))
             }
 
-            Stmt::Respond { status, body, content_type } => {
-                self.answered_by = "respond";
+            Action::Respond { status, body, content_type } => {
                 let text = match body {
                     Some(template) => template.render(&self.vars),
                     None => default_reason(*status).to_string(),
@@ -588,7 +647,7 @@ impl<'a> Run<'a> {
                 )))
             }
 
-            Stmt::CheckAuth { secret, body, otherwise } => {
+            Action::CheckAuth { secret, body, otherwise } => {
                 if secret_matches(secret, presented_secret(req).as_deref()) {
                     self.block(body, req).await
                 } else {
@@ -599,7 +658,7 @@ impl<'a> Run<'a> {
                 }
             }
 
-            Stmt::CheckFile { path, body, otherwise } => {
+            Action::CheckFile { path, body, otherwise } => {
                 let rendered = path.render(&self.vars);
                 let exists = match resolve_below(self.env.dir, &rendered) {
                     Some(file) => tokio::fs::metadata(&file)
@@ -618,7 +677,7 @@ impl<'a> Run<'a> {
                 }
             }
 
-            Stmt::SetHeader(name, value) => {
+            Action::SetHeader(name, value) => {
                 let rendered = value.render(&self.vars);
                 match (HeaderName::try_from(name.as_str()), HeaderValue::from_str(&rendered)) {
                     (Ok(name), Ok(value)) => self.headers.push((name, value)),
@@ -630,19 +689,18 @@ impl<'a> Run<'a> {
                 Ok(None)
             }
 
-            Stmt::Log(message) => {
+            Action::Log(message) => {
                 self.env.logger.write("script", &message.render(&self.vars));
                 Ok(None)
             }
 
-            Stmt::Dashboard { admin } => {
+            Action::Dashboard { admin } => {
                 if *admin && !self.env.admin_allowed {
                     return Ok(Some(Terminal::Response(status_response(
                         403,
                         "admin_dashboard is only served for projects owned by the user running webcentral",
                     )?)));
                 }
-                self.answered_by = "dashboard";
                 let filter = if *admin { None } else { Some(self.env.domain) };
                 Ok(Some(Terminal::Response(crate::dashboard::render(filter)?)))
             }

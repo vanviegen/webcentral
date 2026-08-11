@@ -17,8 +17,10 @@ request entry point (running the script, then forwarding/proxying/upgrading as i
 command construction, container user/ownership policy
 
 `src/script.rs` - The routing script: statement AST, capture scoping, templates, and the
-interpreter. Also static-file resolution (streamed, with `Range`/`If-Range` support) and the
-`check_auth` secret comparison
+interpreter. A `Stmt` is an `Action` plus an `id` - its index into the project's per-statement
+counters, which the interpreter bumps as it reaches each one (one relaxed atomic add, so counting
+every statement of every request is free enough to always do). Also static-file resolution
+(streamed, with `Range`/`If-Range` support) and the `check_auth` secret comparison
 
 `src/config.rs` - The configuration model and the parser for `webcentral.conf`; auto-detection
 synthesises the same language rather than a separate code path. Only a `Dockerfile` (which answers
@@ -38,16 +40,36 @@ re-pointing *everything* a child inherits that could name the wrong user: the XD
 container config overrides, and the working directory
 
 `src/dashboard.rs` - The built-in status page. A section per project rather than a row, since a
-project is a script, some services and their sidecars rather than one thing with a type: each
-service's image/command/state/port and counts, its sidecars nested under it with the
-`<name>.internal:<port>` their peers use, a tally of which *kind* of statement answered, and the
-script itself as a nested list. A `forward` or `proxy` target is deliberately *not* listed as a
-service: it has no lifecycle to report, and the routing section already says where it goes. On the admin page each
-project folds away behind its domain/TLS/request-count line; a project's own page does not fold. The script is rendered from the AST (`script::outline`) rather
-than from the file, so it shows what actually runs - including the implicit tail, which is marked
-as such because it is the one statement a reader cannot find in the file. `check_auth`'s secret is
-never rendered. The tally is per kind rather than per statement, so no statement has to carry an
-identity; `script::Outcome::answered_by` names it as the terminal is produced
+project is a script, some services and their sidecars rather than one thing with a type. Each
+project is one table of labelled rows - problems, directory, owner, config files, settings, a row
+per service, routing, headers read - so the same thing is in the same place on every project, and
+a row with nothing to say is left out rather than saying "none". Settings show their *effective*
+value with webcentral's own default marked, since "unset" is not an answer to what a request does.
+
+Settings are a nested table too, a row per setting. A service's row holds one of the same shape
+(image, command, state, port, project dir, user,
+mounts, packages, build, copies, timeouts, reload rules, environment), and a sidecar's row inside
+*that* holds another - so the nesting on the page is the nesting in the configuration, and a
+sidecar simply has no rows for the questions its parent answers (state, timeouts, reload rules).
+A row no service answers is dropped, which is what keeps a two-line project from showing sixteen
+empty ones. `Port` is one row rather than three, since the container port, the host port and the
+`<name>.internal` address are the same question asked from three places. `user = project` is
+rendered as the owner's *name*: "runs as image" is not a user anybody has. Environment values have
+their middle masked (`project::mask`; values under 12 characters are shown whole, being ports and
+modes rather than secrets). Reload patterns are marked as webcentral's or the service's own
+(`project::mark_defaults`) and a `default` tag is put after each run of webcentral's rather than
+after each pattern - but only when the whole default set is there, since a service that named
+`src` itself said so. A `forward` or `proxy` target is deliberately *not* listed as a service: it
+has no lifecycle to report, and the routing row already says where it goes.
+
+The script is rendered from the AST (`script::outline`) rather than from the file, so it shows
+what actually runs - including the implicit tail, tagged as such because it is the one statement a
+reader cannot find in the file. Each statement carries how many times it *ran* - a conditional
+counts whether or not it held, and what it let through is the count on the statements inside it.
+Zero is worth seeing, being a rule in the wrong place. Nesting is shown by the rule down the left
+rather than by shrinking the text. `check_auth`'s secret is never rendered. On the admin page each
+project folds away behind its domain/TLS/how-many-services-are-up/request-count line; a project's
+own page does not fold
 
 `src/logger.rs` - Daily-rotated logs with configurable retention
 
@@ -92,19 +114,33 @@ which is what lets `${1}` end one and `x{2}` be a quantifier. Every name a templ
 collected and checked at the end against everything the file defines, so a typo is reported
 rather than being silently empty.
 
-A `settings` block holds the four things that belong to the project rather than to a service or a
-request: `redirect_http`, `redirect_https`, and the two `reload_` defaults. There is no
-`log_requests` - a `log` statement at the top of the script says it, in the project's own words and
-behind a `match` if only some requests are worth recording. Settings stay in a block rather than
-becoming top-level `key = value` lines, because which shape a line has must follow from the
-enclosing block: allowing both at the top level would make a bare `=` significant outside a
-settings block, which is exactly what keeps `=` ordinary in patterns and secrets.
+A `settings` block holds what belongs to the project rather than to a service or a request:
+`redirect_http` and `redirect_https`. Reload rules live in the service they restart, not here.
+There is no `log_requests` - a bare `log` writes `${method} ${path}`, behind a `match` when only
+some requests are worth recording. Settings stay in a block rather than becoming top-level
+`key = value` lines, because which shape a line has must follow from the enclosing block: allowing
+both at the top level would make a bare `=` significant outside a settings block, which is exactly
+what keeps `=` ordinary in patterns and secrets.
+
+`${header:Name}` reads a request header, folded to lower case. Only the headers the file actually
+names are copied into `Vars` (`ProjectConfig::read_headers`, gathered from the same reference list
+the never-set check uses): a `${header:...}` name is always a literal, since `${` is not recognised
+inside one, so the set is known at parse time and a script that reads none costs a request nothing.
+`set` refuses one, since `set_header` writes the *response*.
+
+`env_file` keys are `${env:KEY}`; `prefix=` names another and `prefix=` alone drops it. A bare
+`KEY` in an `env` block means `KEY = ${env:KEY}`, and is an error when nothing sets that.
 
 `env_file <path>` reads `KEY=value` lines into those same constants, in file order like `set`, so
 a secret lives outside `webcentral.conf` and reaches only what names it - nothing is injected into
 any process by itself. The path must be inside the project directory (an absolute one would let a
-project read anything a root webcentral can), it joins `config_files` so editing it reloads the
-project, and nothing it defines is injected anywhere by itself.
+project read anything a root webcentral can), and it joins `config_files` so editing it reloads
+the project.
+
+A `.env` beside the configuration is read *before* it without being asked (`DEFAULT_ENV_FILE`), so
+the file can still override what it defines. Safe as a convention precisely because the keys are
+namespaced and nothing an env file defines reaches a process by itself. A line it cannot read is a
+warning rather than an error, since nobody asked for the file (`Builder::env_problem`).
 
 **Container environment** is handed over through podman's *own* environment: `add_env_args` sets
 each variable on the `podman run` child and names it with a valueless `-e NAME`. `podman run`

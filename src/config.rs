@@ -15,7 +15,7 @@
 //! directory exists - so a project with no configuration at all still does the obvious thing.
 
 use crate::parser::{is_argument_name, Diagnostic, Scanner, Word};
-use crate::script::{Pattern, Stmt, Template, Vars};
+use crate::script::{Action, Pattern, Stmt, Template, Vars};
 use anyhow::Result;
 use regex::Regex;
 
@@ -23,6 +23,14 @@ use std::fs;
 use std::path::Path;
 
 pub const CONFIG_FILE: &str = "webcentral.conf";
+
+/// What an `env_file`'s keys are called unless the statement says otherwise.
+pub const ENV_PREFIX: &str = "env:";
+
+/// Read without being asked, when it is there. `${env:...}` is namespaced and nothing an
+/// `env_file` defines is injected into a process by itself, so a `.env` costs a project that has
+/// one nothing and saves it a line.
+pub const DEFAULT_ENV_FILE: &str = ".env";
 
 /// Request variables that only ever describe what arrived, so `set` refuses them. `path` and
 /// `query` are deliberately absent: assigning those is how a request is re-pointed.
@@ -127,7 +135,8 @@ pub struct ServerConfig {
     pub shutdown_time: u64,
     /// Seconds to wait for the port to answer before declaring the startup failed.
     pub startup_time: u64,
-    /// Which files restart this server. Defaults to the project's `settings`, then to everything.
+    /// Which files restart this server. Defaults to `DEFAULT_INCLUDES`, or to everything for a
+    /// service built from a Dockerfile.
     pub reload_include: Vec<String>,
     pub reload_exclude: Vec<String>,
     /// Services started and stopped with this one - a database, a cache, a queue runner. Each gets
@@ -201,18 +210,22 @@ pub struct ProjectConfig {
     /// Files that reload the entire project when touched (the config, and whatever was
     /// auto-detected in its absence).
     pub config_files: Vec<String>,
-    /// The default reload rules for servers that declare none of their own.
-    pub reload_include: Vec<String>,
-    pub reload_exclude: Vec<String>,
     /// Problems that stop something from working, which `webcentral check` fails on.
     pub errors: Vec<String>,
     /// Things worth saying that the project still runs with, which it does not.
     pub warnings: Vec<String>,
     /// Where the configuration came from - the file itself, or what was detected in its absence.
     pub source_name: String,
+    /// The request headers the script reads, folded to lower case. A `${header:...}` name is
+    /// always a literal - `${` is not recognised inside one - so the whole set is known here, and
+    /// a request copies these and nothing else.
+    pub read_headers: Vec<String>,
     /// Where the implicit tail starts in `script` - everything from here was appended by
     /// webcentral rather than written in the file.
     pub implicit_from: usize,
+    /// How many statements the script has, nested ones included: the number of counters a project
+    /// needs, and the number every `Stmt::id` is below.
+    pub stmt_count: usize,
 }
 
 impl ProjectConfig {
@@ -297,15 +310,11 @@ impl ProjectConfig {
 
         add_implicit_tail(&mut config);
 
-        // Reload rules fall back to the project's settings and then to everything, and are only
-        // resolved now because a `settings` block may come after the servers it applies to.
-        let (default_include, default_exclude) =
-            (config.reload_include.clone(), config.reload_exclude.clone());
+        // What restarts a service belongs to that service: it is the thing being restarted, and a
+        // project with two of them rarely wants the same rules for both.
         for server in &mut config.servers {
             if server.reload_include.is_empty() {
-                server.reload_include = if !default_include.is_empty() {
-                    default_include.clone()
-                } else if server.dockerfile.is_some() {
+                server.reload_include = if server.dockerfile.is_some() {
                     // The build context is the whole directory, so anything in it can change what
                     // the image *is* - unlike a mounted service, where only program text matters
                     // because everything else is read from disk as it stands.
@@ -325,7 +334,6 @@ impl ProjectConfig {
                 .collect();
             server.reload_include.extend(copied);
 
-            server.reload_exclude.extend(default_exclude.iter().cloned());
             server.reload_exclude.extend(DEFAULT_EXCLUDES.iter().map(|s| s.to_string()));
             // A change to one of these replaces the project rather than restarting a server.
             server.reload_exclude.extend(PROJECT_FILES.iter().map(|f| format!("/{}", f)));
@@ -335,22 +343,31 @@ impl ProjectConfig {
     }
 }
 
+/// Give a statement the number that identifies it for the rest of the project's life: its index
+/// into the per-statement counters the interpreter bumps. One counter per statement, so the
+/// numbers have to be dense and unique - which is all `stmt_count` is.
+fn number(config: &mut ProjectConfig, action: Action) -> Stmt {
+    let id = config.stmt_count;
+    config.stmt_count += 1;
+    Stmt { action, id }
+}
+
 /// Whether the script already decides how some request is answered. Tells a configuration that
 /// only tweaks settings from one that takes over routing.
 fn serves_anything(stmts: &[Stmt]) -> bool {
     walk(stmts, &mut |stmt| {
         matches!(
-            stmt,
-            Stmt::Match { .. }
-                | Stmt::ServeApp(_)
-                | Stmt::ServeDir { .. }
-                | Stmt::ServeFile { .. }
-                | Stmt::Forward(_)
-                | Stmt::Proxy(_)
-                | Stmt::Redirect { .. }
-                | Stmt::Respond { .. }
-                | Stmt::Dashboard { .. }
-                | Stmt::CheckFile { .. }
+            stmt.action,
+            Action::Match { .. }
+                | Action::ServeApp(_)
+                | Action::ServeDir { .. }
+                | Action::ServeFile { .. }
+                | Action::Forward(_)
+                | Action::Proxy(_)
+                | Action::Redirect { .. }
+                | Action::Respond { .. }
+                | Action::Dashboard { .. }
+                | Action::CheckFile { .. }
         )
     })
 }
@@ -362,18 +379,23 @@ fn serves_anything(stmts: &[Stmt]) -> bool {
 fn add_implicit_tail(config: &mut ProjectConfig) {
     config.implicit_from = config.script.len();
     if config.server("default").is_some() {
-        config.script.push(Stmt::ServeApp("default".to_string()));
+        let stmt = number(config, Action::ServeApp("default".to_string()));
+        config.script.push(stmt);
         return;
     }
     // Not conditional on the directory existing *now*: the configuration is read when a project
     // appears, which for a deploy is before its files have landed, and a tail chosen then would
     // go on 404ing after they did. `serve_dir` on a directory that isn't there answers 404 by
     // itself, which is what the alternative did anyway.
-    config.script.push(Stmt::ServeDir {
-        dir: Template::literal("public"),
-        index: "index.html".to_string(),
-        fallthrough: false,
-    });
+    let stmt = number(
+        config,
+        Action::ServeDir {
+            dir: Template::literal("public"),
+            index: "index.html".to_string(),
+            fallthrough: false,
+        },
+    );
+    config.script.push(stmt);
 }
 
 /// Synthesise a server declaration for a project that doesn't configure one, from its
@@ -486,7 +508,7 @@ const CHECK_AUTH: Signature = Signature {
 };
 const SET_HEADER: Signature =
     sig(&[req("name", Kind::Word), req("value", Kind::Template)], &[]);
-const LOG: Signature = sig(&[req("message", Kind::Template)], &[]);
+const LOG: Signature = sig(&[opt("message", Kind::Template)], &[]);
 const DASHBOARD: Signature = sig(&[], &[]);
 
 /// The signature of every routing statement.
@@ -584,12 +606,12 @@ pub fn parse(source: &str, dir: Option<&Path>) -> ProjectConfig {
             script: Vec::new(),
             vars: Vars::default(),
             config_files: vec![CONFIG_FILE.to_string()],
-            reload_include: Vec::new(),
-            reload_exclude: Vec::new(),
             errors: Vec::new(),
             warnings: Vec::new(),
             source_name: CONFIG_FILE.to_string(),
+            read_headers: Vec::new(),
             implicit_from: 0,
+            stmt_count: 0,
         },
         vars: Vars::default(),
         referenced: Vec::new(),
@@ -607,6 +629,14 @@ pub fn parse(source: &str, dir: Option<&Path>) -> ProjectConfig {
             .collect(),
         served: Vec::new(),
     };
+
+    // A `.env` beside the configuration is read before it, so `${env:KEY}` works without a line
+    // saying so and the file can still override what it defines. Safe to do by convention because
+    // the keys are namespaced and nothing is injected into any process by itself: a value reaches
+    // exactly what names it, the same as an `env_file` written out.
+    if builder.dir.as_ref().is_some_and(|dir| dir.join(DEFAULT_ENV_FILE).is_file()) {
+        builder.load_env_file(DEFAULT_ENV_FILE, ENV_PREFIX, None);
+    }
 
     let script = builder.statements(true);
     builder.config.script = script;
@@ -634,7 +664,7 @@ impl<'a> Builder<'a> {
         for server in &self.config.servers {
             let name = &server.name;
             let served = name == "default"
-                || walk(&self.config.script, &mut |s| matches!(s, Stmt::ServeApp(n) if n == name));
+                || walk(&self.config.script, &mut |s| matches!(&s.action, Action::ServeApp(n) if n == name));
             if !served {
                 warnings.push(format!(
                     "server '{}' is declared but never served - add 'serve {}'",
@@ -647,6 +677,15 @@ impl<'a> Builder<'a> {
         // is intent. The check is file-wide rather than per branch: knowing a name is defined
         // *somewhere* is enough to keep it from being a mistake, and avoids false alarms.
         for (name, pos) in std::mem::take(&mut self.referenced) {
+            // Whatever a request happens to carry, so there is nothing to check it against - but
+            // worth remembering, since a header nobody reads should cost a request nothing.
+            if let Some(header) = name.strip_prefix(crate::script::HEADER_PREFIX) {
+                let folded = header.to_ascii_lowercase();
+                if !self.config.read_headers.contains(&folded) {
+                    self.config.read_headers.push(folded);
+                }
+                continue;
+            }
             if !self.defined.contains(&name) {
                 self.scanner.error_at(
                     pos,
@@ -867,15 +906,26 @@ impl<'a> Builder<'a> {
                     self.scanner.skip_line();
                     return;
                 }
-                match self.scanner.read_word() {
-                    Some(word) => {
-                        let path = self.expand(&word);
-                        self.load_env_file(&path, word.pos);
+                let Some(word) = self.scanner.read_word() else {
+                    self.scanner
+                        .error_at(verb.pos, "'env_file' needs a file to read".to_string());
+                    return;
+                };
+                let path = self.expand(&word);
+                // `${env:KEY}` by default: it says where a value came from, keeps a file's keys
+                // from colliding with a `set` constant or with another file's, and reads like
+                // `${header:...}`. `prefix=` names another, and `prefix=` on its own drops it.
+                let mut prefix = ENV_PREFIX.to_string();
+                if let Some(next) = self.scanner.read_word() {
+                    match next.text.split_once('=') {
+                        Some(("prefix", value)) => prefix = value.to_string(),
+                        _ => self.scanner.error_at(
+                            next.pos,
+                            format!("Unknown argument '{}' - env_file takes only 'prefix='", next.text),
+                        ),
                     }
-                    None => self
-                        .scanner
-                        .error_at(verb.pos, "'env_file' needs a file to read".to_string()),
                 }
+                self.load_env_file(&path, &prefix, Some(word.pos));
             }
             "else" => {
                 let Some(branch) = self.body(&verb) else { return };
@@ -896,17 +946,17 @@ impl<'a> Builder<'a> {
                 }
             }
             _ => {
-                if let Some(stmt) = self.action(&verb) {
+                if let Some(action) = self.action(&verb) {
                     // A `set` at the top level doubles as a constant: everything the parser reads
                     // after it can use the value, and it is re-evaluated per request as well, so
                     // `set now $path` still means what it says.
                     if top {
-                        if let Stmt::Set { name, value } = &stmt {
+                        if let Action::Set { name, value } = &action {
                             let rendered = value.render(&self.vars);
                             self.vars.set(name.clone(), rendered);
                         }
                     }
-                    stmts.push(stmt);
+                    stmts.push(number(&mut self.config, action));
                 }
             }
         }
@@ -915,11 +965,13 @@ impl<'a> Builder<'a> {
     /// Read `KEY=value` lines into the file's constants, so a secret can live somewhere that is
     /// not the configuration - and reach exactly the `env` blocks and statements that name it,
     /// rather than every process. Values are taken as written: a secret is not a template.
-    fn load_env_file(&mut self, path: &str, pos: usize) {
+    /// `pos` is where the statement asking for it stands, and `None` when nothing asked - the
+    /// `.env` read by convention, whose problems are this file's rather than the configuration's.
+    fn load_env_file(&mut self, path: &str, prefix: &str, pos: Option<usize>) {
         // The same containment rule as `copy`. Under a root webcentral an absolute path would let
         // any project read any file on the machine.
         if path.starts_with('/') || Path::new(path).components().any(|c| c.as_os_str() == "..") {
-            self.scanner.error_at(
+            self.env_problem(
                 pos,
                 format!("'{}' is outside the project directory - env_file can only read within it", path),
             );
@@ -929,7 +981,7 @@ impl<'a> Builder<'a> {
         let content = match fs::read_to_string(dir.join(path)) {
             Ok(content) => content,
             Err(e) => {
-                self.scanner.error_at(pos, format!("Could not read '{}': {}", path, e));
+                self.env_problem(pos, format!("Could not read '{}': {}", path, e));
                 return;
             }
         };
@@ -943,7 +995,7 @@ impl<'a> Builder<'a> {
             }
             let Some((key, value)) = line.strip_prefix("export ").unwrap_or(line).split_once('=')
             else {
-                self.scanner.error_at(
+                self.env_problem(
                     pos,
                     format!("{} line {}: expected 'KEY=value'", path, number + 1),
                 );
@@ -957,8 +1009,19 @@ impl<'a> Builder<'a> {
                 .and_then(|v| v.strip_suffix('"'))
                 .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
                 .unwrap_or(value);
-            self.vars.set(key, value);
-            self.defined.insert(key.to_string());
+            let name = format!("{}{}", prefix, key);
+            self.vars.set(name.clone(), value);
+            self.defined.insert(name);
+        }
+    }
+
+    /// Something wrong with an env file. A statement named it, so it is a configuration error;
+    /// nothing did, so it is a warning about a file webcentral went looking for by itself, and the
+    /// project runs on without whatever that line was going to define.
+    fn env_problem(&mut self, pos: Option<usize>, message: String) {
+        match pos {
+            Some(pos) => self.scanner.error_at(pos, message),
+            None => self.config.warnings.push(message),
         }
     }
 
@@ -1000,7 +1063,7 @@ impl<'a> Builder<'a> {
 
     // --- Routing statements ---
 
-    fn action(&mut self, verb: &Word) -> Option<Stmt> {
+    fn action(&mut self, verb: &Word) -> Option<Action> {
         let Some(signature) = signature(&verb.text) else {
             self.scanner.error_at(verb.pos, format!("Unknown statement '{}'", verb.text));
             self.scanner.skip_line();
@@ -1022,6 +1085,17 @@ impl<'a> Builder<'a> {
                 // `path`, `query` and `uri` are the request itself, so assigning one changes what
                 // is served or forwarded. The rest of the request's variables describe what
                 // arrived and cannot be rewritten into something else.
+                if name.text.starts_with(crate::script::HEADER_PREFIX) {
+                    self.scanner.error_at(
+                        name.pos,
+                        format!(
+                            "'{}' is a header the request arrived with and cannot be set; \
+                             'set_header' sets one on the response",
+                            name.text
+                        ),
+                    );
+                    return None;
+                }
                 if READ_ONLY_VARS.contains(&name.text.as_str()) {
                     self.scanner.error_at(
                         name.pos,
@@ -1046,22 +1120,22 @@ impl<'a> Builder<'a> {
                     }
                 }
                 self.defined.insert(name.text.clone());
-                Some(Stmt::Set { name: name.text, value })
+                Some(Action::Set { name: name.text, value })
             }
 
             "serve" => {
                 // The name is remembered for a cross-check once every server has been declared.
                 let name = args.word("server").unwrap_or(Word::new("default", verb.pos));
                 self.served.push(name.clone());
-                Some(Stmt::ServeApp(name.text))
+                Some(Action::ServeApp(name.text))
             }
 
-            "serve_file" => Some(Stmt::ServeFile {
+            "serve_file" => Some(Action::ServeFile {
                 path: args.template("path")?,
                 fallthrough: self.flag(&mut args, "fallthrough")?,
             }),
 
-            "serve_dir" => Some(Stmt::ServeDir {
+            "serve_dir" => Some(Action::ServeDir {
                 dir: args.template("dir")?,
                 index: args.text("index").unwrap_or_else(|| "index.html".to_string()),
                 fallthrough: self.flag(&mut args, "fallthrough")?,
@@ -1070,7 +1144,7 @@ impl<'a> Builder<'a> {
             "check_file" => {
                 let path = args.template("path")?;
                 let body = self.body(verb)?;
-                Some(Stmt::CheckFile { path, body, otherwise: None })
+                Some(Action::CheckFile { path, body, otherwise: None })
             }
 
             "forward" => {
@@ -1081,7 +1155,7 @@ impl<'a> Builder<'a> {
                         return None;
                     }
                 }
-                Some(Stmt::Forward(target))
+                Some(Action::Forward(target))
             }
 
             "proxy" => {
@@ -1092,18 +1166,22 @@ impl<'a> Builder<'a> {
                         return None;
                     }
                 }
-                Some(Stmt::Proxy(url))
+                Some(Action::Proxy(url))
             }
-            "log" => Some(Stmt::Log(args.template("message")?)),
-            "project_dashboard" => Some(Stmt::Dashboard { admin: false }),
-            "admin_dashboard" => Some(Stmt::Dashboard { admin: true }),
+            // Bare `log` writes the request, which is what a request log is; anything else is
+            // said by giving it something to say.
+            "log" => Some(Action::Log(
+                args.template("message").unwrap_or_else(Template::request_line),
+            )),
+            "project_dashboard" => Some(Action::Dashboard { admin: false }),
+            "admin_dashboard" => Some(Action::Dashboard { admin: true }),
 
-            "redirect" => Some(Stmt::Redirect {
+            "redirect" => Some(Action::Redirect {
                 target: args.template("url")?,
                 status: args.status("status").unwrap_or(302),
             }),
 
-            "respond" => Some(Stmt::Respond {
+            "respond" => Some(Action::Respond {
                 status: args.status("status")?,
                 body: args.template("body"),
                 content_type: args
@@ -1114,7 +1192,7 @@ impl<'a> Builder<'a> {
             "check_auth" => {
                 let secret = args.text("secret")?;
                 let body = self.body(verb)?;
-                Some(Stmt::CheckAuth { secret, body, otherwise: None })
+                Some(Action::CheckAuth { secret, body, otherwise: None })
             }
 
             "set_header" => {
@@ -1125,7 +1203,7 @@ impl<'a> Builder<'a> {
                         .error_at(name.pos, format!("'{}' is not a valid header name", name.text));
                     return None;
                 }
-                Some(Stmt::SetHeader(name.text, args.template("value")?))
+                Some(Action::SetHeader(name.text, args.template("value")?))
             }
 
             other => unreachable!("no handler for '{}', which has a signature", other),
@@ -1151,7 +1229,7 @@ impl<'a> Builder<'a> {
     /// `match` compares one variable against one pattern. The variable is `path` unless
     /// `subject=` names another, and the pattern is a regex unless `matcher=literal` says
     /// otherwise. Everything after the pattern is the body.
-    fn match_statement(&mut self, verb: &Word, mut args: Args) -> Option<Stmt> {
+    fn match_statement(&mut self, verb: &Word, mut args: Args) -> Option<Action> {
         let subject = args.template("subject").unwrap_or_else(|| Template::variable("path"));
         let literal = match args.word("matcher") {
             Some(word) => match word.text.as_str() {
@@ -1232,7 +1310,7 @@ impl<'a> Builder<'a> {
         };
 
         let body = self.body(verb)?;
-        Some(Stmt::Match { subject, pattern, body, otherwise: None })
+        Some(Action::Match { subject, pattern, body, otherwise: None })
     }
 
     // --- Declarations ---
@@ -1353,14 +1431,6 @@ impl<'a> Builder<'a> {
         self.each_setting(|me, key| match key.text.as_str() {
             "redirect_http" => me.config.redirect_http = me.bool_value(),
             "redirect_https" => me.config.redirect_https = me.bool_value(),
-            "reload_include" => {
-                let list = me.word_list();
-                me.config.reload_include.extend(list);
-            }
-            "reload_exclude" => {
-                let list = me.word_list();
-                me.config.reload_exclude.extend(list);
-            }
             other => {
                 me.scanner.error_at(key.pos, format!("Unknown setting '{}'", other));
                 me.scanner.skip_line();
@@ -1368,16 +1438,41 @@ impl<'a> Builder<'a> {
         });
     }
 
+    /// An `env { }` block: `KEY = value` lines, and bare `KEY` for the common case of passing on
+    /// a secret of the same name - `KEY` alone means `KEY = ${env:KEY}`, so the name is written
+    /// once rather than three times.
     fn map_block(&mut self) -> Vec<(String, String)> {
         let mut entries = Vec::new();
-        self.each_setting(|me, key| {
-            let value = match me.scanner.read_word() {
-                Some(word) => me.expand(&word),
+        loop {
+            self.scanner.skip_separators();
+            if self.scanner.read_block_close() || self.scanner.at_eof() {
+                return entries;
+            }
+            let Some(key) = self.scanner.read_key() else { continue };
+            if !self.scanner.read_eq() {
+                let name = format!("{}{}", ENV_PREFIX, key.text);
+                if !self.defined.contains(&name) {
+                    self.scanner.error_at(
+                        key.pos,
+                        format!(
+                            "'{}' on its own means '{} = ${{{}}}', and nothing sets that",
+                            key.text, key.text, name
+                        ),
+                    );
+                    self.scanner.skip_line();
+                    continue;
+                }
+                entries.push((key.text, self.vars.get(&name).to_string()));
+                self.end_of_setting();
+                continue;
+            }
+            let value = match self.scanner.read_word() {
+                Some(word) => self.expand(&word),
                 None => String::new(),
             };
             entries.push((key.text, value));
-        });
-        entries
+            self.end_of_setting();
+        }
     }
 
     fn bool_value(&mut self) -> Option<bool> {
@@ -1774,10 +1869,10 @@ fn walk(stmts: &[Stmt], predicate: &mut impl FnMut(&Stmt) -> bool) -> bool {
         if predicate(stmt) {
             return true;
         }
-        let (body, otherwise) = match stmt {
-            Stmt::Match { body, otherwise, .. }
-            | Stmt::CheckAuth { body, otherwise, .. }
-            | Stmt::CheckFile { body, otherwise, .. } => (Some(body), otherwise),
+        let (body, otherwise) = match &stmt.action {
+            Action::Match { body, otherwise, .. }
+            | Action::CheckAuth { body, otherwise, .. }
+            | Action::CheckFile { body, otherwise, .. } => (Some(body), otherwise),
             _ => (None, &None),
         };
         if let Some(body) = body {

@@ -573,6 +573,17 @@ def test(func):
     return func
 
 
+def ran(body, verb):
+    """How often each statement with this verb ran, as the dashboard's routing section says.
+
+    The count is rendered right after a statement's arguments and before anything it contains,
+    which is what makes it findable without parsing the nesting."""
+    pattern = ('<span class="verb">' + re.escape(verb) + '</span>'
+               r'(?:<span class="(?:arg|tag)">[^<]*</span>)*'
+               r'<span class="ran">(\d+)</span>')
+    return [int(m) for m in re.findall(pattern, body)]
+
+
 # ============================================================================
 # TESTS
 # ============================================================================
@@ -822,19 +833,16 @@ serve web
 
 
 @test
-def test_reload_rules_default_to_project_settings(t):
-    """settings.reload_include is the default for servers that declare none"""
+def test_reload_rules_belong_to_the_service(t):
+    """reload_include is named in the service it restarts, and covers a directory's contents"""
     t.write_file('api.py', _echo_server('api'))
     # Created up front: a directory that appears and is written to in the same instant can be
     # missed, since the watch for it is added only once it exists.
     t.write_file('watched/deep/file.txt', 'first')
     t.write_file('webcentral.conf', '''
-settings {
-  reload_include = *.py watched
-}
-
 service api {
   command = python3 -u api.py
+  reload_include = *.py watched
 }
 serve api
 ''')
@@ -851,6 +859,12 @@ serve api
     # ...and a listed directory covers what is inside it, however deep
     t.write_file('watched/deep/file.txt', 'second')
     t.await_log('Stopping due to file changes: watched/deep/file.txt')
+
+    # It is not a project-wide setting, so saying it there is rejected rather than ignored
+    t.write_file('webcentral.conf', 'settings {\n  reload_include = src\n}\nrespond 200 ok\n')
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='ok')
+    t.assert_log("Unknown setting 'reload_include'", count=1)
 
 
 @test
@@ -1421,13 +1435,14 @@ env_file .env
 service {
   command = python3 -u app.py --port $PORT
   env {
-    DATABASE_URL = postgres://app:${DB_PASSWORD}@db.internal:5432/app
-    NOTE = ${QUOTED}
+    DATABASE_URL = postgres://app:${env:DB_PASSWORD}@db.internal:5432/app
+    NOTE = ${env:QUOTED}
+    DB_PASSWORD
   }
 }
 
-match /secret { respond 200 "the secret is ${DB_PASSWORD}" }
-check_auth ${DASHBOARD_SECRET} { respond 200 "admin ok" }
+match /secret { respond 200 "the secret is ${env:DB_PASSWORD}" }
+check_auth ${env:DASHBOARD_SECRET} { respond 200 "admin ok" }
 serve
 """)
 
@@ -1450,6 +1465,8 @@ serve
     # variable without its value, and /proc/<pid>/environ is readable only by its owner.
     log = t.get_log_content(t.current_test_domain)
     assert '-e DATABASE_URL ' in log, "DATABASE_URL was not passed by name"
+    # A bare name in an env block passes on the value of the same name
+    assert '-e DB_PASSWORD ' in log, "the bare `DB_PASSWORD` was not passed on"
     assert 'DATABASE_URL=' not in log, "the value reached the command line"
     # Nothing is written to disk for it either
     data = os.path.join(t.tmpdir, t.current_test_domain, '_webcentral_data')
@@ -1475,7 +1492,7 @@ serve_dir public
 def test_env_file_change_reloads(t):
     """Editing an env_file changes what the configuration means, so the project reloads"""
     t.write_file('.env', 'GREETING=first\n')
-    t.write_file('webcentral.conf', 'env_file .env\nrespond 200 "${GREETING}"\n')
+    t.write_file('webcentral.conf', 'env_file .env\nrespond 200 "${env:GREETING}"\n')
     t.assert_http('/', check_body='first')
     t.mark_log_read()
 
@@ -1966,6 +1983,139 @@ def test_static_tail_survives_an_empty_directory(t):
 
 
 @test
+def test_request_headers_are_variables(t):
+    """${header:Name} reads what the request arrived with, whatever case it is written in"""
+    t.write_file('webcentral.conf', """
+match /agent { respond 200 "ua=${header:User-Agent} again=${header:user-agent}" }
+match /joined { respond 200 "accept=${header:Accept}" }
+match /absent { respond 200 "[${header:X-Not-Sent}]" }
+respond 200 root
+""")
+
+    t.assert_http('/agent', check_body='ua=probe/1 again=probe/1',
+                  headers={'User-Agent': 'probe/1'})
+    t.assert_http('/joined', check_body='accept=text/plain', headers={'Accept': 'text/plain'})
+    # A header nobody sent is empty rather than an error - it is whatever arrived
+    t.assert_http('/absent', check_body='[]')
+
+    # ...and it is the request's, so it cannot be assigned; set_header writes the response
+    t.write_file('webcentral.conf', 'set header:X-Foo bar\nrespond 200 ok\n')
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='ok')
+    t.assert_log('is a header the request arrived with and cannot be set', count=1)
+
+
+@test
+def test_bare_log_writes_the_request(t):
+    """`log` with nothing to say logs the request, which is what a request log is"""
+    t.write_file('webcentral.conf', """
+log
+match /quiet { respond 200 quiet }
+log "reached the tail for ${path}"
+respond 200 loud
+""")
+
+    t.assert_http('/quiet', check_body='quiet')
+    t.assert_http('/other', check_body='loud')
+    t.assert_log('GET /quiet', count=1)
+    t.assert_log('GET /other', count=1)
+    # The statement below the match only runs for what got past it
+    t.assert_log('reached the tail for /other', count=1)
+    t.assert_log('reached the tail for /quiet', count=0)
+
+
+@test
+def test_env_file_is_read_by_default(t):
+    """A `.env` beside the configuration is read without a statement asking for it"""
+    t.write_file('.env', 'TOKEN=s3cret\n')
+    t.write_file('webcentral.conf', 'respond 200 "token=${env:TOKEN}"')
+    t.assert_http('/', check_body='token=s3cret')
+
+    # Editing it reloads the project, the same as any file the configuration is built from
+    t.mark_log_read()
+    t.write_file('.env', 'TOKEN=rotated\n')
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='token=rotated')
+
+    # A line it cannot read is a warning about a file nobody asked for, not a broken project
+    t.mark_log_read()
+    t.write_file('.env', 'TOKEN=rotated\nnot a variable\n')
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='token=rotated')
+    t.assert_log(".env line 2: expected 'KEY=value'", count=1)
+
+
+@test
+def test_env_file_prefix(t):
+    """A file's keys are `${env:KEY}` unless the statement names another prefix"""
+    t.write_file('.env', 'TOKEN=s3cret\n')
+    t.write_file('secrets/other.env', 'TOKEN=different\n')
+    t.write_file('webcentral.conf', """
+env_file .env
+env_file secrets/other.env prefix=other:
+match /default { respond 200 "token=${env:TOKEN}" }
+match /named { respond 200 "token=${other:TOKEN}" }
+respond 200 root
+""")
+
+    # Two files with the same key, kept apart by their prefixes
+    t.assert_http('/default', check_body='token=s3cret')
+    t.assert_http('/named', check_body='token=different')
+
+    # An empty prefix puts the keys in as they are written
+    t.mark_log_read()
+    t.write_file('webcentral.conf', """
+env_file .env prefix=
+respond 200 "${TOKEN}"
+""")
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='s3cret')
+
+    # ...and the prefixed name is then not defined, which is reported rather than left empty.
+    # A file of its own, since `.env` is read by default and would define `${env:...}` anyway.
+    t.mark_log_read()
+    t.write_file('secrets/other.env', 'OTHER=different\n')
+    t.write_file('webcentral.conf', """
+env_file secrets/other.env prefix=
+respond 200 "${env:OTHER}"
+""")
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_code=200)
+    t.assert_log("'${env:OTHER}' is never set", count=1)
+
+
+@test
+def test_env_block_bare_name(t):
+    """A bare KEY in an env block passes on the secret of the same name"""
+    t.write_file('.env', 'TOKEN=s3cret\n')
+    t.write_file('webcentral.conf', """
+env_file .env
+service {
+  command = python3 -u -m http.server $PORT
+  env { TOKEN }
+}
+""")
+    t.write_file('index.html', 'up')
+
+    t.assert_http('/', check_body='up')
+    t.await_log('Running:')
+    t.assert_log('-e TOKEN ', count=1)
+    t.assert_log('s3cret', count=0)
+
+    # A bare name nothing set says what it means, rather than passing an empty value
+    t.mark_log_read()
+    t.write_file('webcentral.conf', """
+service {
+  command = python3 -u -m http.server $PORT
+  env { NOT_SET_ANYWHERE }
+}
+""")
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='up', timeout=30)
+    t.assert_log("nothing sets that", count=1)
+
+
+@test
 def test_dashboard_shows_the_shape_of_a_project(t):
     """The dashboard is a section per project: its services, their sidecars, and its configuration"""
     # The test runner owns its projects and runs webcentral, so the admin view is allowed
@@ -1975,6 +2125,10 @@ def test_dashboard_shows_the_shape_of_a_project(t):
     t.write_file('webcentral.conf', """
 service {
   command = sleep 999
+  env {
+    SHORT = 8000
+    LONG = abcdefghijklmnopqrstuvwxyz
+  }
   service helper {
     command = sleep 998
   }
@@ -1998,9 +2152,32 @@ respond 200 hello
     assert "default&#x27;s image" in body or "default's image" in body, body
     # Nothing is published to the host, so the address peers use is worth saying
     assert 'helper.internal:8000' in body, body
-    # The script that routes the requests, as parsed - including the tail nothing wrote
+    # A service is a row of the project's table holding a table of its own, and a sidecar is the
+    # same thing again nested inside it - with no rows for what its parent's lifetime answers
+    assert '<th>Service <b>default</b></th>' in body, body
+    assert '<th>Sidecar <b>helper</b></th>' in body, body
+    # The rows that say what a service restarts for, with webcentral's own patterns listed and
+    # tagged as its rather than the project's
+    assert '<th>Restart includes</th>' in body, body
+    assert '<span class="chip">requirements.txt</span>' in body, body
+    assert '</span> <span class="tag">default</span>' in body, body
+    assert '<th>Stops when idle</th>' in body, body
+    # The script that routes the requests, as parsed - including the tail nothing wrote, which is
+    # tagged rather than dimmed
     assert 'webcentral.conf' in body, body
-    assert 'implicit' in body, body
+    assert '<span class="tag">implicit</span>' in body, body
+    # A service's environment is shown with the middle of long values masked, so the page says a
+    # secret is set without handing it over
+    assert '>SHORT</b>=8000' in body, body
+    assert '>LONG</b>=abcd…wxyz' in body, body
+    assert 'abcdefgh' not in body, body
+    # The summary says how much of the project is up before you unfold it: the script answered
+    # without ever needing the service, so nothing is running
+    assert '0/1 running' in body, body
+    # The settings are a table of their own, saying what a request actually does and marking what
+    # came from a webcentral-wide default rather than from the file
+    assert '<th>redirect_http</th>' in body, body
+    assert '<th>redirect_https</th><td>off<span class="tag">default</span></td>' in body, body
 
     # project_dashboard shows only the project's own slice: no other domains, and none of the
     # server-wide numbers
@@ -2010,8 +2187,10 @@ respond 200 hello
     body = t.assert_http('/', host=pd_domain, check_body='project-dash.test')
     assert 'app.test' not in body, "project_dashboard leaked another project's domain"
     assert 'Uptime' not in body, "project_dashboard leaked server-wide info"
-    # A project with no services says so rather than showing an empty list
-    assert '>None<' in body, body
+    # A project with no services has no service row at all, rather than one saying "none" - and
+    # so nothing to count in its summary either
+    assert '<th>Service ' not in body, body
+    assert ' running</span>' not in body, body
     # ...and its own page is not folded away behind a summary, having only one project on it
     assert '<summary>' not in body, body
 
@@ -2457,9 +2636,14 @@ def test_readme_examples_are_valid(t):
         # Examples reference commands and images that don't exist here; only parsing is checked.
         d = os.path.join(t.tmpdir, f'readme-example-{i}')
         os.makedirs(d, exist_ok=True)
-        # Examples that read secrets need the file to exist; the values do not matter here.
+        # Examples that read secrets need the files to exist; the values do not matter here.
         with open(os.path.join(d, '.env'), 'w') as f:
-            f.write('DB_PASSWORD=x\nDASHBOARD_SECRET=y\n')
+            f.write('DB_PASSWORD=x\nDASHBOARD_SECRET=y\nGREETING=hello\nSTRIPE_KEY=sk\n')
+        os.makedirs(os.path.join(d, 'secrets'), exist_ok=True)
+        with open(os.path.join(d, 'secrets/stripe.env'), 'w') as f:
+            f.write('PUBLISHABLE_KEY=pk_test\n')
+        with open(os.path.join(d, 'secrets/production.env'), 'w') as f:
+            f.write('DB_PASSWORD=x\n')
         with open(os.path.join(d, 'webcentral.conf'), 'w') as f:
             f.write(example)
         result = subprocess.run(['./webcentral', 'check', d], capture_output=True, text=True,
@@ -2575,8 +2759,8 @@ serve_dir public
 
 
 @test
-def test_dashboard_shows_config_and_answers(t):
-    """The dashboard names what each service runs, and tallies what answered the requests"""
+def test_dashboard_counts_what_each_statement_answered(t):
+    """The dashboard names what each service runs, and counts what every statement did"""
     t.write_file('public/index.html', '<h1>Home</h1>')
     t.write_file('webcentral.conf', """
 service api {
@@ -2595,13 +2779,23 @@ serve_dir public
     t.assert_http('/nothing/here', check_code=404)
 
     body = t.assert_http('/status', check_body='Webcentral Dashboard')
-    # The service row says what it runs and what image it runs on
+    # The service column says what it runs and what image it runs on
     assert 'http.server' in body, body
     # The image is the one the harness gives a service that names none
     assert 'webcentral-test-base' in body, body
-    # ...and the tally says which statements did the answering
-    for kind in ('serve_dir', 'respond', 'redirect', 'not found'):
-        assert kind in body, f"{kind} missing from the tally: {body}"
+
+    # Every statement says how often it ran, this page's own request included. Nothing matched
+    # /api, so all five reached the second `match`; after that each one that answers takes a
+    # request out of the count below it.
+    assert ran(body, 'match') == [5, 5, 4, 3], body
+    # ...and each of those bodies answered exactly the one request that got there
+    assert ran(body, 'redirect') == [1], body
+    assert ran(body, 'respond') == [1], body
+    # The service is declared but never reached, which the count says outright
+    assert ran(body, 'serve') == [0], body
+    # `/` and `/nothing/here` both fell through to the static tail; the implicit one after it is
+    # dead, since a `serve_dir` without `fallthrough` answers by itself
+    assert ran(body, 'serve_dir') == [2, 0], body
 
 
 @test
