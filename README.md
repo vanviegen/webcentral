@@ -4,31 +4,14 @@ A reverse proxy that runs multiple web applications for multiple users on a sing
 
 > ### 🎉 3.0 is here - and it breaks just about everything
 >
-> **What a project does is now written in one small language.** `webcentral.conf` holds a script,
-> run top to bottom for every request: `match` a path, `serve` an application, `serve_dir` some
-> files, `proxy` somewhere else, `respond` on the spot. What used to be a handful of fixed project
-> types is now a few lines you can read, so a redirect, a static site and a Node app are the same
-> kind of thing rather than three special cases.
->
-> **Every project can run several services**, each in its own container with its own image, port
-> and lifecycle, started only when a request is actually routed to it - and a nested one is a
-> *sidecar* sharing its parent's life, which is how you get a database or a queue runner.
->
-> **A project with a `Dockerfile` needs no configuration at all.** It is built with the project
-> directory as its context - podman confines that, so one user's Dockerfile cannot reach another's
-> files - and its `CMD` is run, in whatever language the project happens to be written.
->
-> **Containers always run rootless, as the person who owns the project.** Not as root, ever, even
-> when webcentral itself is. What a container writes is already theirs, with no uid mapping to get
-> wrong, and a `build` step - which is arbitrary code from somebody else's project - has at worst
-> that person's privileges.
->
-> **The catch: `webcentral.ini` is not read any more**, Procfile support is gone, firejail and the
-> unsandboxed path are gone, and so are webcentral's own user accounts and passwords. Nearly every
-> 2.x project needs converting, which is usually five minutes of work and always tells you what it
-> objects to. See **[MIGRATION-v3.md](MIGRATION-v3.md)**, and run `webcentral check` when you're
-> done.
-
+> What a project does is now written in one small language: `webcentral.conf` holds a script, run
+> top to bottom for every request, and a project can declare as many services - each its own
+> container, with sidecars for the database and the queue runner - as it needs. Containers always
+> run rootless, as the person who owns the project. A project with a `Dockerfile` usually needs no
+> configuration at all. The catch is in the title: `webcentral.ini` is not read any more, Procfile
+> support is gone, firejail and the unsandboxed path are gone, webcentral's own accounts and
+> passwords are gone, and what restarts an application has changed. See
+> **[MIGRATION-v3.md](MIGRATION-v3.md)**, and the changelog for the full list.
 
 ## Features
 
@@ -107,12 +90,16 @@ Point DNS for `someapp.yourdomain.com` at your server. Up and running!
 | Auto-reload on file change | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ (git&nbsp;push) |
 | Idle shutdown | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Multi-user (shared port 80/443) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| Built-in sandboxing | Podman | ✗ | Docker | ✗ | Docker | Docker |
+| Runs apps in containers | Podman | ✗ | ✗ | ✗ | Docker | Docker |
+| Apps run as their owner (rootless) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| Builds from a `Dockerfile` | ✓ | ✗ | ✗ | ✗ | ✓ | ✓ |
+| Database/worker alongside an app | ✓ | ✗ | ✗ | ✗ | ✓ (plugins) | ✓ |
+| Per-project config, owned by its user | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Config complexity | Minimal | Low | Medium | High | Medium | Medium |
 | Container orchestration | ✗ | ✗ | ✓ | ✗ | ✓ | ✓ |
 | HTTP/3 (QUIC) | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ |
 
-**Caddy/Nginx/Traefik** are pure reverse proxies—they route traffic but don't manage application lifecycles. You need separate tools (systemd, Docker Compose, Kubernetes) to run your apps.
+**Caddy/Nginx/Traefik** are pure reverse proxies—they route traffic but don't manage application lifecycles. You need separate tools (systemd, Docker Compose, Kubernetes) to run your apps. Traefik reads container labels to discover what is already running; it doesn't start or stop anything itself.
 
 **Dokku/Coolify** are self-hosted PaaS platforms with git-push deployment, but require more setup and resources. They're better suited for team environments with CI/CD pipelines.
 
@@ -150,7 +137,7 @@ With **no configuration file at all**, webcentral looks at what the directory ho
 | The directory contains | What happens |
 |------------------------|--------------|
 | `public/` | its files are served |
-| `Dockerfile` | it is built, and its `CMD` is run - whatever language the project is in |
+| `Dockerfile` | it is built, and its `CMD` is run - whatever language the project is in. Add a `webcentral.conf` only for what the Dockerfile can't say: which port, what to persist, how to route |
 | `package.json` with a `start` script | `npm start` is run as a service, on a node image |
 
 That still applies when a `webcentral.conf` is present but never says how to answer a request - so
@@ -376,8 +363,8 @@ serve_dir public
 ```
 
 Webcentral deliberately has no user accounts or passwords of its own: an application that needs
-real logins does its own authentication, and can still hand static delivery back to webcentral -
-see **Internal redirects** below.
+real logins does its own authentication, and can still hand delivery back to webcentral - a file
+on disk, a dashboard, anything the script can answer with. See **Internal redirects** below.
 
 #### set_header
 
@@ -539,9 +526,9 @@ serve web
 
 ### Dockerfiles
 
-A project that ships a `Dockerfile` has already answered every question webcentral would otherwise
-ask - which runtime, which dependencies, which command - in whatever language it is written in. It
-needs no configuration at all:
+A project that ships a `Dockerfile` has already answered the questions webcentral would otherwise
+ask - which runtime, which dependencies, which command - in whatever language it is written in.
+Usually that is the whole configuration:
 
 ```
 project/
@@ -563,6 +550,20 @@ defaults to `none`. That has a consequence worth knowing before you choose: a fi
 **rebuild**, not a restart - so the edit-and-refresh loop that mounted services get does not apply.
 Everything in the directory is watched, since anything in the build context can change what the
 image is, and podman's layer cache keeps an unchanged rebuild to about a second.
+
+A `webcentral.conf` is still worth writing for what a Dockerfile cannot say: a port other than
+8000, what to route where, what to persist, and what should reload it. Naming the Dockerfile
+explicitly is how those live side by side:
+
+```ini
+service {
+  dockerfile = Dockerfile
+  port = 3000
+  mounts = /var/lib/myapp
+}
+match /static/(.*) { serve_dir public }
+serve
+```
 
 `dockerfile` and `base`/`packages`/`build`/`copy` are alternatives, and saying both is an error:
 the Dockerfile is already the answer to how the image gets built.
@@ -1033,7 +1034,8 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
   - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. `webcentral check` parses a project without starting anything
   - Request bodies and static files are **streamed**, and static files support `Range`, so uploads and video seeking work at any size
   - `env_file` keeps secrets out of the configuration, and they reach a container through podman's own environment rather than its command line, which `ps` exposes to every user on the machine
-  - The whole projects tree is watched with **one** inotify instance rather than one per project (60 projects went from 61 to 2), and reload rules default to a whitelist of program text rather than to everything
+  - **What restarts an application has been inverted**: 2.x watched every file except a short exclusion list, 3.0 watches a whitelist of source directories, source extensions and dependency manifests. A restart is disruptive and most files in a project are not program text - but a project whose application reads a `config.yaml` or a template at startup has to say so with `reload_include`
+  - The whole projects tree is watched with **one** inotify instance rather than one per project (60 projects went from 61 to 2)
   - `proxy` speaks **https**, verifying the upstream against the system trust store, and a `VOLUME` an image declares is given a directory that outlives the container instead of being discarded with it
   - `Procfile` is no longer detected: it supplied a command but never the runtime or the dependencies its commands assume, so the compatibility failed at run time rather than when the file was read. `package.json` with a `start` script still is
   - Fix containers being orphaned on shutdown, both because only SIGINT was handled - not the SIGTERM systemd sends - and because the stop was never waited for

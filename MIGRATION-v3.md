@@ -4,33 +4,26 @@
 work until it is converted.** Nothing is read from `webcentral.ini` any more - not even partly, so
 there is no half-migrated state to be surprised by.
 
-The conversion is usually five minutes of work per project. Do it, then run:
+The conversion is usually five minutes per project. Do it, then run:
 
 ```sh
 webcentral check ~/webcentral-projects/example.com
 ```
 
-which parses the project and prints every line it doesn't understand, with a line and column,
-without starting anything.
+which parses the project and prints every problem it finds, with a line and column, without
+starting anything.
 
 ---
 
-## The two changes that matter
+## The three things that changed
 
 ### 1. Everything runs in a container
 
 Firejail is gone, and so is the unsandboxed path. Podman is now the only way an application runs,
 and the only external dependency. **A project that relied on the host's `python`, `node` or `ruby`
-has to say which image provides it.**
+has to say which image provides it** - `base = python:3-alpine`, or `packages` on top of alpine.
 
-```ini
-service {
-  base = python:3-alpine        # or: packages = python3 py3-pip  (on top of alpine)
-  command = python3 app.py
-}
-```
-
-Containers always run **rootless**, as the user who owns the project directory - whether webcentral
+Containers always run **rootless**, as the user who owns the project directory, whether webcentral
 itself runs as root or not. That user needs a subordinate id range, which most distributions give
 every account by default:
 
@@ -43,81 +36,214 @@ missing, naming the command that fixes it.
 
 ### 2. `webcentral.ini` becomes `webcentral.conf`
 
-The old file was a set of sections that each meant one fixed thing. The new one is a small
-language: declarations that say what the project *has*, and a script, run top to bottom, that says
-how requests are answered. That is what makes a redirect project and a proxy project and a static
-project the same kind of thing.
+The old file was a set of sections that each meant one fixed thing, and which of them you wrote
+decided what *kind* of project you had. The new one is a small language: declarations saying what
+the project *has*, and a script, run top to bottom, saying how requests are answered. That is what
+makes a redirect project and a proxy project and a Node project the same kind of thing.
+
+The examples below convert whole files, because settings do not translate one at a time: `port`
+meant two different things depending on whether a `command` was present, and in 3.0 it lives
+inside a service rather than at the top of the file.
+
+### 3. What triggers a reload has been inverted
+
+**2.x watched every file in the project** except a short exclusion list. **3.0 watches a
+whitelist**: source directories (`src`, `app`, `lib`, `server`, `api`, `bin`), source extensions
+(`*.py`, `*.js`, `*.rb`, `*.go`, ...) and dependency manifests. A restart is disruptive, and most
+files in a project are not program text.
+
+**This is the change most likely to go unnoticed**, because nothing fails - the application simply
+keeps running with what it read at startup. A project whose application reads a `config.yaml`, a
+`*.toml`, a `*.sql` schema or an HTML template at startup no longer restarts when those change.
+Say so explicitly:
+
+```ini
+settings {
+  reload_include = src config.yaml templates schema.sql
+}
+```
+
+A service built from a `Dockerfile` is the exception: it watches everything, since anything in the
+build context can change the image.
 
 ---
 
 ## Converting the file
 
-Rename `webcentral.ini` to `webcentral.conf` and rewrite it with this table. The
-**Configuration** chapter of the README is the full reference.
+Whole files, simplest first. The old file is on the left of each pair, the new one on the right -
+or above and below, depending on how wide your window is.
 
-| 2.x | 3.0 |
-|---|---|
-| `[app]` `command = ...` | `service { command = ... }` |
-| `port = 3000` (with a command) | `service { port = 3000 ... }` |
-| `port`/`host` with **no** command | `forward host:3000` |
-| `type = redirect` + `target = ...` | `redirect https://example.com status=301` |
-| `type = static` | `serve_dir public` (or nothing - `public/` is served by itself) |
-| `type = dashboard` | `project_dashboard`, or `admin_dashboard` for every domain |
-| `[rewrite]` `/a = /b` | `match /a { set path /b }` |
-| `[rewrite]` with a URL target | `match /a { redirect https://... }` |
-| `[environment]` `KEY = value` | `env { KEY = value }` inside the service - or `env_file .env` |
-| `[auth]` and password hashes | gone - see **What was removed** |
-| `mount_app_dir = false` | `app_dir = none` |
-| `startup_deadline` | `startup_time` |
-| `idle_timeout` | `shutdown_time` |
-| `[podman]` `image = ...` | `base = ...` inside the service |
-| `[podman]` `packages = ...` | `packages = ...` inside the service |
-| worker processes | a nested `service` - see **Sidecars** in the README |
+### A static site, or a Node project
 
-### A worked example
+Nothing to do. `public/` and `package.json` are still detected without any configuration file, and
+a `Dockerfile` now is too.
 
-Before:
+### Forward to something already running
+
+**Before** — `webcentral.ini`:
 
 ```ini
-[app]
-command = npm start
 port = 3000
-idle_timeout = 600
-
-[environment]
-NODE_ENV = production
-DATABASE_URL = postgres://localhost/app
-
-[rewrite]
-/old-blog/(.*) = /blog/$1
+host = 192.168.10.20
 ```
 
-After:
+**After** — `webcentral.conf`:
+
+```ini
+forward 192.168.10.20:3000
+```
+
+A unix socket (`socket_path = /run/app.sock`) becomes `forward /run/app.sock`.
+
+### Redirect, and proxy
+
+**Before**:
+
+```ini
+redirect = https://new-name.example.com
+```
+
+**After** — the status was always 301, and now says so:
+
+```ini
+redirect https://new-name.example.com status=301
+```
+
+**Before**:
+
+```ini
+proxy = https://www.example.com
+```
+
+**After**:
+
+```ini
+proxy https://www.example.com
+```
+
+### An application
+
+**Before** — a firejailed command, using whatever the host had installed:
+
+```ini
+command = python3 app.py --port $PORT
+```
+
+**After** — the same command, and the image that provides `python3`:
 
 ```ini
 service {
-  base = node:22-alpine
-  command = npm start
-  port = 3000
-  shutdown_time = 600
+  base = python:3-alpine
+  command = python3 app.py --port $PORT
+}
+```
+
+`$PORT` survives untouched: `${...}` is the only thing webcentral substitutes, so a command keeps
+its shell variables.
+
+### An application with packages, a build step and settings
+
+**Before**:
+
+```ini
+command = php -S 0.0.0.0:$PORT -t public
+[podman]
+base = debian
+packages[] = php
+packages[] = composer
+commands[] = composer install
+mounts[] = data
+app_dir = /srv
+[reload]
+timeout = 0
+include[] = src
+exclude[] = src/build
+[environment]
+APP_ENV = production
+```
+
+**After** — one block, and the settings named as what they do:
+
+```ini
+service {
+  base = debian
+  packages = php composer
+  copy = composer.json composer.lock
+  build = composer install
+  command = php -S 0.0.0.0:$PORT -t public
+  mounts = data
+  app_dir = /srv
+  shutdown_time = 0
+  reload_include = src
+  reload_exclude = src/build
   env {
-    NODE_ENV = production
-    DATABASE_URL = postgres://localhost/app
+    APP_ENV = production
   }
 }
+```
 
-match /old-blog/(.*) { set path /blog/${1} }
+`copy` is new and usually wanted next to `build`: it names the files the build step needs inside
+the image, so `composer install` runs against them and its result is baked in rather than repeated
+on every start.
+
+### An application with rewrites, workers and a password
+
+This is where the shape really changes: rewrites and auth were sections that applied to the
+project, and they are now statements in the script, in the order you want them run.
+
+**Before**:
+
+```ini
+command = python app.py --port $PORT
+worker = python background_tasks.py
+worker:email = python email_processor.py
+log_requests = true
+
+[podman]
+base = python:3-alpine
+
+[environment]
+DATABASE_URL = postgres://localhost/app
+
+[rewrite]
+/blog/(.*?)/.* = /articles/$1.html
+/[^/]* = /index.html
+
+[auth]
+admin = $argon2id$v=19$m=19456,t=2,p=1$...
+```
+
+**After**:
+
+```ini
+settings {
+  log_requests = true
+}
+
+service {
+  base = python:3-alpine
+  command = python app.py --port $PORT
+  env {
+    DATABASE_URL = postgres://localhost/app
+  }
+
+  service background { command = python background_tasks.py }
+  service email { command = python email_processor.py }
+}
+
+match /blog/(.*?)/.* { set path /articles/${1}.html }
+match /[^/]* { set path /index.html }
 serve
 ```
 
-Three things to notice:
+Four things to notice:
 
-- **`base` is new and usually necessary.** There is no host `node` to fall back on.
-- **Capture groups are `${1}`, not `$1`.** `${...}` is the only substitution webcentral makes, which
-  is exactly why a `command` can still contain `$PORT` and `$HOME` untouched.
-- **`serve` at the end** hands the request to the service. It is implicit when the script would
-  otherwise be empty, so a project that only runs an application needs no routing statements at
-  all.
+- **Workers are nested services** - *sidecars*. One that names no `base` of its own runs in its
+  parent's image and starts from its parent's environment, which is exactly what a worker was.
+- **Capture groups are `${1}`, not `$1`.**
+- **The script runs top to bottom**, so the order of the two `match` lines is the order they are
+  tried in - where `[rewrite]` used to depend on the order of a hash map.
+- **The password is gone.** See below.
 
 ---
 
@@ -126,24 +252,16 @@ Three things to notice:
 **`Procfile` is no longer read.** It supplied a command line, but the runtime and the dependencies
 its commands assume came from Heroku's buildpacks, which webcentral never had - so the
 compatibility was partial in a way that failed at run time rather than when the file was read.
-Write the `web:` line as `command =`, and any `worker:` lines as nested services.
+Write the `web:` line as `command =`, and any `worker:` lines as nested services, as above. (If
+your Procfile project worked, it was because the host happened to have the runtime installed;
+under 3.0 the image provides it.)
 
-**Dependencies are not installed for you.** Use `copy` and `build` in the service, ship a
-`Dockerfile`, or install them in the `command`:
+**Accounts and passwords are gone**: `[auth]`, its argon2 hashes, the `webcentral hash` subcommand
+and the auth cookie. Webcentral is a proxy, and a proxy is the wrong place to keep a login session.
 
-```ini
-service {
-  base = python:3-alpine
-  copy = requirements.txt
-  build = pip install -r requirements.txt
-  command = python3 app.py
-}
-```
-
-**There are no accounts or passwords.** `[auth]`, its argon2 hashes, `webcentral hash` and the
-auth cookie are all gone. Webcentral is a proxy, and a proxy is the wrong place for a login
-session. What remains is `check_auth <secret>`, one shared secret for guarding something small
-like a dashboard:
+What remains is `check_auth <secret>`, one shared secret, sent as an `Authorization: Bearer`
+header or a `secret=` query parameter - enough for something small like a dashboard, and not
+pretending to be more:
 
 ```ini
 env_file .env                       # DASHBOARD_SECRET=...
@@ -151,18 +269,34 @@ check_auth ${DASHBOARD_SECRET} { project_dashboard }
 respond 401
 ```
 
-An application that needs real logins does its own authentication - and can still hand file
-delivery back to webcentral with an `X-Accel-Redirect` header, so an authorised download is served
-straight from disk. See **Internal redirects** in the README.
+An application that needs real logins does its own authentication - and can still hand delivery
+back to webcentral with an `X-Accel-Redirect` header, whether that is a file on disk or anything
+else the script can answer with. See **Internal redirects** in the README.
+
+---
+
+## Settings that did not appear above
+
+| 2.x | 3.0 |
+|---|---|
+| `[reload]` `timeout` | `shutdown_time` in the service |
+| `startup_deadline` | `startup_time` |
+| `[podman]` `http_port` | `port` |
+| `[podman]` `commands[]` | `build` |
+| `mount_app_dir = false` | `app_dir = none` |
+| `[docker]` section | `service { ... }` - the engine was already podman |
+| `type = dashboard` | `project_dashboard`, or `admin_dashboard` for every domain |
+| `redirect_http` / `redirect_https` | the same, in a `settings { }` block |
 
 ---
 
 ## Worth doing while you are in there
 
-- **A `Dockerfile` in the project directory now needs no configuration at all.** If your project
-  already has one, delete the service block and let it be used.
-- **Secrets belong in `env_file`**, not in `webcentral.conf` - which sits in the project directory
-  and usually in git. Nothing reaches a container's environment unless the file names it.
-- **Reload rules default to a whitelist** of source directories, source extensions and dependency
-  manifests, rather than to everything. If your application restarts too rarely, name what it runs
-  from with `reload_include`.
+- **If the project already has a `Dockerfile`, delete the service block** and let it be used. The
+  Dockerfile answers every question webcentral would otherwise ask, in any language.
+- **Move secrets into `env_file`.** `webcentral.conf` lives in the project directory and usually in
+  git; an `env_file` does not have to. Nothing reaches a container's environment unless something
+  names it, and values are handed to podman through its own environment rather than its command
+  line, which `ps` shows to every user on the machine.
+- **Check the reload rules**, per the inversion described above. It is the one change that fails
+  silently.
