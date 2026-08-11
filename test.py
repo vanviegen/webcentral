@@ -4177,9 +4177,13 @@ service {
 }
 ''')
 
-    t.assert_http('/', check_body='app says /')
+    # A generous budget, because this test writes watched source files (`*.py`) immediately before
+    # its first request: their change events land while the service is starting, which by design
+    # throws that startup away and begins again from the new files. Two container starts back to
+    # back is well over five seconds on a slow machine, and none of that is what this test is about
+    t.assert_http('/', check_body='app says /', timeout=60)
     # Inherited where it says nothing, its own value where it does
-    t.await_log('helper sees SHARED=from-parent OWN=sidecar-wins')
+    t.await_log('helper sees SHARED=from-parent OWN=sidecar-wins', timeout=30)
 
 
 @test
