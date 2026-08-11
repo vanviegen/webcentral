@@ -41,7 +41,9 @@ container config overrides, and the working directory
 project is a script, some services and their sidecars rather than one thing with a type: each
 service's image/command/state/port and counts, its sidecars nested under it with the
 `<name>.internal:<port>` their peers use, a tally of which *kind* of statement answered, and the
-script itself as a nested list. The script is rendered from the AST (`script::outline`) rather
+script itself as a nested list. A `forward` or `proxy` target is deliberately *not* listed as a
+service: it has no lifecycle to report, and the routing section already says where it goes. On the admin page each
+project folds away behind its domain/TLS/request-count line; a project's own page does not fold. The script is rendered from the AST (`script::outline`) rather
 than from the file, so it shows what actually runs - including the implicit tail, which is marked
 as such because it is the one statement a reader cannot find in the file. `check_auth`'s secret is
 never rendered. The tally is per kind rather than per statement, so no statement has to carry an

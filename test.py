@@ -1998,8 +1998,11 @@ respond 200 hello
     assert "default&#x27;s image" in body or "default's image" in body, body
     # Nothing is published to the host, so the address peers use is worth saying
     assert 'helper.internal:8000' in body, body
-    # The configuration itself, so the script that routes the requests is legible
+    # The script that routes the requests, as parsed - including the tail nothing wrote
     assert 'webcentral.conf' in body, body
+    assert 'implicit' in body, body
+    # Each service says what kind of thing it is, and so does anything the script routes to
+    assert 'podman' in body, body
 
     # project_dashboard shows only the project's own slice: no other domains, and none of the
     # server-wide numbers
@@ -2010,7 +2013,9 @@ respond 200 hello
     assert 'app.test' not in body, "project_dashboard leaked another project's domain"
     assert 'Uptime' not in body, "project_dashboard leaked server-wide info"
     # A project with no services says so rather than showing an empty list
-    assert 'No services' in body, body
+    assert '>None<' in body, body
+    # ...and its own page is not folded away behind a summary, having only one project on it
+    assert '<summary>' not in body, body
 
 
 @test

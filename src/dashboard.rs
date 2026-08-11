@@ -4,6 +4,10 @@
 //! sidecars - so the page is a section per project rather than a row per project. What a reader
 //! wants from it is the shape: which services exist, what each is running and whether it is up,
 //! what hangs off it, and which part of the script is actually answering the requests.
+//!
+//! The admin page lists everyone's projects, so each folds away behind the line that identifies
+//! it - domain, certificate, request count. A project's own page has one project on it and
+//! nothing to fold.
 
 use crate::project::{body_from, StreamBody};
 use anyhow::Result;
@@ -84,7 +88,7 @@ pub fn render(filter: Option<&str>) -> Result<Response<StreamBody>> {
     }
 
     for domain in &domains {
-        html.push_str(&render_project(domain));
+        html.push_str(&render_project(domain, filter.is_none()));
     }
     if domains.is_empty() {
         html.push_str("<p class=\"empty\">No projects.</p>\n");
@@ -98,69 +102,71 @@ pub fn render(filter: Option<&str>) -> Result<Response<StreamBody>> {
         .body(body_from(html))?)
 }
 
-fn render_project(domain: &DomainStatus) -> String {
-    let mut html = String::new();
-    html.push_str("<section class=\"project\">\n");
-    html.push_str(&format!("<h2>{}</h2>\n", escape(&domain.domain)));
-
-    // One line of context: where it lives, what its certificate is doing, how busy it has been.
+fn render_project(domain: &DomainStatus, collapsible: bool) -> String {
     let (cert_class, cert_text) = match domain.cert_status.as_deref() {
-        Some(s) if s.starts_with("Valid") => ("cert-valid", s),
-        Some(s) if s.starts_with("Error") || s == "Expired" => ("cert-error", s),
-        Some(s) => ("cert-acquiring", s),
-        None => ("cert-none", "no certificate"),
+        Some(s) if s.starts_with("Valid") => ("cert-valid", format!("TLS {}", s.to_lowercase())),
+        Some(s) if s.starts_with("Error") || s == "Expired" => {
+            ("cert-error", format!("TLS {}", s.to_lowercase()))
+        }
+        Some(s) => ("cert-acquiring", format!("TLS {}", s.to_lowercase())),
+        None => ("cert-none", "no TLS".to_string()),
     };
-    html.push_str(&format!(
-        "<div class=\"meta\"><span class=\"dir\">{}</span><span class=\"{}\">{}</span>\
-         <span>{} request{}</span></div>\n",
-        escape(&domain.directory),
+    // The line that identifies the project, and - on the admin page, which lists everyone's - the
+    // line you fold the rest away behind.
+    let summary = format!(
+        "<span class=\"domain\">{}</span><span class=\"{}\">{}</span>\
+         <span class=\"count\">{} request{}</span>",
+        escape(&domain.domain),
         cert_class,
-        escape(cert_text),
+        escape(&cert_text),
         domain.total_requests,
         if domain.total_requests == 1 { "" } else { "s" },
-    ));
+    );
 
+    let mut html = String::new();
+    if collapsible {
+        html.push_str(&format!(
+            "<details class=\"project\">\n<summary>{}</summary>\n",
+            summary
+        ));
+    } else {
+        html.push_str(&format!("<section class=\"project\">\n<div class=\"head\">{}</div>\n", summary));
+    }
+
+    html.push_str(&format!("<div class=\"dir\">{}</div>\n", escape(&domain.directory)));
     for problem in &domain.problems {
         html.push_str(&format!("<div class=\"problem\">{}</div>\n", escape(problem)));
     }
 
-    // Which kind of statement answered, which is the part of the script actually in use.
-    if !domain.answers.is_empty() {
-        html.push_str("<div class=\"answers\"><span class=\"label\">Answered by</span>");
-        for (kind, count) in &domain.answers {
-            html.push_str(&format!(
-                "<span class=\"answer\">{} <b>{}</b></span>",
-                escape(kind),
-                count
-            ));
-        }
-        html.push_str("</div>\n");
-    }
-
+    html.push_str("<h3>Services</h3>\n");
     if !domain.loaded {
-        html.push_str(
-            "<div class=\"no-services\">Not read yet - the next request to it will.</div>\n",
-        );
+        html.push_str("<div class=\"none\">Not read yet - the next request to it will.</div>\n");
     } else if domain.servers.is_empty() {
-        html.push_str(
-            "<div class=\"no-services\">No services: this project is answered from its files and \
-             its script alone.</div>\n",
-        );
+        html.push_str("<div class=\"none\">None</div>\n");
     }
     for server in &domain.servers {
         html.push_str(&render_service(server));
     }
-
     if !domain.script.is_empty() {
         html.push_str(&format!(
-            "<details class=\"script\" open><summary>Routing <span class=\"from\">{}</span>             </summary>\n",
+            "<h3>Routing <span class=\"from\">{}</span></h3>\n",
             escape(&domain.source_name)
         ));
         html.push_str(&render_statements(&domain.script));
-        html.push_str("</details>\n");
+        if !domain.answers.is_empty() {
+            html.push_str("<div class=\"answers\"><span class=\"label\">Answered by</span>");
+            for (kind, count) in &domain.answers {
+                html.push_str(&format!(
+                    "<span class=\"answer\">{} <b>{}</b></span>",
+                    escape(kind),
+                    count
+                ));
+            }
+            html.push_str("</div>\n");
+        }
     }
 
-    html.push_str("</section>\n");
+    html.push_str(if collapsible { "</details>\n" } else { "</section>\n" });
     html
 }
 
@@ -171,7 +177,7 @@ fn render_service(server: &ServerStatus) -> String {
     };
     let mut html = format!(
         "<div class=\"service\">\n<div class=\"service-head\"><span class=\"name\">{}</span>\
-         <span class=\"state {}\">{}</span></div>\n",
+         <span class=\"kind\">podman</span><span class=\"state {}\">{}</span></div>\n",
         escape(&server.name),
         status_class(&server.state),
         escape(&state),
@@ -303,74 +309,87 @@ const STYLE: &str = r#"
 body { font-family: system-ui, sans-serif; margin: 0 auto; padding: 2em 1.5em; max-width: 60em;
        background: #f5f5f5; color: #222; line-height: 1.5; }
 h1 { font-size: 1.4em; color: #555; font-weight: 600; margin: 0 0 1em 0; }
-h2 { font-size: 1.25em; margin: 0; }
-.project { background: white; border-radius: 6px; padding: 1.2em 1.4em; margin-bottom: 1.2em;
-           box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-.meta { display: flex; flex-wrap: wrap; gap: 0.4em 1.2em; font-size: 0.85em; color: #777;
-        margin-top: 0.3em; }
-.meta .dir { font-family: ui-monospace, monospace; }
-.answers { margin-top: 0.9em; font-size: 0.85em; color: #666; display: flex; flex-wrap: wrap;
-           gap: 0.3em 1.2em; align-items: baseline; }
-.answers .label { color: #999; text-transform: uppercase; font-size: 0.85em;
-                  letter-spacing: 0.05em; }
-.answers b { color: #222; }
-.service { margin-top: 1em; padding: 0.7em 0.9em; background: #fafafa; border-radius: 5px;
-           border-left: 3px solid #ddd; }
-.service-head { display: flex; flex-wrap: wrap; gap: 0.8em; align-items: baseline; }
+
+/* A project: its identifying line, and everything else under it. */
+.project { background: white; border-radius: 6px; padding: 1em 1.3em; margin-bottom: 0.8em;
+           box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.project > summary, .project > .head { display: flex; flex-wrap: wrap; gap: 0.5em 1.2em;
+                                       align-items: baseline; }
+.project > summary { cursor: pointer; }
+.project > summary::marker { color: #bbb; }
+.domain { font-size: 1.1em; font-weight: 600; }
+.count { color: #999; font-size: 0.85em; margin-left: auto; }
+.dir { font-family: ui-monospace, monospace; font-size: 0.8em; color: #aaa; margin-top: 0.2em;
+       word-break: break-all; }
+
+/* Section headings inside a project, for Services and Routing alike. */
+h3 { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.06em; color: #aaa;
+     font-weight: 600; margin: 1.4em 0 0.5em 0; }
+h3 .from { text-transform: none; letter-spacing: 0; font-family: ui-monospace, monospace;
+           margin-left: 0.6em; color: #bbb; }
+.none { color: #999; font-size: 0.9em; }
+
+/* One service, or one thing the script routes to. */
+.service { padding: 0.55em 0.8em; margin-bottom: 0.4em; background: #fafafa; border-radius: 5px;
+           border-left: 3px solid #d8d8d8; }
+.service-head { display: flex; flex-wrap: wrap; gap: 0.7em; align-items: baseline; }
 .service-head .name { font-weight: 600; }
+.kind { font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.05em; color: #999;
+        border: 1px solid #ddd; border-radius: 3px; padding: 0 0.4em; }
 .state { font-size: 0.85em; }
 .runs { font-size: 0.85em; color: #666; margin-top: 0.2em; }
-.image { color: #888; margin-right: 0.7em; }
+.image { color: #999; margin-right: 0.7em; }
 code { font-family: ui-monospace, monospace; background: #efefef; padding: 0.05em 0.4em;
        border-radius: 3px; }
-.numbers { display: flex; flex-wrap: wrap; gap: 0.3em 1.2em; font-size: 0.8em; color: #888;
-           margin-top: 0.35em; }
-.sidecar { margin: 0.5em 0 0 1.2em; padding-left: 0.8em; border-left: 2px solid #e0e0e0;
+.numbers { display: flex; flex-wrap: wrap; gap: 0.3em 1.2em; font-size: 0.8em; color: #999;
+           margin-top: 0.3em; }
+.sidecar { margin: 0.45em 0 0 1em; padding-left: 0.8em; border-left: 2px solid #e0e0e0;
            font-size: 0.85em; color: #666; }
 .sidecar .name { font-weight: 600; color: #555; margin-right: 0.7em; }
-.sidecar .address { font-family: ui-monospace, monospace; color: #999; margin-left: 0.7em; }
-.no-services { margin-top: 0.8em; font-size: 0.85em; color: #888; }
-.problem { margin-top: 0.6em; font-size: 0.85em; color: #c22; }
-.script { margin-top: 1.2em; font-size: 0.85em; }
-.script summary { cursor: pointer; color: #999; text-transform: uppercase; font-size: 0.85em;
-                  letter-spacing: 0.05em; }
-.script summary .from { text-transform: none; letter-spacing: 0; margin-left: 0.6em;
-                        font-family: ui-monospace, monospace; }
-.stmts { list-style: none; margin: 0.5em 0 0 0; padding: 0; }
-.stmts .stmts { margin: 0.25em 0 0.25em 0.6em; padding-left: 0.9em;
-                border-left: 2px solid #e3e3e3; }
-.stmts li { padding: 0.12em 0; }
-.stmts .verb { font-family: ui-monospace, monospace; font-weight: 600; color: #345; }
-.stmts .arg { font-family: ui-monospace, monospace; color: #777; margin-left: 0.6em;
+.sidecar .address { font-family: ui-monospace, monospace; color: #aaa; margin-left: 0.7em; }
+
+/* The script, nested as it is written. */
+.stmts { list-style: none; margin: 0; padding: 0; font-size: 0.85em; }
+.stmts .stmts { margin: 0.2em 0 0.2em 0.5em; padding-left: 0.9em; border-left: 2px solid #e3e3e3; }
+.stmts li { padding: 0.1em 0; }
+.stmts .verb { font-family: ui-monospace, monospace; font-weight: 600; color: #456; }
+.stmts .arg { font-family: ui-monospace, monospace; color: #888; margin-left: 0.6em;
               word-break: break-word; }
-.otherwise { margin-top: 0.25em; }
-.stmts .implicit { opacity: 0.65; }
-.stmts .implicit::after { content: " implicit"; font-size: 0.85em; color: #aaa;
+.otherwise { margin-top: 0.2em; }
+.stmts .implicit { opacity: 0.6; }
+.stmts .implicit::after { content: " implicit"; font-size: 0.85em; color: #bbb;
                           margin-left: 0.6em; }
+.answers { margin-top: 0.8em; font-size: 0.8em; color: #888; display: flex; flex-wrap: wrap;
+           gap: 0.3em 1.2em; align-items: baseline; }
+.answers .label { color: #bbb; text-transform: uppercase; font-size: 0.9em;
+                  letter-spacing: 0.05em; }
+.answers b { color: #444; }
+
+.problem { margin-top: 0.5em; font-size: 0.85em; color: #c22; }
 .status-running { color: #2a2; }
-.status-stopped { color: #888; }
+.status-stopped { color: #999; }
 .status-starting { color: #f90; }
 .status-failed { color: #c22; }
-.cert-valid { color: #2a2; }
-.cert-error { color: #c22; }
-.cert-acquiring { color: #f90; }
-.cert-none { color: #aaa; }
+.cert-valid { color: #2a2; font-size: 0.85em; }
+.cert-error { color: #c22; font-size: 0.85em; }
+.cert-acquiring { color: #f90; font-size: 0.85em; }
+.cert-none { color: #bbb; font-size: 0.85em; }
 .server-info { display: flex; gap: 1em; flex-wrap: wrap; margin-bottom: 1.5em; }
 .info-card { background: white; border-radius: 6px; padding: 0.8em 1.4em;
-             box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-.info-card h3 { margin: 0; color: #999; font-size: 0.75em; text-transform: uppercase;
-                letter-spacing: 0.05em; font-weight: 600; }
+             box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.info-card h3 { margin: 0; color: #aaa; }
 .info-card .value { font-size: 1.3em; }
-.empty { color: #888; }
+.empty { color: #999; }
+
 @media (prefers-color-scheme: dark) {
   body { background: #16181c; color: #ddd; }
   h1, .sidecar .name { color: #aaa; }
   .project, .info-card { background: #1f2228; box-shadow: none; }
   .service { background: #23262d; border-left-color: #3a3f48; }
   code { background: #23262d; }
+  .kind { border-color: #3a3f48; }
   .stmts .verb { color: #8fb8d8; }
-  .stmts .stmts { border-left-color: #3a3f48; }
+  .stmts .stmts, .sidecar { border-left-color: #3a3f48; }
   .answers b, .info-card .value { color: #eee; }
-  .sidecar { border-left-color: #3a3f48; }
 }
 "#;
