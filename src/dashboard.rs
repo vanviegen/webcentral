@@ -26,6 +26,8 @@ pub struct ServerStatus {
     pub pending_requests: u64,
     pub active_upgrades: u64,
     pub idle_seconds: Option<u64>,
+    /// What the container is given, values masked - see `mask`.
+    pub env: Vec<(String, String)>,
     /// Services nested inside this one, which share its lifetime and have no state of their own.
     pub sidecars: Vec<SidecarStatus>,
 }
@@ -38,6 +40,7 @@ pub struct SidecarStatus {
     /// `<name>.internal:<port>` is the only way its peers reach it - which is worth saying, since
     /// it has to be written into the configuration by hand.
     pub port: u16,
+    pub env: Vec<(String, String)>,
 }
 
 pub struct DomainStatus {
@@ -211,6 +214,8 @@ fn render_service(server: &ServerStatus) -> String {
             .collect::<String>()
     ));
 
+    html.push_str(&render_env(&server.env));
+
     for sidecar in &server.sidecars {
         html.push_str(&format!(
             "<div class=\"sidecar\"><span class=\"name\">{}</span>{}             <span class=\"address\">{}.internal:{}</span></div>\n",
@@ -219,6 +224,7 @@ fn render_service(server: &ServerStatus) -> String {
             escape(&sidecar.name),
             sidecar.port,
         ));
+        html.push_str(&render_env(&sidecar.env));
     }
 
     html.push_str("</div>\n");
@@ -245,6 +251,25 @@ fn render_statements(stmts: &[crate::script::Outline]) -> String {
         html.push_str("</li>\n");
     }
     html.push_str("</ul>\n");
+    html
+}
+
+/// The environment a container is given. Worth showing: whether a variable arrived at all, and
+/// with roughly the right value, is most of what goes wrong with one - and the value itself is
+/// masked, so a page that says a token is set does not hand it over.
+fn render_env(env: &[(String, String)]) -> String {
+    if env.is_empty() {
+        return String::new();
+    }
+    let mut html = String::from("<div class=\"env\">");
+    for (name, value) in env {
+        html.push_str(&format!(
+            "<span class=\"var\"><b>{}</b>={}</span>",
+            escape(name),
+            escape(value)
+        ));
+    }
+    html.push_str("</div>\n");
     html
 }
 
@@ -345,6 +370,9 @@ code { font-family: ui-monospace, monospace; background: #efefef; padding: 0.05e
            font-size: 0.85em; color: #666; }
 .sidecar .name { font-weight: 600; color: #555; margin-right: 0.7em; }
 .sidecar .address { font-family: ui-monospace, monospace; color: #aaa; margin-left: 0.7em; }
+.env { display: flex; flex-wrap: wrap; gap: 0.2em 1em; margin-top: 0.35em; font-size: 0.8em;
+       font-family: ui-monospace, monospace; color: #999; }
+.env b { font-weight: 600; color: #777; }
 
 /* The script, nested as it is written. */
 .stmts { list-style: none; margin: 0; padding: 0; font-size: 0.85em; }
@@ -386,6 +414,7 @@ code { font-family: ui-monospace, monospace; background: #efefef; padding: 0.05e
   .service { background: #23262d; border-left-color: #3a3f48; }
   code { background: #23262d; }
   .stmts .verb { color: #8fb8d8; }
+  .env b { color: #999; }
   .stmts .stmts, .sidecar { border-left-color: #3a3f48; }
   .answers b, .info-card .value { color: #eee; }
 }

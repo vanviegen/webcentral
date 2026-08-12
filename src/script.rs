@@ -385,22 +385,31 @@ impl Vars {
         self.0.insert(name.into(), value.into());
     }
 
-    /// Copy the request's headers in, once, as `header:<name>`. Done separately from
-    /// `set_request` because headers do not change when the path does, and a request carries
-    /// enough of them that repeating this on every rewrite would not be free.
+    /// Copy in the headers the script actually reads, as `header:<name>`. Only those: a request
+    /// carries twenty of them and a script reads none, so copying them all would be a string
+    /// allocation apiece for nothing. Which ones are read is known when the file is parsed,
+    /// because a `${header:...}` name is always a literal.
     ///
     /// A header sent more than once is joined with `, `, which is what the HTTP specification says
     /// a repeated field is equivalent to.
-    fn set_headers<B>(&mut self, req: &Request<B>) {
-        for name in req.headers().keys() {
-            let joined = req
-                .headers()
-                .get_all(name)
-                .iter()
-                .filter_map(|value| value.to_str().ok())
-                .collect::<Vec<_>>()
-                .join(", ");
-            self.set(format!("{}{}", HEADER_PREFIX, name.as_str()), joined);
+    fn set_headers<B>(&mut self, req: &Request<B>, wanted: &[String]) {
+        for name in wanted {
+            let Ok(header) = http::header::HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            let mut values =
+                req.headers().get_all(&header).iter().filter_map(|value| value.to_str().ok());
+            let Some(first) = values.next() else { continue };
+            // The overwhelmingly common case is one value, which should not pay for a Vec.
+            let joined = match values.next() {
+                None => first.to_string(),
+                Some(second) => std::iter::once(first)
+                    .chain(std::iter::once(second))
+                    .chain(values)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            self.set(format!("{}{}", HEADER_PREFIX, name), joined);
         }
     }
 
@@ -462,6 +471,8 @@ pub struct Env<'a> {
     /// Whether this project may serve the server-wide dashboard: true when the project belongs
     /// to the user webcentral runs as, since that page shows every user's domains.
     pub admin_allowed: bool,
+    /// The request headers this project's script reads, and so the only ones worth copying.
+    pub read_headers: &'a [String],
 }
 
 /// The result of a run: what to do, plus response decorations gathered along the way.
@@ -483,8 +494,9 @@ struct Run<'a> {
 
 /// Run `script` against `req`, mutating its URI as `rewrite` statements ask.
 pub async fn run<B>(script: &[Stmt], env: Env<'_>, vars: Vars, req: &mut Request<B>) -> Result<Outcome> {
+    let read_headers = env.read_headers;
     let mut run = Run { env, vars, headers: Vec::new(), answered_by: "not found" };
-    run.vars.set_headers(req);
+    run.vars.set_headers(req, read_headers);
     run.vars.set_request(req);
     let terminal = match run.block(script, req).await? {
         Some(terminal) => terminal,

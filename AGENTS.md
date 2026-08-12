@@ -40,7 +40,9 @@ container config overrides, and the working directory
 `src/dashboard.rs` - The built-in status page. A section per project rather than a row, since a
 project is a script, some services and their sidecars rather than one thing with a type: each
 service's image/command/state/port and counts, its sidecars nested under it with the
-`<name>.internal:<port>` their peers use, a tally of which *kind* of statement answered, and the
+`<name>.internal:<port>` their peers use, the environment each is given with the middle of every
+value masked (`project::mask`; values under 12 characters are shown whole, being ports and modes
+rather than secrets), a tally of which *kind* of statement answered, and the
 script itself as a nested list. A `forward` or `proxy` target is deliberately *not* listed as a
 service: it has no lifecycle to report, and the routing section already says where it goes. On the admin page each
 project folds away behind its domain/TLS/request-count line; a project's own page does not fold. The script is rendered from the AST (`script::outline`) rather
@@ -100,10 +102,14 @@ some requests are worth recording. Settings stay in a block rather than becoming
 both at the top level would make a bare `=` significant outside a settings block, which is exactly
 what keeps `=` ordinary in patterns and secrets.
 
-`${header:Name}` reads a request header, folded to lower case, copied into `Vars` once per request
-by `Vars::set_headers` (not per rewrite - headers don't change when the path does). Any name is
-valid, so the never-set check skips them; `set` refuses one, since `set_header` writes the
-*response*. `env_file` takes `prefix=`, which namespaces a file's keys.
+`${header:Name}` reads a request header, folded to lower case. Only the headers the file actually
+names are copied into `Vars` (`ProjectConfig::read_headers`, gathered from the same reference list
+the never-set check uses): a `${header:...}` name is always a literal, since `${` is not recognised
+inside one, so the set is known at parse time and a script that reads none costs a request nothing.
+`set` refuses one, since `set_header` writes the *response*.
+
+`env_file` keys are `${env:KEY}`; `prefix=` names another and `prefix=` alone drops it. A bare
+`KEY` in an `env` block means `KEY = ${env:KEY}`, and is an error when nothing sets that.
 
 `env_file <path>` reads `KEY=value` lines into those same constants, in file order like `set`, so
 a secret lives outside `webcentral.conf` and reaches only what names it - nothing is injected into

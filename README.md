@@ -718,7 +718,7 @@ service app {
     user = 999:999          # what the postgres image switches to at run time
     app_dir = none
     mounts = /var/lib/postgresql/data
-    env { POSTGRES_PASSWORD = ${DB_PASSWORD} }
+    env { POSTGRES_PASSWORD = ${env:DB_PASSWORD} }
   }
 }
 serve app
@@ -882,8 +882,8 @@ otherwise silently be empty, which is a typo far more often than it is intent.
 ### Secrets
 
 A password does not belong in `webcentral.conf`, which lives in the project directory and usually
-in git. `env_file` reads `KEY=value` lines from somewhere else and makes them constants, so they
-reach exactly what names them and nothing else:
+in git. `env_file` reads `KEY=value` lines from somewhere else and makes them constants named
+`${env:KEY}`, so they reach exactly what names them and nothing else:
 
 ```ini
 env_file .env
@@ -891,7 +891,7 @@ env_file .env
 service {
   command = ./app
   env {
-    DATABASE_URL = postgres://app:${DB_PASSWORD}@db.internal:5432/app
+    DATABASE_URL = postgres://app:${env:DB_PASSWORD}@db.internal:5432/app
   }
   service db {
     base = postgres:16
@@ -900,13 +900,13 @@ service {
     app_dir = none
     mounts = /var/lib/postgresql/data
     env {
-      POSTGRES_PASSWORD = ${DB_PASSWORD}
+      POSTGRES_PASSWORD = ${env:DB_PASSWORD}
       POSTGRES_USER = app
       POSTGRES_DB = app
     }
   }
 }
-check_auth ${DASHBOARD_SECRET} { project_dashboard }
+check_auth ${env:DASHBOARD_SECRET} { project_dashboard }
 serve
 ```
 
@@ -922,14 +922,29 @@ line, because `podman run` stays alive for as long as the container does and any
 can read another process's command line with `ps`. Nothing is written to disk for it, and the
 startup log line records the variable's name without its value.
 
-`prefix=` keeps a file's names together, which says where a value came from and lets two files be
-read without their keys colliding:
+The `env:` prefix says where a value came from, and keeps a file's keys from colliding with a
+constant or with another file's. `prefix=` names a different one, and `prefix=` on its own drops it:
 
 ```ini
-env_file .env prefix=env:
+env_file .env
 env_file secrets/stripe.env prefix=stripe:
 
 respond 200 "${env:GREETING} ${stripe:PUBLISHABLE_KEY}"
+```
+
+Passing one on to a container usually means writing the same name three times, so a bare name in
+an `env` block is shorthand for exactly that - `STRIPE_KEY` means `STRIPE_KEY = ${env:STRIPE_KEY}`:
+
+```ini
+env_file .env
+
+service {
+  command = ./app
+  env {
+    STRIPE_KEY                          # the same as STRIPE_KEY = ${env:STRIPE_KEY}
+    LOG_LEVEL = debug
+  }
+}
 ```
 
 Keep the file out of git (`.gitignore`) and readable only by the project owner.

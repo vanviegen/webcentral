@@ -849,11 +849,11 @@ serve api
     t.write_file('watched/deep/file.txt', 'second')
     t.await_log('Stopping due to file changes: watched/deep/file.txt')
 
-    # Saying it in `settings` says where it belongs instead of quietly doing nothing
+    # It is not a project-wide setting, so saying it there is rejected rather than ignored
     t.write_file('webcentral.conf', 'settings {\n  reload_include = src\n}\nrespond 200 ok\n')
     t.await_log('(reloading configuration)')
     t.assert_http('/', check_body='ok')
-    t.assert_log("'reload_include' belongs in the service it restarts", count=1)
+    t.assert_log("Unknown setting 'reload_include'", count=1)
 
 
 @test
@@ -1424,13 +1424,14 @@ env_file .env
 service {
   command = python3 -u app.py --port $PORT
   env {
-    DATABASE_URL = postgres://app:${DB_PASSWORD}@db.internal:5432/app
-    NOTE = ${QUOTED}
+    DATABASE_URL = postgres://app:${env:DB_PASSWORD}@db.internal:5432/app
+    NOTE = ${env:QUOTED}
+    DB_PASSWORD
   }
 }
 
-match /secret { respond 200 "the secret is ${DB_PASSWORD}" }
-check_auth ${DASHBOARD_SECRET} { respond 200 "admin ok" }
+match /secret { respond 200 "the secret is ${env:DB_PASSWORD}" }
+check_auth ${env:DASHBOARD_SECRET} { respond 200 "admin ok" }
 serve
 """)
 
@@ -1453,6 +1454,8 @@ serve
     # variable without its value, and /proc/<pid>/environ is readable only by its owner.
     log = t.get_log_content(t.current_test_domain)
     assert '-e DATABASE_URL ' in log, "DATABASE_URL was not passed by name"
+    # A bare name in an env block passes on the value of the same name
+    assert '-e DB_PASSWORD ' in log, "the bare `DB_PASSWORD` was not passed on"
     assert 'DATABASE_URL=' not in log, "the value reached the command line"
     # Nothing is written to disk for it either
     data = os.path.join(t.tmpdir, t.current_test_domain, '_webcentral_data')
@@ -1478,7 +1481,7 @@ serve_dir public
 def test_env_file_change_reloads(t):
     """Editing an env_file changes what the configuration means, so the project reloads"""
     t.write_file('.env', 'GREETING=first\n')
-    t.write_file('webcentral.conf', 'env_file .env\nrespond 200 "${GREETING}"\n')
+    t.write_file('webcentral.conf', 'env_file .env\nrespond 200 "${env:GREETING}"\n')
     t.assert_http('/', check_body='first')
     t.mark_log_read()
 
@@ -2012,25 +2015,70 @@ respond 200 loud
 
 @test
 def test_env_file_prefix(t):
-    """env_file can keep a file's names together under a prefix of their own"""
+    """A file's keys are `${env:KEY}` unless the statement names another prefix"""
     t.write_file('.env', 'TOKEN=s3cret\n')
+    t.write_file('secrets/other.env', 'TOKEN=different\n')
     t.write_file('webcentral.conf', """
-env_file .env prefix=env:
-match /prefixed { respond 200 "token=${env:TOKEN}" }
+env_file .env
+env_file secrets/other.env prefix=other:
+match /default { respond 200 "token=${env:TOKEN}" }
+match /named { respond 200 "token=${other:TOKEN}" }
 respond 200 root
 """)
 
-    t.assert_http('/prefixed', check_body='token=s3cret')
+    # Two files with the same key, kept apart by their prefixes
+    t.assert_http('/default', check_body='token=s3cret')
+    t.assert_http('/named', check_body='token=different')
 
-    # Without the prefix the bare name is what it was read as, and the prefixed one is not defined
+    # An empty prefix puts the keys in as they are written
     t.mark_log_read()
     t.write_file('webcentral.conf', """
-env_file .env prefix=env:
+env_file .env prefix=
 respond 200 "${TOKEN}"
 """)
     t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='s3cret')
+
+    # ...and the prefixed name is then not defined, which is reported rather than left empty
+    t.mark_log_read()
+    t.write_file('webcentral.conf', """
+env_file .env prefix=
+respond 200 "${env:TOKEN}"
+""")
+    t.await_log('(reloading configuration)')
     t.assert_http('/', check_code=200)
-    t.assert_log("'${TOKEN}' is never set", count=1)
+    t.assert_log("'${env:TOKEN}' is never set", count=1)
+
+
+@test
+def test_env_block_bare_name(t):
+    """A bare KEY in an env block passes on the secret of the same name"""
+    t.write_file('.env', 'TOKEN=s3cret\n')
+    t.write_file('webcentral.conf', """
+env_file .env
+service {
+  command = python3 -u -m http.server $PORT
+  env { TOKEN }
+}
+""")
+    t.write_file('index.html', 'up')
+
+    t.assert_http('/', check_body='up')
+    t.await_log('Running:')
+    t.assert_log('-e TOKEN ', count=1)
+    t.assert_log('s3cret', count=0)
+
+    # A bare name nothing set says what it means, rather than passing an empty value
+    t.mark_log_read()
+    t.write_file('webcentral.conf', """
+service {
+  command = python3 -u -m http.server $PORT
+  env { NOT_SET_ANYWHERE }
+}
+""")
+    t.await_log('(reloading configuration)')
+    t.assert_http('/', check_body='up', timeout=30)
+    t.assert_log("nothing sets that", count=1)
 
 
 @test
@@ -2043,6 +2091,10 @@ def test_dashboard_shows_the_shape_of_a_project(t):
     t.write_file('webcentral.conf', """
 service {
   command = sleep 999
+  env {
+    SHORT = 8000
+    LONG = abcdefghijklmnopqrstuvwxyz
+  }
   service helper {
     command = sleep 998
   }
@@ -2069,6 +2121,11 @@ respond 200 hello
     # The script that routes the requests, as parsed - including the tail nothing wrote
     assert 'webcentral.conf' in body, body
     assert 'implicit' in body, body
+    # A service's environment is shown with the middle of long values masked, so the page says a
+    # secret is set without handing it over
+    assert '>SHORT</b>=8000' in body, body
+    assert '>LONG</b>=abcd…wxyz' in body, body
+    assert 'abcdefgh' not in body, body
 
     # project_dashboard shows only the project's own slice: no other domains, and none of the
     # server-wide numbers
@@ -2527,7 +2584,7 @@ def test_readme_examples_are_valid(t):
         os.makedirs(d, exist_ok=True)
         # Examples that read secrets need the files to exist; the values do not matter here.
         with open(os.path.join(d, '.env'), 'w') as f:
-            f.write('DB_PASSWORD=x\nDASHBOARD_SECRET=y\nGREETING=hello\n')
+            f.write('DB_PASSWORD=x\nDASHBOARD_SECRET=y\nGREETING=hello\nSTRIPE_KEY=sk\n')
         os.makedirs(os.path.join(d, 'secrets'), exist_ok=True)
         with open(os.path.join(d, 'secrets/stripe.env'), 'w') as f:
             f.write('PUBLISHABLE_KEY=pk_test\n')

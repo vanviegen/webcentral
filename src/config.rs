@@ -24,6 +24,9 @@ use std::path::Path;
 
 pub const CONFIG_FILE: &str = "webcentral.conf";
 
+/// What an `env_file`'s keys are called unless the statement says otherwise.
+pub const ENV_PREFIX: &str = "env:";
+
 /// Request variables that only ever describe what arrived, so `set` refuses them. `path` and
 /// `query` are deliberately absent: assigning those is how a request is re-pointed.
 const READ_ONLY_VARS: &[&str] =
@@ -208,6 +211,10 @@ pub struct ProjectConfig {
     pub warnings: Vec<String>,
     /// Where the configuration came from - the file itself, or what was detected in its absence.
     pub source_name: String,
+    /// The request headers the script reads, folded to lower case. A `${header:...}` name is
+    /// always a literal - `${` is not recognised inside one - so the whole set is known here, and
+    /// a request copies these and nothing else.
+    pub read_headers: Vec<String>,
     /// Where the implicit tail starts in `script` - everything from here was appended by
     /// webcentral rather than written in the file.
     pub implicit_from: usize,
@@ -580,6 +587,7 @@ pub fn parse(source: &str, dir: Option<&Path>) -> ProjectConfig {
             errors: Vec::new(),
             warnings: Vec::new(),
             source_name: CONFIG_FILE.to_string(),
+            read_headers: Vec::new(),
             implicit_from: 0,
         },
         vars: Vars::default(),
@@ -638,8 +646,13 @@ impl<'a> Builder<'a> {
         // is intent. The check is file-wide rather than per branch: knowing a name is defined
         // *somewhere* is enough to keep it from being a mistake, and avoids false alarms.
         for (name, pos) in std::mem::take(&mut self.referenced) {
-            // Whatever a request happens to carry, so there is nothing to check it against.
-            if name.starts_with(crate::script::HEADER_PREFIX) {
+            // Whatever a request happens to carry, so there is nothing to check it against - but
+            // worth remembering, since a header nobody reads should cost a request nothing.
+            if let Some(header) = name.strip_prefix(crate::script::HEADER_PREFIX) {
+                let folded = header.to_ascii_lowercase();
+                if !self.config.read_headers.contains(&folded) {
+                    self.config.read_headers.push(folded);
+                }
                 continue;
             }
             if !self.defined.contains(&name) {
@@ -868,10 +881,10 @@ impl<'a> Builder<'a> {
                     return;
                 };
                 let path = self.expand(&word);
-                // `prefix=env:` makes the file's keys `${env:KEY}`, which keeps a secret's origin
-                // visible and lets two files be read without their names colliding. Written out in
-                // full rather than implied, since the prefix is part of how the name reads.
-                let mut prefix = String::new();
+                // `${env:KEY}` by default: it says where a value came from, keeps a file's keys
+                // from colliding with a `set` constant or with another file's, and reads like
+                // `${header:...}`. `prefix=` names another, and `prefix=` on its own drops it.
+                let mut prefix = ENV_PREFIX.to_string();
                 if let Some(next) = self.scanner.read_word() {
                     match next.text.split_once('=') {
                         Some(("prefix", value)) => prefix = value.to_string(),
@@ -1373,17 +1386,6 @@ impl<'a> Builder<'a> {
 
     fn settings_block(&mut self) {
         self.each_setting(|me, key| match key.text.as_str() {
-            // Named here in 3.0's release candidates, and worth saying where they went.
-            "reload_include" | "reload_exclude" => {
-                me.scanner.error_at(
-                    key.pos,
-                    format!(
-                        "'{}' belongs in the service it restarts, not in 'settings'",
-                        key.text
-                    ),
-                );
-                me.scanner.skip_line();
-            }
             "redirect_http" => me.config.redirect_http = me.bool_value(),
             "redirect_https" => me.config.redirect_https = me.bool_value(),
             other => {
@@ -1393,16 +1395,41 @@ impl<'a> Builder<'a> {
         });
     }
 
+    /// An `env { }` block: `KEY = value` lines, and bare `KEY` for the common case of passing on
+    /// a secret of the same name - `KEY` alone means `KEY = ${env:KEY}`, so the name is written
+    /// once rather than three times.
     fn map_block(&mut self) -> Vec<(String, String)> {
         let mut entries = Vec::new();
-        self.each_setting(|me, key| {
-            let value = match me.scanner.read_word() {
-                Some(word) => me.expand(&word),
+        loop {
+            self.scanner.skip_separators();
+            if self.scanner.read_block_close() || self.scanner.at_eof() {
+                return entries;
+            }
+            let Some(key) = self.scanner.read_key() else { continue };
+            if !self.scanner.read_eq() {
+                let name = format!("{}{}", ENV_PREFIX, key.text);
+                if !self.defined.contains(&name) {
+                    self.scanner.error_at(
+                        key.pos,
+                        format!(
+                            "'{}' on its own means '{} = ${{{}}}', and nothing sets that",
+                            key.text, key.text, name
+                        ),
+                    );
+                    self.scanner.skip_line();
+                    continue;
+                }
+                entries.push((key.text, self.vars.get(&name).to_string()));
+                self.end_of_setting();
+                continue;
+            }
+            let value = match self.scanner.read_word() {
+                Some(word) => self.expand(&word),
                 None => String::new(),
             };
             entries.push((key.text, value));
-        });
-        entries
+            self.end_of_setting();
+        }
     }
 
     fn bool_value(&mut self) -> Option<bool> {

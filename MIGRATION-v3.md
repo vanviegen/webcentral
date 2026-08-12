@@ -265,7 +265,7 @@ pretending to be more:
 
 ```ini
 env_file .env                       # DASHBOARD_SECRET=...
-check_auth ${DASHBOARD_SECRET} { project_dashboard }
+check_auth ${env:DASHBOARD_SECRET} { project_dashboard }
 respond 401
 ```
 
@@ -296,8 +296,9 @@ else the script can answer with. See **Internal redirects** in the README.
 - **If the project already has a `Dockerfile`, delete the service block** and let it be used. The
   Dockerfile answers every question webcentral would otherwise ask, in any language.
 - **Move secrets into `env_file`.** `webcentral.conf` lives in the project directory and usually in
-  git; an `env_file` does not have to. Nothing reaches a container's environment unless something
-  names it, and values are handed to podman through its own environment rather than its command
+  git; an `env_file` does not have to. Its keys are `${env:KEY}`, and a bare `KEY` in an `env`
+  block passes one on under its own name. Nothing reaches a container's environment unless
+  something names it, and values are handed to podman through its own environment rather than its command
   line, which `ps` shows to every user on the machine.
 - **Check the reload rules**, per the inversion described above. It is the one change that fails
   silently.

@@ -49,6 +49,27 @@ fn proxy_connector(target: &str) -> AnyConnector {
     }
 }
 
+/// A container's environment with the middle of each value replaced, so the dashboard can show
+/// that a variable is set, and roughly to what, without handing over a token to whoever can reach
+/// the page. Short values are shown as they are: they are almost always a port, a hostname or a
+/// mode, and a masked one that tells you nothing is worse than none at all - so anything short
+/// enough to be worth hiding should not be a secret in the first place.
+fn masked_env(env: &[(String, String)]) -> Vec<(String, String)> {
+    env.iter().map(|(name, value)| (name.clone(), mask(value))).collect()
+}
+
+fn mask(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() < 12 {
+        return value.to_string();
+    }
+    format!(
+        "{}…{}",
+        chars[..4].iter().collect::<String>(),
+        chars[chars.len() - 4..].iter().collect::<String>()
+    )
+}
+
 /// What a service runs, said the way the configuration says it: its own image, the Dockerfile it
 /// builds, or - for a sidecar that names none - its parent's.
 fn describe_image(
@@ -243,6 +264,7 @@ impl Project {
                 name: server.name().to_string(),
                 image: describe_image(&server.config, None),
                 command: server.config.command.clone(),
+                env: masked_env(&server.config.env),
                 sidecars: server
                     .config
                     .sidecars
@@ -252,6 +274,7 @@ impl Project {
                         image: describe_image(sidecar, Some(&server.config)),
                         command: sidecar.command.clone(),
                         port: sidecar.port,
+                        env: masked_env(&sidecar.env),
                     })
                     .collect(),
                 state: match server.state() {
@@ -405,6 +428,7 @@ impl Project {
             logger: &self.logger,
             domain: &self.domain,
             admin_allowed: self.admin_allowed,
+            read_headers: &self.config.read_headers,
         };
         let outcome = script::run(&self.config.script, env, vars, req).await?;
         *self.answers.entry(outcome.answered_by).or_insert(0) += 1;
