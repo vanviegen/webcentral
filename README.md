@@ -1078,6 +1078,11 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-08-12 (3.0.1):
+  - A `base` naming no registry means Docker Hub, unless an image of that name is already on the machine. Podman, unlike docker, refuses a short name it cannot place, with an error that says nothing about where it expected to find it.
+  - Rootless podman's need for `pasta` or `slirp4netns` is checked for along with the subordinate id range, and named with the package that carries it. Podman 5 asks for pasta where podman 4 asked for slirp4netns, so a host upgraded across that line fails every container start with `could not find pasta`.
+  - A probe that cannot tell which user an image runs as now says why. It threw podman's reason away and reported only that it could not tell, which read as a fact about the image when the host was in fact unable to start any container at all.
+
 2026-08-12 (3.0.0):
   - **`webcentral.ini` is replaced by `webcentral.conf`**, a small configuration language. A project's requests are handled by a routing script run top to bottom - `match`, `serve`, `serve_dir`, `check_file`, `forward`, `proxy`, `respond` and friends - which subsumes what used to be fixed project types: a redirect project is now the one-line script `redirect https://example.com status=301`. Nearly every 2.x project needs converting; see [MIGRATION-v3.md](MIGRATION-v3.md).
   - Configuration errors are reported with **line and column**, all of them in one pass, and the rest of the file still runs. `webcentral check <dir>` parses a project and prints every problem without starting anything.
@@ -1099,8 +1104,6 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
   - **Authentication belongs to the application.** Accounts, password hashes and the auth cookie are gone; what remains is `check_auth <secret>` for guarding something small.
   - **What restarts an application has been inverted**: 2.x watched every file except a short exclusion list, 3.0 watches a whitelist of source directories, source extensions and dependency manifests. A project whose application reads a `config.yaml` or a template at startup has to say so with `reload_include`.
   - `Procfile` is no longer detected: the Heroku compatibility was always just superficial at best. `package.json` with a `start` script still is.
-  - A `base` naming no registry means Docker Hub, unless an image of that name is already on the machine. Podman, unlike docker, refuses a short name it cannot place, with an error that says nothing about where it expected to find it.
-  - Rootless podman's need for `pasta` or `slirp4netns` is checked for along with the subordinate id range, and named with the package that carries it. Podman 5 asks for pasta where podman 4 asked for slirp4netns, so a host upgraded across that line fails every container start with `could not find pasta`.
   - Fix containers being orphaned on shutdown, both because only SIGINT was handled - not the SIGTERM systemd sends - and because the stop was never waited for.
   - Fix services being unreachable on IPv6 hosts: ports are published on `127.0.0.1` and addressed that way.
 

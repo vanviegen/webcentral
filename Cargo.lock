@@ -2346,7 +2346,7 @@ dependencies = [
 
 [[package]]
 name = "webcentral"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "anyhow",
  "bytes",
