@@ -71,6 +71,12 @@ impl Owner {
             .unwrap_or_else(|| uid.to_string());
         let mut problems = Vec::new();
 
+        // A container of root's own is given a bridge by netavark and needs none of this; every
+        // other case is rootless, whether webcentral becomes the owner or already is them.
+        if uid != 0 {
+            problems.extend(rootless_network_problems());
+        }
+
         // Already this user: podman's own defaults are what we want, and setting an identity we
         // already have would need privileges we do not have.
         if nix::unistd::geteuid().as_raw() == uid {
@@ -301,6 +307,70 @@ fn newidmap_problems() -> Vec<String> {
         }
     }
     problems
+}
+
+/// Rootless podman cannot give a container a network by itself: it shells out to `pasta` or
+/// `slirp4netns`, and podman 5 changed which of the two it reaches for by default. A host with
+/// podman 5 and only slirp4netns installed - the shape a distribution upgrade leaves behind - then
+/// fails every `run` with `could not find pasta`, which names the binary but not the package that
+/// carries it, and says nothing about the alternative.
+fn rootless_network_problems() -> Vec<String> {
+    let (pasta, slirp) = (helper_exists("pasta"), helper_exists("slirp4netns"));
+    if pasta {
+        return Vec::new();
+    }
+    if !slirp {
+        return vec![
+            "Neither pasta nor slirp4netns is installed, and rootless podman needs one of them to \
+             give a container a network. Install your distribution's passt package (Debian and \
+             Ubuntu: apt install passt)."
+                .to_string(),
+        ];
+    }
+    // slirp4netns is there, so this is only a problem if podman would rather have pasta. Asked of
+    // the binary rather than of `podman info`, which would have to be run once per owner against
+    // their store; the version is a fact about the installation.
+    if podman_major() >= 5 {
+        return vec![format!(
+            "podman {} gives a container its network with pasta by default, which is not \
+             installed, so containers will fail to start with 'could not find pasta'. Install \
+             your distribution's passt package (Debian and Ubuntu: apt install passt), or keep \
+             using the slirp4netns you do have by putting 'default_rootless_network_cmd = \
+             \"slirp4netns\"' under [network] in /etc/containers/containers.conf.",
+            podman_major()
+        )];
+    }
+    Vec::new()
+}
+
+/// Whether podman would find `name`. Its helpers are not always on `PATH` - a distribution may put
+/// them in one of podman's own directories instead - so those are searched too.
+fn helper_exists(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var("PATH").unwrap_or_default();
+    let helpers = "/usr/local/libexec/podman:/usr/local/lib/podman:/usr/libexec/podman:/usr/lib/podman";
+    path.split(':').chain(helpers.split(':')).any(|dir| {
+        std::fs::metadata(PathBuf::from(dir).join(name))
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    })
+}
+
+/// Podman's major version, or 0 when it cannot be read - which reports nothing rather than
+/// guessing. `--version` reads no configuration and opens no store, so it is cheap and needs no
+/// owner to be run as.
+fn podman_major() -> u32 {
+    use std::sync::OnceLock;
+    static MAJOR: OnceLock<u32> = OnceLock::new();
+    *MAJOR.get_or_init(|| {
+        let out = std::process::Command::new(podman_path()).arg("--version").output();
+        let Ok(out) = out else { return 0 };
+        // "podman version 5.8.2"
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .find_map(|word| word.split('.').next()?.parse().ok())
+            .unwrap_or(0)
+    })
 }
 
 /// Create a directory owned by someone else, which only root can do - and only root gets here.

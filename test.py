@@ -1661,6 +1661,26 @@ def test_simple_application(t):
 
     # Verify the app actually started
     t.assert_log('Ready on port', count=1)
+    # A host that can start a container is one whose rootless networking is fine, so the check for
+    # it must have stayed quiet: a false alarm there would be in every project's log
+    t.assert_log('pasta', count=0)
+    # ...and a locally built image is used under the name it has, not looked for on Docker Hub
+    t.assert_log('docker.io/', count=0)
+
+
+@test
+def test_short_image_names_come_from_docker_hub(t):
+    """A base naming no registry means Docker Hub, which is what everybody writing one means"""
+    t.write_file('webcentral.conf',
+                 'service {\n  base = webcentral-no-such-image/nope\n  command = true\n}')
+
+    # The pull cannot succeed - the point is which name it was tried under. Podman would otherwise
+    # refuse the short name outright, saying nothing about where it expected to find it.
+    try:
+        t.assert_http('/', timeout=30)
+    except Exception:
+        pass
+    t.await_log('Pulling docker.io/webcentral-no-such-image/nope', timeout=30)
 
 
 @test

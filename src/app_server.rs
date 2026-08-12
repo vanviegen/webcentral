@@ -66,6 +66,20 @@ pub struct AppConnection {
 /// How many images may be pulled or built at the same time, across every project. Enough to keep
 /// a slow registry from serialising everything, few enough that a restart is not a thundering
 /// herd.
+/// The same name with Docker Hub named in front of it, or `None` when it already names a
+/// registry. The rule is podman's own: the part before the first `/` is a registry when it looks
+/// like a host - it carries a dot or a port - or is `localhost`. A name with no `/` at all never
+/// names one, so `alpine:3` is a short name and not a host called `alpine`.
+fn qualified(image: &str) -> Option<String> {
+    let names_registry = match image.split_once('/') {
+        None => false,
+        Some((first, _)) => {
+            first == "localhost" || first.contains('.') || first.contains(':')
+        }
+    };
+    (!names_registry).then(|| format!("docker.io/{}", image))
+}
+
 fn image_work() -> &'static tokio::sync::Semaphore {
     static LIMIT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     LIMIT.get_or_init(|| tokio::sync::Semaphore::new(4))
@@ -805,8 +819,15 @@ impl AppServer {
 
     /// The uid/gid a container started from `image` actually runs as. This needs podman's help:
     /// `USER` may name a user that only exists inside the image, and an image declaring no user at
-    /// all runs as root. Cached per image+user, as it costs a container round trip.
-    async fn container_user_ids(&self, image: &str, user_arg: Option<&str>) -> Option<(u32, u32)> {
+    /// all runs as root. Cached per image+user, as it costs a container round trip. The `Err` is
+    /// whatever podman said when it could not be settled, which is worth carrying: a probe that
+    /// fails because the *host* cannot start any container at all otherwise looks like a fact
+    /// about the image.
+    async fn container_user_ids(
+        &self,
+        image: &str,
+        user_arg: Option<&str>,
+    ) -> Result<(u32, u32), String> {
         use std::collections::HashMap;
         use std::sync::{Mutex, OnceLock};
         static CACHE: OnceLock<Mutex<HashMap<String, (u32, u32)>>> = OnceLock::new();
@@ -814,7 +835,7 @@ impl AppServer {
 
         let key = format!("{}\0{}", image, user_arg.unwrap_or(""));
         if let Some(ids) = cache.lock().unwrap().get(&key) {
-            return Some(*ids);
+            return Ok(*ids);
         }
 
         // Asking `id` inside the container resolves names and an absent USER uniformly, and pulls
@@ -826,6 +847,7 @@ impl AppServer {
         }
         probe.args([image, "-c", "id -u; id -g"]);
 
+        let mut why = String::new();
         let ids = match probe.output().await {
             Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
@@ -838,7 +860,14 @@ impl AppServer {
                     _ => None,
                 }
             }
-            _ => None,
+            Ok(out) => {
+                why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                None
+            }
+            Err(e) => {
+                why = e.to_string();
+                None
+            }
         };
 
         // Images without a shell (distroless and friends) can't be probed, so fall back to the
@@ -859,16 +888,27 @@ impl AppServer {
                             parse_numeric_user(&declared)
                         }
                     }
-                    _ => None,
+                    Ok(out) => {
+                        why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                        None
+                    }
+                    Err(e) => {
+                        why = e.to_string();
+                        None
+                    }
                 }
             }
             (ids, _) => ids,
         };
 
-        if let Some(ids) = ids {
-            cache.lock().unwrap().insert(key, ids);
+        match ids {
+            Some(ids) => {
+                cache.lock().unwrap().insert(key, ids);
+                Ok(ids)
+            }
+            None if why.is_empty() => Err("the image declares a user it cannot resolve".to_string()),
+            None => Err(why),
         }
-        ids
     }
 
     /// Build (or reuse) an image derived from the configured base, optionally with `uid:gid` added
@@ -1125,13 +1165,13 @@ impl AppServer {
         let (run_uid, run_gid) = match known {
             Some(ids) => ids,
             None => match self.container_user_ids(&image, user_arg.as_deref()).await {
-                Some(ids) => ids,
-                None => {
+                Ok(ids) => ids,
+                Err(why) => {
                     self.logger.write("podman", &format!(
-                        "Could not determine which user image {} runs as; assuming root. If that's \
-                         wrong, files the container writes may not end up owned by the project \
-                         owner, and it may not be able to write in its mounts.",
-                        image));
+                        "Could not determine which user image {} runs as, so assuming root: {}. \
+                         If that's wrong, files the container writes may not end up owned by the \
+                         project owner, and it may not be able to write in its mounts.",
+                        image, why));
                     (0, 0)
                 }
             },
@@ -1269,22 +1309,18 @@ impl AppServer {
         // thing that decided how that went. The work still happens, just a few at a time.
         let _permit = image_work().acquire().await;
 
-        let base = match (&config.base, parent_image) {
-            (Some(base), _) => base.clone(),
-            (None, Some(parent)) => parent.to_string(),
-            (None, None) => DEFAULT_BASE_IMAGE.to_string(),
+        // A sidecar's parent image is a tag of our own making and always local; the rest is a name
+        // somebody wrote, which may need a registry putting in front of it.
+        let (base, present) = match (&config.base, parent_image) {
+            (Some(base), _) => self.locate_base(base).await,
+            (None, Some(parent)) => (parent.to_string(), true),
+            (None, None) => self.locate_base(DEFAULT_BASE_IMAGE).await,
         };
         if let Some(dockerfile) = &config.dockerfile {
             return self.build_from_dockerfile(config, dockerfile).await;
         }
         if config.packages.is_empty() && config.build.is_empty() {
             // Nothing to add, so the base image is the image - but it still has to be here.
-            let present = self.owner.podman()
-                .args(["image", "exists", &base])
-                .status()
-                .await
-                .map(|s| s.success())
-                .unwrap_or(false);
             if !present {
                 self.log(&format!("Pulling {}", base));
                 let out = self.owner.podman()
@@ -1302,6 +1338,40 @@ impl AppServer {
             return Ok(base);
         }
         self.build_image(config, &base).await
+    }
+
+    /// Settle what a written base image name refers to, and whether it is here already.
+    ///
+    /// Podman, unlike docker, does not assume a registry for a name that names none: `oven/bun`
+    /// resolves through `unqualified-search-registries`, and on a host that configures none it
+    /// fails with a short-name error that says nothing about where the image was expected to come
+    /// from. Everybody writing `oven/bun` means Docker Hub, so that is what it is taken to mean -
+    /// but only after the local store has been asked, since an image built on the machine (a
+    /// `podman build -t myapp`, or webcentral's own base for the test suite) has no registry to
+    /// come from and must keep its name.
+    async fn locate_base(&self, base: &str) -> (String, bool) {
+        if self.image_exists(base).await {
+            return (base.to_string(), true);
+        }
+        match qualified(base) {
+            // Already names a registry, so there is nothing to add and nothing local to fall back
+            // on: the pull below will say what went wrong with it.
+            None => (base.to_string(), false),
+            Some(qualified) => {
+                let present = self.image_exists(&qualified).await;
+                (qualified, present)
+            }
+        }
+    }
+
+    async fn image_exists(&self, image: &str) -> bool {
+        self.owner
+            .podman()
+            .args(["image", "exists", image])
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     async fn build_podman_command(

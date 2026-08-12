@@ -474,7 +474,7 @@ service {                         # no name, so it is called "default"
 | Setting | Meaning |
 |---------|---------|
 | `command` | The command to run inside the container, given to `/bin/sh`. It must serve HTTP on `$PORT`, listening on all interfaces rather than only loopback - a published port reaches the container's own interface. Takes the rest of the line, quoting and all. Leave it out to use the image's own entrypoint. |
-| `base` | The image to start from. Default `alpine`. |
+| `base` | The image to start from. Default `alpine`. A name with no registry in it means Docker Hub, unless an image of that name is already on the machine - so `oven/bun` works, and so does one you built yourself with `podman build -t myapp`. |
 | `packages` | Packages to add to it (auto-detects `apk`, `apt-get`, `dnf`, `yum`). |
 | `build` | A command to run when the image is built. Repeat for more. |
 | `copy` | Project files to put in the image before `build` runs, so it can use them (`copy = requirements.txt`). Paths are relative to the project and may not leave it. Editing one rebuilds the image and restarts the service. |
@@ -739,8 +739,12 @@ that switches at runtime to a uid it doesn't declare writes as that uid instead;
 Each owner gets a podman image store of its own, under their home directory. It is separate from
 whatever they use podman for themselves, which means webcentral's images do not appear in their
 `podman images` - and equally that their `podman system prune` cannot take webcentral's away.
-Rootless podman needs a subordinate id range per user (`/etc/subuid` and `/etc/subgid`); webcentral
-checks for one when it first sees a project and says exactly what to run if it is missing.
+
+Rootless podman needs two things from the host, and webcentral checks for both when it first sees
+a project, saying exactly what to install or run if either is missing: a subordinate id range per
+user (`/etc/subuid` and `/etc/subgid`), and either `pasta` or `slirp4netns` to give a container
+its network. Podman 5 asks for pasta by default where podman 4 asked for slirp4netns, so a host
+upgraded across that line may need its `passt` package installed.
 
 ---
 ### Words and quoting
@@ -1095,6 +1099,8 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
   - **Authentication belongs to the application.** Accounts, password hashes and the auth cookie are gone; what remains is `check_auth <secret>` for guarding something small.
   - **What restarts an application has been inverted**: 2.x watched every file except a short exclusion list, 3.0 watches a whitelist of source directories, source extensions and dependency manifests. A project whose application reads a `config.yaml` or a template at startup has to say so with `reload_include`.
   - `Procfile` is no longer detected: the Heroku compatibility was always just superficial at best. `package.json` with a `start` script still is.
+  - A `base` naming no registry means Docker Hub, unless an image of that name is already on the machine. Podman, unlike docker, refuses a short name it cannot place, with an error that says nothing about where it expected to find it.
+  - Rootless podman's need for `pasta` or `slirp4netns` is checked for along with the subordinate id range, and named with the package that carries it. Podman 5 asks for pasta where podman 4 asked for slirp4netns, so a host upgraded across that line fails every container start with `could not find pasta`.
   - Fix containers being orphaned on shutdown, both because only SIGINT was handled - not the SIGTERM systemd sends - and because the stop was never waited for.
   - Fix services being unreachable on IPv6 hosts: ports are published on `127.0.0.1` and addressed that way.
 

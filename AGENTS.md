@@ -34,7 +34,9 @@ question
 which webcentral uses to decide which server a changed file belongs to.)
 
 `src/owner.rs` - Who a project belongs to: resolves the owner, checks the host can run rootless
-podman as them (subordinate ids present and not overlapping, `newuidmap` installed, every
+podman as them (subordinate ids present and not overlapping, `newuidmap` installed, `pasta` or
+`slirp4netns` there to give a container a network - podman 5 wants the first where podman 4 wanted
+the second, so the version decides which absence is a problem - and every
 directory above the project traversable), and hands out a `Command` that will - which means
 re-pointing *everything* a child inherits that could name the wrong user: the XDG directories, the
 container config overrides, and the working directory
@@ -307,6 +309,11 @@ then waits for the container's own stop timeout, which outlasts the grace period
 gets killed and the container keeps running.
 
 **Process exit detection:** `wait_for_port_ready` polls `try_wait()` to detect early process exit during startup.
+
+A `base` naming no registry means Docker Hub (`app_server::qualified`), but only after the local
+store has been asked (`locate_base`): podman refuses a short name it cannot place, while an image
+built on the machine has no registry to come from and must keep the name it has - which includes
+the test suite's own base image.
 
 **Podman** is the only way a service runs; there is no unsandboxed path. Via `get_podman_path()`:
 - A project's own `Dockerfile` is built with the project directory as context, which podman
