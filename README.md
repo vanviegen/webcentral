@@ -63,12 +63,11 @@ sudo webcentral --email you@example.com --systemd
 The `email` flag is mandatory, as it's needed for Let's Encrypt. Alternatively you can disable HTTPS (`webcentral --https 0`). See `webcentral --help` for more options.
 
 Containers run rootless as the user who owns each project, so that user needs a subordinate id
-range. Most distributions give every account one; webcentral checks when it first sees a project
-and prints the command to run if not:
-
-```sh
-grep "^$USER:" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
-```
+range. Most distributions give every account one, and a root webcentral adds one itself for an
+account that has none. Nothing else about podman is checked in advance: a service that will not
+start says why - in podman's own words, with a hint added where podman's message names a symptom
+rather than a cause - in the project's log, in webcentral's output, and on the dashboard beside
+the service.
 
 Create a directory at `~/webcentral-projects/someapp.yourdomain.com/` with either:
 - A `package.json` for Node.js apps (`npm start` should start a webserver on `$PORT`)
@@ -740,11 +739,26 @@ Each owner gets a podman image store of its own, under their home directory. It 
 whatever they use podman for themselves, which means webcentral's images do not appear in their
 `podman images` - and equally that their `podman system prune` cannot take webcentral's away.
 
-Rootless podman needs two things from the host, and webcentral checks for both when it first sees
-a project, saying exactly what to install or run if either is missing: a subordinate id range per
-user (`/etc/subuid` and `/etc/subgid`), and either `pasta` or `slirp4netns` to give a container
-its network. Podman 5 asks for pasta by default where podman 4 asked for slirp4netns, so a host
-upgraded across that line may need its `passt` package installed.
+**Nothing about the host is checked before it is used.** Everything a container needs - a usable
+image store, subordinate ids, a user namespace, and a network, which rootless podman gets from a
+`pasta` or `slirp4netns` binary it may not have - is set up by `podman run` and by nothing before
+it, so trying it is the only honest check there is. A start that fails therefore reports what
+podman said, in three places: the project's log, webcentral's output, and the dashboard, where it
+appears as a **Problem** row beside the service that would not start.
+
+Two things happen on top of relaying it:
+
+- **What can be fixed is fixed, and the start retried.** A project owner with no subordinate id
+  range gets one (`usermod --add-subuids`), which only a root webcentral can do and only it needs
+  to. This is why nothing checks `/etc/subuid` up front - the failure is more reliable than the
+  check, and it arrives exactly when something can be done about it.
+- **What podman explains badly gets a hint.** `could not find pasta` becomes a line naming the
+  `passt` package - the usual way a host upgraded from podman 4 to podman 5 breaks, since podman 5
+  asks for pasta where podman 4 asked for slirp4netns. Same for `newuidmap`, for overlapping
+  subordinate id ranges, and for a project directory the owner cannot traverse.
+
+A host somebody fixes while webcentral is running therefore needs no telling: the next request
+starts the service, and the problem disappears from the dashboard.
 
 ---
 ### Words and quoting
@@ -1077,6 +1091,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 ---
 
 ## Changelog
+
+2026-08-13 (3.0.2):
+  - **Nothing about podman is checked in advance any more.** Webcentral used to look for subordinate id ranges and helper binaries before using them, which was a guess at another program's requirements, went stale with every podman release, and could only be made at a moment when nothing could be done about the answer. A service is simply started; if that fails, **what can be fixed is fixed and the start retried** (a project owner with no subordinate id range is given one), and what cannot is **relayed in podman's own words** - to the project's log, to webcentral's output, and to the dashboard, where it appears as a Problem row beside the service. A hint is added for the messages that name a symptom rather than a cause, such as `could not find pasta`.
+  - **Projects that already exist are read the moment webcentral starts**, rather than two seconds later - that delay is for a directory that *appears*, where a deploy is probably still writing into it. What remains of a restart is image preparation, which runs in the background four at a time while every other project already serves; the dashboard says **Building** on a project whose service is still getting its image, and `building image` beside that service.
 
 2026-08-12 (3.0.1):
   - A `base` naming no registry means Docker Hub, unless an image of that name is already on the machine. Podman, unlike docker, refuses a short name it cannot place, with an error that says nothing about where it expected to find it.

@@ -79,6 +79,8 @@ fn describe_service(config: &crate::config::ServerConfig, grouped: bool) -> Serv
         image: describe_image(config, None),
         command: config.command.clone(),
         state: None,
+        problem: None,
+        building: false,
         host_port: None,
         pending_requests: 0,
         active_upgrades: 0,
@@ -180,7 +182,7 @@ impl Project {
         // Said where both audiences look: the owner reads their project's log, whoever runs
         // webcentral reads its output. A project with an unusable owner is still registered - its
         // services will fail to start, and by then this has already explained why.
-        for problem in owner.problems.iter().chain(owner.unreachable(dir).iter()) {
+        for problem in &owner.problems {
             logger.write("supervisor", problem);
             eprintln!("{}: {}", domain, problem);
         }
@@ -328,6 +330,8 @@ impl Project {
                         }
                         .to_string(),
                     ),
+                    problem: server.problem(),
+                    building: server.building(),
                     host_port: server.port(),
                     pending_requests: server.pending_requests(),
                     active_upgrades: server.active_upgrades(),

@@ -38,11 +38,11 @@ pub enum AppState {
     Failed,
 }
 
-/// How an attempt to start ended: serving, given up on, or thrown away because the files moved
-/// under it.
+/// How an attempt to start ended: serving, given up on (with what we noticed, which the container
+/// usually explains better), or thrown away because the files moved under it.
 enum Startup {
     Ready,
-    Failed,
+    Failed(String),
     Aborted,
 }
 
@@ -63,14 +63,11 @@ pub struct AppConnection {
     pub connector: AnyConnector,
 }
 
-/// How many images may be pulled or built at the same time, across every project. Enough to keep
-/// a slow registry from serialising everything, few enough that a restart is not a thundering
-/// herd.
 /// The same name with Docker Hub named in front of it, or `None` when it already names a
 /// registry. The rule is podman's own: the part before the first `/` is a registry when it looks
 /// like a host - it carries a dot or a port - or is `localhost`. A name with no `/` at all never
 /// names one, so `alpine:3` is a short name and not a host called `alpine`.
-fn qualified(image: &str) -> Option<String> {
+pub fn qualified(image: &str) -> Option<String> {
     let names_registry = match image.split_once('/') {
         None => false,
         Some((first, _)) => {
@@ -80,6 +77,9 @@ fn qualified(image: &str) -> Option<String> {
     (!names_registry).then(|| format!("docker.io/{}", image))
 }
 
+/// How many images may be pulled or built at the same time, across every project. Enough to keep
+/// a slow registry from serialising everything, few enough that a restart is not a thundering
+/// herd.
 fn image_work() -> &'static tokio::sync::Semaphore {
     static LIMIT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     LIMIT.get_or_init(|| tokio::sync::Semaphore::new(4))
@@ -123,8 +123,31 @@ pub struct AppServer {
     finished_rx: watch::Receiver<bool>,
     pending_requests: AtomicU64,
     active_upgrades: AtomicU64,
+    /// Whether an image is being pulled or built for this service right now. Set while the
+    /// preparation that follows the service being declared runs, which is the slow part of a
+    /// restart and the one worth saying out loud - a service whose image is not there yet cannot
+    /// start, however ready everything around it is.
+    building: std::sync::atomic::AtomicBool,
     last_activity: Mutex<Instant>,
     state_changed: Notify,
+    /// The last thing a container wrote to stderr: where podman reports a refusal to start one,
+    /// and where a service that dies says its last word. Emptied as each start begins, so a
+    /// failure is explained by that attempt's words rather than by an earlier one's. Shared with
+    /// the log streamers, which is what the `Arc` is for.
+    said: Arc<std::sync::Mutex<Option<String>>>,
+    /// Why the service is not running: set when something failed, cleared when it comes up. Read
+    /// by the dashboard from outside any runtime, so a plain mutex rather than tokio's.
+    problem: std::sync::Mutex<Option<String>>,
+}
+
+/// Clears the building flag however the preparation task ends, including the early return when
+/// the parent's image cannot be made at all.
+struct BuildGuard(Arc<AppServer>);
+
+impl Drop for BuildGuard {
+    fn drop(&mut self) {
+        self.0.building.store(false, Ordering::Relaxed);
+    }
 }
 
 impl AppServer {
@@ -153,8 +176,11 @@ impl AppServer {
             finished_rx,
             pending_requests: 0.into(),
             active_upgrades: 0.into(),
+            building: false.into(),
             last_activity: Mutex::new(Instant::now()),
             state_changed: Notify::new(),
+            said: Arc::new(std::sync::Mutex::new(None)),
+            problem: std::sync::Mutex::new(None),
         });
 
         let running = server.clone();
@@ -164,18 +190,24 @@ impl AppServer {
 
         // Get the images ready now rather than when the first request is waiting on them. The
         // parent goes first: a sidecar without a `base` of its own builds on the parent's image.
+        // Everything else about a project is ready before this is, so it is what the dashboard
+        // reports as Building - and the only thing a restart actually waits for.
         let preparing = server.clone();
+        preparing.building.store(true, Ordering::Relaxed);
         tokio::spawn(async move {
+            let _done = BuildGuard(preparing.clone());
             let parent = match preparing.ensure_prepared(&preparing.config, None).await {
                 Ok(prepared) => prepared.image,
                 Err(e) => {
-                    preparing.log(&format!("Could not prepare {}: {}", preparing.config.name, e));
+                    // Whatever it says is worth saying now, an hour before the first request:
+                    // preparation is not cached when it fails, so the start will try again.
+                    preparing.failed(&format!("Could not prepare {}: {}", preparing.config.name, e));
                     return;
                 }
             };
             for sidecar in &preparing.config.sidecars {
                 if let Err(e) = preparing.ensure_prepared(sidecar, Some(&parent)).await {
-                    preparing.log(&format!("Could not prepare {}: {}", sidecar.name, e));
+                    preparing.failed(&format!("Could not prepare {}: {}", sidecar.name, e));
                 }
             }
         });
@@ -194,6 +226,40 @@ impl AppServer {
 
     fn log(&self, message: &str) {
         self.logger.write(&self.log_tag(), message);
+    }
+
+    /// Why the service is not running, for the dashboard.
+    pub fn problem(&self) -> Option<String> {
+        self.problem.lock().unwrap().clone()
+    }
+
+    /// Deal with something that did not work: repair what webcentral can repair itself - saying so
+    /// and that the same attempt is worth making again - or say why it is not.
+    ///
+    /// What is said goes to all three places somebody might be looking: the project's log,
+    /// webcentral's own output, and the dashboard beside the service. It is whatever actually
+    /// went wrong, plus whatever podman's wording leaves out (`Owner::explain`); nothing was
+    /// checked in advance to produce it, so a host that somebody fixes while webcentral runs needs
+    /// no telling - the next start simply works. A repair fires at most once per cause, since what
+    /// it fixes stays fixed, so retrying cannot loop.
+    fn failed(&self, why: &str) -> bool {
+        let mut problem = match self.owner.repair() {
+            Ok(Some(done)) => {
+                self.log(&done);
+                eprintln!("{}: {}", self.dir.display(), done);
+                *self.problem.lock().unwrap() = None;
+                return true;
+            }
+            Ok(None) => why.to_string(),
+            Err(e) => format!("{}\n{}", why, e),
+        };
+        if let Some(hint) = self.owner.explain(&problem, &self.dir) {
+            problem = format!("{}\n{}", problem, hint);
+        }
+        self.log(&problem);
+        eprintln!("{} ({}): {}", self.dir.display(), self.config.name, problem);
+        *self.problem.lock().unwrap() = Some(problem);
+        false
     }
 
     pub fn name(&self) -> &str {
@@ -219,6 +285,11 @@ impl AppServer {
 
     pub fn active_upgrades(&self) -> u64 {
         self.active_upgrades.load(Ordering::Relaxed)
+    }
+
+    /// Whether this service is still getting its image, and so cannot start yet.
+    pub fn building(&self) -> bool {
+        self.building.load(Ordering::Relaxed)
     }
 
     pub fn idle_seconds(&self) -> Option<u64> {
@@ -353,10 +424,16 @@ impl AppServer {
 
                 AppState::Starting => {
                     self.log("Starting");
+                    // This attempt is explained by what this attempt says, not by the last one's.
+                    *self.said.lock().unwrap() = None;
                     let mut children = match self.spawn_processes().await {
                         Ok(children) => children,
                         Err(e) => {
-                            self.log(&format!("Failed to spawn: {}; giving up", e));
+                            // A repair means the same start is worth trying again, which is what
+                            // leaving the state at Starting does.
+                            if self.failed(&format!("Could not start: {}", e)) {
+                                continue;
+                            }
                             let _ = self.state_tx.send(AppState::Failed);
                             continue;
                         }
@@ -381,21 +458,22 @@ impl AppServer {
                                     // ordinary, since a deploy writes the files that triggered
                                     // the project to load in the first place.
                                     Some(StopReason::FileChange) => break Startup::Aborted,
-                                    _ => break Startup::Failed,
+                                    _ => break Startup::Failed("it was stopped".to_string()),
                                 }
                             }
                             status = async { children.first_mut().unwrap().wait().await } => {
-                                self.log(&format!("Process exited during startup: {:?}", status));
-                                break Startup::Failed;
+                                break Startup::Failed(match status {
+                                    Ok(status) => format!("it exited with {}", status),
+                                    Err(e) => format!("it could not be waited for: {}", e),
+                                });
                             }
                             ready = self.probe_port() => {
                                 if ready {
                                     break Startup::Ready;
                                 } else if tokio::time::Instant::now() >= deadline {
-                                    self.log(&format!(
-                                        "Port did not become ready within {}s",
-                                        self.config.startup_time));
-                                    break Startup::Failed;
+                                    break Startup::Failed(format!(
+                                        "nothing answered on port {} within {}s",
+                                        self.config.port, self.config.startup_time));
                                 }
                                 sleep(Duration::from_millis(50)).await;
                             }
@@ -409,9 +487,17 @@ impl AppServer {
                             let _ = self.state_tx.send(AppState::Stopped);
                             continue;
                         }
-                        Startup::Failed => {
-                            self.log("Startup failed; terminating and giving up");
+                        Startup::Failed(noticed) => {
                             self.kill_processes(&mut children).await;
+                            // What the container wrote as it died says more than what we noticed
+                            // from outside - it is where podman reports its own refusals.
+                            let why = match self.said.lock().unwrap().take() {
+                                Some(said) => format!("Startup failed ({}). {}", noticed, said),
+                                None => format!("Startup failed ({})", noticed),
+                            };
+                            if self.failed(&why) {
+                                continue;
+                            }
                             let _ = self.state_tx.send(AppState::Failed);
                             continue;
                         }
@@ -419,8 +505,12 @@ impl AppServer {
 
                     let port = self.port().unwrap_or(0);
                     self.log(&format!("Ready on port {}", port));
+                    // It is running, so whatever was wrong with it no longer is.
+                    *self.problem.lock().unwrap() = None;
                     let _ = self.state_tx.send(AppState::Running);
 
+                    // Stopping for a reason of ours says nothing about the service. Exiting by
+                    // itself does, and what it last wrote usually says what.
                     match self.run_until_stop(children, &mut stop_rx, idle_timeout).await {
                         StopReason::Shutdown => {
                             self.log("Stopped (shutdown)");
@@ -432,7 +522,10 @@ impl AppServer {
                             self.log("Stopped (file change)");
                         }
                         StopReason::Inactivity => self.log("Stopped (inactivity)"),
-                        StopReason::ProcessExit => self.log("Stopped (process exit)"),
+                        StopReason::ProcessExit => {
+                            let said = self.said.lock().unwrap().take().unwrap_or_default();
+                            self.failed(&format!("Stopped (process exit). {}", said));
+                        }
                     }
                 }
 
@@ -680,24 +773,15 @@ impl AppServer {
 
     async fn ensure_network(&self) -> Result<()> {
         let name = self.network_name();
-        let exists = self.owner.podman()
-            .args(["network", "exists", &name])
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if exists {
+        if self.podman(&["network", "exists", &name]).await.is_ok() {
             return Ok(());
         }
-        let out = self.owner.podman()
-            .args(["network", "create", &name])
-            .output()
-            .await?;
-        // A concurrent start may have won the race, which is not a failure.
-        if !out.status.success() && !String::from_utf8_lossy(&out.stderr).contains("already exists") {
-            anyhow::bail!("could not create network {}: {}", name, String::from_utf8_lossy(&out.stderr).trim());
+        match self.podman(&["network", "create", &name]).await {
+            Ok(_) => Ok(()),
+            // A concurrent start may have won the race, which is not a failure.
+            Err(e) if e.contains("already exists") => Ok(()),
+            Err(e) => anyhow::bail!("could not create network {}: {}", name, e),
         }
-        Ok(())
     }
 
     /// `build_command` for a sidecar, which owns its preparation but may inherit `parent_image`.
@@ -741,10 +825,18 @@ impl AppServer {
         if let Some(stderr) = child.stderr.take() {
             let logger = self.logger.clone();
             let tag = format!("{}stderr", prefix);
+            // Kept as well as logged: podman writes why it would not start a container here, and
+            // a service that dies says its last word here too. Whichever it turns out to be, it
+            // is what explains a failure - and it is only ever read by one, so a line from a
+            // service that stopped for a reason of ours is simply never looked at.
+            let said = self.said.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     logger.write(&tag, &line);
+                    if !line.trim().is_empty() {
+                        *said.lock().unwrap() = Some(line);
+                    }
                 }
             });
         }
@@ -817,12 +909,30 @@ impl AppServer {
         Ok(())
     }
 
+    /// Run one podman subcommand as the project owner and wait for it: its trimmed stdout when it
+    /// worked, and whatever it said about why when it did not.
+    ///
+    /// Every short podman call goes through here, so none of them has to spell out the three ways
+    /// one can end. The `Err` is podman's own words rather than a sentence of ours, and reaches
+    /// whoever asked for the work: nothing is checked before podman is used, so what it says when
+    /// it refuses is the whole diagnosis (`note_problem` adds the little it can).
+    async fn podman(&self, args: &[&str]) -> Result<String, String> {
+        let mut cmd = self.owner.podman();
+        cmd.args(args);
+        match cmd.output().await {
+            Ok(out) if out.status.success() => {
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            }
+            Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// The uid/gid a container started from `image` actually runs as. This needs podman's help:
     /// `USER` may name a user that only exists inside the image, and an image declaring no user at
     /// all runs as root. Cached per image+user, as it costs a container round trip. The `Err` is
     /// whatever podman said when it could not be settled, which is worth carrying: a probe that
-    /// fails because the *host* cannot start any container at all otherwise looks like a fact
-    /// about the image.
+    /// fails for a reason of its own otherwise looks like a fact about the image.
     async fn container_user_ids(
         &self,
         image: &str,
@@ -840,62 +950,25 @@ impl AppServer {
 
         // Asking `id` inside the container resolves names and an absent USER uniformly, and pulls
         // the image if it isn't local yet - which `run` would do moments later anyway.
-        let mut probe = self.owner.podman();
-        probe.args(["run", "--rm", "--entrypoint", "/bin/sh"]);
+        let mut probe = vec!["run", "--rm", "--entrypoint", "/bin/sh"];
         if let Some(user) = user_arg {
-            probe.args(["--user", user]);
+            probe.extend(["--user", user]);
         }
-        probe.args([image, "-c", "id -u; id -g"]);
-
-        let mut why = String::new();
-        let ids = match probe.output().await {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let mut fields = stdout.split_whitespace();
-                match (
-                    fields.next().and_then(|v| v.parse().ok()),
-                    fields.next().and_then(|v| v.parse().ok()),
-                ) {
-                    (Some(uid), Some(gid)) => Some((uid, gid)),
-                    _ => None,
-                }
-            }
-            Ok(out) => {
-                why = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                None
-            }
-            Err(e) => {
-                why = e.to_string();
-                None
-            }
-        };
+        probe.extend([image, "-c", "id -u; id -g"]);
+        let probed = self.podman(&probe).await;
+        let ids = probed.as_deref().ok().and_then(parse_id_output);
 
         // Images without a shell (distroless and friends) can't be probed, so fall back to the
         // declared USER. Only a numeric uid:gid pair is usable - anything else would need the
         // image's passwd to resolve.
         let ids = match (ids, user_arg) {
             (None, None) => {
-                let out = self.owner.podman()
-                    .args(["image", "inspect", "--format", "{{.Config.User}}", image])
-                    .output()
-                    .await;
-                match out {
-                    Ok(out) if out.status.success() => {
-                        let declared = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                        if declared.is_empty() || declared == "root" {
-                            Some((0, 0))
-                        } else {
-                            parse_numeric_user(&declared)
-                        }
-                    }
-                    Ok(out) => {
-                        why = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                        None
-                    }
-                    Err(e) => {
-                        why = e.to_string();
-                        None
-                    }
+                let declared =
+                    self.podman(&["image", "inspect", "--format", "{{.Config.User}}", image]).await;
+                match declared.as_deref() {
+                    Ok("") | Ok("root") => Some((0, 0)),
+                    Ok(user) => parse_numeric_user(user),
+                    Err(_) => None,
                 }
             }
             (ids, _) => ids,
@@ -906,8 +979,11 @@ impl AppServer {
                 cache.lock().unwrap().insert(key, ids);
                 Ok(ids)
             }
-            None if why.is_empty() => Err("the image declares a user it cannot resolve".to_string()),
-            None => Err(why),
+            // Whatever the probe said, or - when it ran and answered - that the answer was of no
+            // use, which is the image's own doing.
+            None => Err(probed.err().unwrap_or_else(|| {
+                "it declares a user that is neither numeric nor resolvable".to_string()
+            })),
         }
     }
 
@@ -960,14 +1036,8 @@ impl AppServer {
         // second, and servers are started on demand while a request is waiting. The base image's
         // local ID is part of the hash, so a pulled base update triggers one (cached) rebuild. A
         // base that isn't local yet hashes as empty and self-corrects once the first build pulls it.
-        let base_id = self.owner.podman()
-            .args(["image", "inspect", "--format", "{{.Id}}", base])
-            .output()
-            .await
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .unwrap_or_default();
+        let base_id =
+            self.podman(&["image", "inspect", "--format", "{{.Id}}", base]).await.unwrap_or_default();
         // A copied file is part of what the image *is*, so its contents belong in the tag -
         // otherwise an edited requirements.txt would go on reusing the image built from the old
         // one. Reading them here also re-checks containment now that symlinks can be resolved:
@@ -996,15 +1066,7 @@ impl AppServer {
         let repo = format!("webcentral-{:x}", self.dir_hash(&config.name));
         let image_name = format!("{}:{:x}", repo, hasher.finish());
 
-        let exists = self.owner.podman()
-            .args(["image", "inspect", &image_name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if exists {
+        if self.image_exists(&image_name).await {
             return Ok(image_name);
         }
 
@@ -1029,20 +1091,11 @@ impl AppServer {
 
         // Remove this server's images for older configs. They are named tags, which
         // `podman image prune` never touches, so they would otherwise pile up forever.
-        if let Ok(out) = self.owner.podman()
-            .args(["images", &repo, "--format", "{{.Tag}}"])
-            .output()
-            .await
-        {
-            for tag in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+        if let Ok(tags) = self.podman(&["images", &repo, "--format", "{{.Tag}}"]).await {
+            for tag in tags.split_whitespace() {
                 let stale = format!("{}:{}", repo, tag);
                 if stale != image_name {
-                    let _ = self.owner.podman()
-                        .args(["rmi", &stale])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await;
+                    let _ = self.podman(&["rmi", &stale]).await;
                 }
             }
         }
@@ -1260,26 +1313,22 @@ impl AppServer {
         // Mounted somewhere else, so that the image's own contents at `container_path` are still
         // visible to copy from.
         const SCRATCH: &str = "/webcentral-seed";
-        let mut copy = self.owner.podman();
-        copy.args(["run", "--rm", "--entrypoint", "/bin/sh"]);
-        copy.args(["-v", &format!("{}:{}", host_path.display(), SCRATCH)]);
-        copy.args([
-            image,
-            "-c",
-            &format!("cp -a {}/. {}/ 2>/dev/null || true", container_path, SCRATCH),
-        ]);
-        match copy.output().await {
-            Ok(out) if out.status.success() => {
-                if fs::read_dir(&host_path).map(|mut d| d.next().is_some()).unwrap_or(false) {
-                    self.log(&format!("Copied what {} ships in {} into it", image, container_path));
-                }
+        let mount = format!("{}:{}", host_path.display(), SCRATCH);
+        let script = format!("cp -a {}/. {}/ 2>/dev/null || true", container_path, SCRATCH);
+        let copied = self
+            .podman(&["run", "--rm", "--entrypoint", "/bin/sh", "-v", &mount, image, "-c", &script])
+            .await;
+        match copied {
+            Ok(_) if fs::read_dir(&host_path).map(|mut d| d.next().is_some()).unwrap_or(false) => {
+                self.log(&format!("Copied what {} ships in {} into it", image, container_path))
             }
+            Ok(_) => {}
             // An image with no shell cannot be copied out of this way. It is also an image that
             // could not have had anything but an empty directory there to begin with, unless it
             // was built FROM one that had a shell - so this is worth a line, not a failure.
-            _ => self.log(&format!(
-                "Could not read what {} ships in {}; starting it empty",
-                image, container_path
+            Err(e) => self.log(&format!(
+                "Could not read what {} ships in {}, so it starts empty: {}",
+                image, container_path, e
             )),
         }
     }
@@ -1287,14 +1336,13 @@ impl AppServer {
     /// The `VOLUME` paths an image declares, sorted so the same image always reports them in the
     /// same order. An image that declares none, or that cannot be inspected, has none.
     async fn image_volumes(&self, image: &str) -> Vec<String> {
-        let mut inspect = self.owner.podman();
-        inspect.args(["image", "inspect", "--format", "{{json .Config.Volumes}}", image]);
-        let output = match inspect.output().await {
-            Ok(out) if out.status.success() => out.stdout,
-            _ => return Vec::new(),
+        let Ok(output) =
+            self.podman(&["image", "inspect", "--format", "{{json .Config.Volumes}}", image]).await
+        else {
+            return Vec::new();
         };
         let parsed: Option<std::collections::BTreeMap<String, serde_json::Value>> =
-            serde_json::from_slice(&output).unwrap_or_default();
+            serde_json::from_str(&output).unwrap_or_default();
         parsed.map(|map| map.into_keys().collect()).unwrap_or_default()
     }
 
@@ -1323,17 +1371,9 @@ impl AppServer {
             // Nothing to add, so the base image is the image - but it still has to be here.
             if !present {
                 self.log(&format!("Pulling {}", base));
-                let out = self.owner.podman()
-                    .args(["pull", &base])
-                    .output()
-                    .await?;
-                if !out.status.success() {
-                    anyhow::bail!(
-                        "could not pull {}: {}",
-                        base,
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                }
+                self.podman(&["pull", &base])
+                    .await
+                    .map_err(|e| anyhow::anyhow!("could not pull {}: {}", base, e))?;
             }
             return Ok(base);
         }
@@ -1365,13 +1405,7 @@ impl AppServer {
     }
 
     async fn image_exists(&self, image: &str) -> bool {
-        self.owner
-            .podman()
-            .args(["image", "exists", image])
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false)
+        self.podman(&["image", "exists", image]).await.is_ok()
     }
 
     async fn build_podman_command(
@@ -1389,12 +1423,7 @@ impl AppServer {
         // name, so anything still answering to it is a leftover of ours. `--time 2`: without it a
         // still-running leftover gets podman's default 10s SIGTERM grace, all of it spent in this
         // start's critical path while a request waits.
-        let _ = self.owner.podman()
-            .args(["rm", "--force", "--time", "2", &container_name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
+        let _ = self.podman(&["rm", "--force", "--time", "2", &container_name]).await;
 
         let mut cmd = self.owner.podman();
         cmd.args(["run", "--rm", "--name", &container_name]);
@@ -1522,6 +1551,12 @@ fn get_free_port() -> Result<u16> {
         );
     }
     Ok(listener.local_addr()?.port())
+}
+
+/// The two numbers `id -u; id -g` wrote inside a container.
+fn parse_id_output(output: &str) -> Option<(u32, u32)> {
+    let mut fields = output.split_whitespace();
+    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
 }
 
 /// Parse a numeric `uid:gid` pair. Anything else - including a bare uid, whose gid would depend on

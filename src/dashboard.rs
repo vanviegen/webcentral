@@ -28,6 +28,12 @@ pub struct ServiceStatus {
     pub command: String,
     /// `None` for a sidecar, which is up exactly when its parent is.
     pub state: Option<String>,
+    /// Why it is not running, when something said why: podman's own words, and whatever they
+    /// leave out. Said here as well as in the log, since this is where somebody looks first.
+    pub problem: Option<String>,
+    /// Whether its image is still being pulled or built, which is the one thing a project is not
+    /// ready for the moment it is read.
+    pub building: bool,
     /// The host port the parent is published on while it is up. Nothing else is published.
     pub host_port: Option<u16>,
     pub pending_requests: u64,
@@ -173,6 +179,11 @@ fn render_project(domain: &DomainStatus, collapsible: bool) -> String {
             domain.services.len()
         ));
     }
+    // The one thing a project is not ready for as soon as it is read. Worth saying before the
+    // count, since a service whose image is still coming cannot start whatever else is in order.
+    if domain.services.iter().any(|service| service.building) {
+        summary.push_str("<span class=\"building\">Building</span>");
+    }
     summary.push_str(&format!(
         "<span class=\"count\">{} request{}</span>",
         domain.total_requests,
@@ -205,7 +216,7 @@ fn render_project(domain: &DomainStatus, collapsible: bool) -> String {
     }
 
     if !domain.loaded {
-        html.push_str(&row("", "Config", "<span class=\"none\">Reading its configuration…</span>"));
+        html.push_str(&row("", "Config", "<span class=\"none\">Initializing…</span>"));
         html.push_str("</tbody>\n</table>\n");
         html.push_str(if collapsible { "</details>\n" } else { "</section>\n" });
         return html;
@@ -287,6 +298,9 @@ fn render_service(service: &ServiceStatus, owner: &str) -> String {
         // Only what is worth reading: a service with nothing pending and no websockets says so by
         // saying nothing rather than by a row of zeroes.
         let mut notes = Vec::new();
+        if service.building {
+            notes.push("building image".to_string());
+        }
         if service.pending_requests > 0 {
             notes.push(format!("{} pending", service.pending_requests));
         }
@@ -295,6 +309,17 @@ fn render_service(service: &ServiceStatus, owner: &str) -> String {
             format!("<span class=\"{}\">{}</span>{}", status_class(state), escape(state), note(&notes)),
         );
     }
+    // Straight under the state, because it is the rest of that sentence. A line per line, since a
+    // hint is a paragraph after whatever podman said.
+    add(
+        "Problem",
+        service
+            .problem
+            .iter()
+            .flat_map(|problem| problem.lines())
+            .map(|line| format!("<div class=\"problem\">{}</div>", escape(line)))
+            .collect(),
+    );
 
     // One row for the port, since the two or three numbers around it are the same question asked
     // from inside the container, from the host, and from a peer - and reading them apart is how
@@ -532,6 +557,9 @@ h1 { font-size: 1.4em; color: #555; font-weight: 600; margin: 0 0 1em 0; }
 .project[open] > summary::before { content: "▾"; }
 .domain { font-size: 1.1em; font-weight: 600; }
 .count { color: #999; font-size: 0.85em; margin-left: auto; }
+/* Amber, like everything else here that is still on its way - a certificate being acquired, a
+   service starting. */
+.building { color: #f90; font-size: 0.85em; }
 .running-all { color: #2a2; font-size: 0.85em; }
 .running-some { color: #d80; font-size: 0.85em; }
 .running-none { font-size: 0.85em; }
@@ -549,7 +577,7 @@ h1 { font-size: 1.4em; color: #555; font-weight: 600; margin: 0 0 1em 0; }
 /* The rows whose value is a block rather than a phrase, and so needs the room. */
 .detail > tbody > tr.wide > th { padding-top: 0.6em; }
 .detail > tbody > tr.wide > td { padding: 0.5em 0; }
-.detail > tbody > tr.problems > td { color: #c22; font-size: 0.9em; }
+.detail > tbody > tr.problems > td, .problem { color: #c22; font-size: 0.9em; }
 /* A service's own name is a name, not a label: it keeps its case and its weight. */
 .detail > tbody > tr.named > th { white-space: normal; }
 .detail > tbody > tr.named > th b { display: block; text-transform: none; letter-spacing: 0;

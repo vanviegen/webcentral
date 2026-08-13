@@ -153,10 +153,14 @@ pub fn register(server: &Arc<Server>) {
     let _ = SERVER.set(Arc::downgrade(server));
 }
 
-/// How long a project directory is left alone before its configuration is read unasked. A
-/// directory usually appears because a deploy is in progress, and reading it while its files are
+/// How long a project directory that *appears* is left alone before its configuration is read
+/// unasked. It usually appears because a deploy is in progress, and reading it while its files are
 /// still landing would answer requests from half of it - so it is given a moment to stop moving.
 /// A request arriving first reads it itself, which makes this a no-op for anything busy.
+///
+/// A directory that was already there when webcentral started is not landing anywhere, so it is
+/// read at once instead: everything is in place before the first request, and a restart has no
+/// window in which projects exist but nothing is known about them.
 const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Read a project's configuration without waiting for somebody to make a request first, so its
@@ -166,14 +170,16 @@ const SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 ///
 /// Errors are already reported by `Project::new` into the project's own log; there is nothing
 /// useful to do with them here.
-pub fn load_project(domain: &str) {
+pub fn load_project(domain: &str, after: std::time::Duration) {
     let Some(server) = SERVER.get().and_then(|weak| weak.upgrade()) else { return };
     let domain = domain.to_string();
     tokio::spawn(async move {
-        tokio::time::sleep(SETTLE).await;
-        // Read by a request in the meantime, which is the common case for a busy domain.
-        if DOMAINS.get(&domain).is_some_and(|info| info.project.is_some()) {
-            return;
+        if !after.is_zero() {
+            tokio::time::sleep(after).await;
+            // Read by a request in the meantime, which is the common case for a busy domain.
+            if DOMAINS.get(&domain).is_some_and(|info| info.project.is_some()) {
+                return;
+            }
         }
         let _ = server.get_project_for_domain(&domain).await;
     });
@@ -186,7 +192,8 @@ pub fn reload_project_by_dir(dir: &std::path::Path) {
     let dir = dir.to_string_lossy().to_string();
     let domain = DOMAINS.iter().find(|entry| entry.directory == dir).map(|e| e.key().clone());
     if let Some(domain) = domain {
-        load_project(&domain);
+        // Settled, because the change that triggered this is usually one of many still arriving.
+        load_project(&domain, SETTLE);
     }
 }
 
@@ -449,8 +456,14 @@ impl Server {
                 .match_files(true)
                 .watch_update(false)
                 .watch_initial(true)
-                .run(move |_event, path| {
-                    server.process_project_directory(&path);
+                .run(move |event, path| {
+                    // A directory that was already there is read at once; one that just appeared
+                    // is probably still being written to.
+                    let settle = match event {
+                        include_exclude_watcher::WatchEvent::Initial => std::time::Duration::ZERO,
+                        _ => SETTLE,
+                    };
+                    server.process_project_directory(&path, settle);
                 })
                 .await {
                 eprintln!("Directory watcher error: {}", e);
@@ -1036,6 +1049,7 @@ impl Server {
     fn process_project_directory(
         self: &Arc<Self>,
         path: &std::path::Path,
+        settle: std::time::Duration,
     ) {
         let Some(domain_name) = path.file_name().and_then(|n| n.to_str()) else {
             return ; // Shouldn't happen?
@@ -1097,7 +1111,7 @@ impl Server {
         println!("Domain {} added ({:?})", &domain, directory);
         DOMAINS.insert(domain.clone(), DomainInfo::new(directory, cert_task));
         self.schedule_write_bindings();
-        load_project(&domain);
+        load_project(&domain, settle);
     }
 
     /// Whether `domain` resolves to this very process on port 80, verified by fetching a path

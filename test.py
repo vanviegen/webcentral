@@ -203,12 +203,20 @@ class TestRunner:
         self.log_positions['stdout'] = 0
         self.log_positions['stderr'] = 0
 
-        # Wait for webcentral to start
-        time.sleep(0.5)
-
-        if self.webcentral_proc.poll() is not None:
-            self.show_all_new_logs()
-            raise Exception("Webcentral process failed to start")
+        # Wait for the port to answer rather than for a fixed moment
+        deadline = time.time() + 30
+        while True:
+            if self.webcentral_proc.poll() is not None:
+                self.show_all_new_logs()
+                raise Exception("Webcentral process failed to start")
+            try:
+                with socket.create_connection(('localhost', self.port), timeout=1):
+                    break
+            except OSError:
+                if time.time() > deadline:
+                    self.show_all_new_logs()
+                    raise Exception("Webcentral did not start listening")
+                time.sleep(0.1)
 
         print(f"webcentral started (PID: {self.webcentral_proc.pid})")
         print()
@@ -1661,10 +1669,7 @@ def test_simple_application(t):
 
     # Verify the app actually started
     t.assert_log('Ready on port', count=1)
-    # A host that can start a container is one whose rootless networking is fine, so the check for
-    # it must have stayed quiet: a false alarm there would be in every project's log
-    t.assert_log('pasta', count=0)
-    # ...and a locally built image is used under the name it has, not looked for on Docker Hub
+    # A locally built image is used under the name it has, not looked for on Docker Hub
     t.assert_log('docker.io/', count=0)
 
 
@@ -1681,6 +1686,16 @@ def test_short_image_names_come_from_docker_hub(t):
     except Exception:
         pass
     t.await_log('Pulling docker.io/webcentral-no-such-image/nope', timeout=30)
+
+    # Nothing is checked in advance, so what a reader gets is podman's own account of the failure -
+    # in the project's log, in webcentral's output, and on the dashboard beside the service
+    t.await_log('Could not prepare default', timeout=30)
+    t.await_log('stderr', 'short-image-names-come-from-docker-hub.test', timeout=30)
+    t.write_file('webcentral.conf', 'admin_dashboard', domain='image-failure-dash.test')
+    body = t.assert_http('/', host='image-failure-dash.test',
+                         check_body='short-image-names-come-from-docker-hub.test')
+    assert '<th>Problem</th>' in body, body
+    assert 'webcentral-no-such-image/nope' in body, body
 
 
 @test
@@ -1850,9 +1865,8 @@ service {
     else:
         raise AssertionError("Expected HTTP request to fail due to startup timeout")
 
-    # Verify we saw the deadline + give-up logs
-    t.await_log('did not become ready', timeout=2)
-    t.await_log('giving up', timeout=2)
+    # Verify we saw what the deadline was and that it gave up on it
+    t.await_log('Startup failed (nothing answered on port 8000 within 5s)', timeout=2)
 
 
 @test
@@ -4129,7 +4143,7 @@ sys.exit(1)
     # Key assertion: with the fix, we should see this message because wait_for_port
     # detects the stop signal and returns false. Without the fix, the project gets
     # replaced before wait_for_port can return, so this message is never logged.
-    t.await_log('Process exited during startup', timeout=3)
+    t.await_log('Startup failed (it exited', timeout=3)
 
 
 @test
@@ -4302,6 +4316,110 @@ def test_shutdown_stops_containers(t):
             subprocess.run([podman, 'rm', '--force', '--time', '2', name],
                            capture_output=True, timeout=60)
         log.close()
+
+
+@test
+def test_projects_are_read_as_soon_as_webcentral_starts(t):
+    """A project that was already there when webcentral started is read at once, not two seconds later"""
+    # Its own webcentral, since this is about what a restart does. The root has no dot in its
+    # name, so the suite's own project glob never sees it.
+    root = os.path.join(t.tmpdir, 'startup-read-root')
+    for domain, name, content in [
+        ('startup-static.test', 'public/index.html', 'already here'),
+        ('startup-dash.test', 'webcentral.conf', 'admin_dashboard'),
+    ]:
+        path = os.path.join(root, domain, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(content)
+
+    port = t.find_free_port()
+    log_f = open(os.path.join(root, 'out.log'), 'w')
+    proc = subprocess.Popen(
+        ['./webcentral', '--projects', root, '--http', str(port), '--https', '0',
+         '--data-dir', os.path.join(root, 'data')],
+        stdout=log_f, stderr=subprocess.STDOUT,
+        cwd=os.path.dirname(os.path.abspath(__file__)))
+
+    def dashboard():
+        conn = http.client.HTTPConnection('localhost', port, timeout=10)
+        try:
+            conn.request('GET', '/', headers={'Host': 'startup-dash.test'})
+            return conn.getresponse().read().decode('utf-8')
+        finally:
+            conn.close()
+
+    try:
+        # Only for the port, so nothing here waits out the two seconds this is about
+        deadline = time.time() + 30
+        while True:
+            try:
+                with socket.create_connection(('localhost', port), timeout=1):
+                    break
+            except OSError:
+                assert time.time() < deadline, "the instance never started listening"
+                time.sleep(0.02)
+
+        # The other project has to be registered before it can be reported on, which is a moment
+        # of directory scanning - but by the time it is listed it must already be read, which the
+        # routing section only exists for.
+        deadline = time.time() + 5
+        while True:
+            body = dashboard()
+            if 'startup-static.test' in body:
+                break
+            assert time.time() < deadline, f"the static project was never listed:\n{body}"
+            time.sleep(0.05)
+        assert '<th>Routing</th>' in body, \
+            f"listed but not read yet - a restart should not leave projects unread:\n{body}"
+        assert 'Initializing' not in body, body
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=30)
+        log_f.close()
+
+
+@test
+def test_dashboard_says_which_images_are_still_building(t):
+    """A service whose image is still being built says so, while everything else serves"""
+    # Unique, so podman's layer cache cannot make this build instant on a second run
+    t.write_file('webcentral.conf',
+                 'service {\n'
+                 f'  base = {TEST_BASE_IMAGE}\n'
+                 f'  build = echo {time.time()} && sleep 8\n'
+                 '  command = python3 -u -m http.server $PORT\n'
+                 '  shutdown_time = 5\n'
+                 '}\n')
+    t.write_file('webcentral.conf', 'admin_dashboard', domain='building-dash.test')
+
+    # The project is read as its directory settles, and preparing its image starts there - no
+    # request needed, which is the point: it is already under way when somebody first looks.
+    deadline = time.time() + 20
+    while True:
+        body = t.assert_http('/', host='building-dash.test',
+                             check_body='building-dash.test')
+        if 'dashboard-says-which-images-are-still-building.test' in body and '>Building<' in body:
+            break
+        assert time.time() < deadline, f"never reported the build:\n{body}"
+        time.sleep(0.2)
+    # ...and the service row says which part of it is not ready
+    assert 'building image' in body, body
+
+    # Meanwhile the rest of the server is unaffected: this very page came back, and so does a
+    # project that needs no image at all.
+    t.write_file('public/index.html', 'served during the build', domain='building-bystander.test')
+    t.assert_http('/', host='building-bystander.test', check_body='served during the build',
+                  timeout=5)
+
+    # When the image is ready the service starts on the first request, and nothing says Building
+    t.assert_http('/', check_body='<title>Directory listing', timeout=60)
+    body = t.assert_http('/', host='building-dash.test', check_body='building-dash.test')
+    assert '>Building<' not in body, body
+    assert 'building image' not in body, body
 
 
 @test

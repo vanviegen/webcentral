@@ -33,13 +33,10 @@ question
 (Include/exclude path matching lives in the `include-exclude-watcher` crate's public `Matcher`,
 which webcentral uses to decide which server a changed file belongs to.)
 
-`src/owner.rs` - Who a project belongs to: resolves the owner, checks the host can run rootless
-podman as them (subordinate ids present and not overlapping, `newuidmap` installed, `pasta` or
-`slirp4netns` there to give a container a network - podman 5 wants the first where podman 4 wanted
-the second, so the version decides which absence is a problem - and every
-directory above the project traversable), and hands out a `Command` that will - which means
-re-pointing *everything* a child inherits that could name the wrong user: the XDG directories, the
-container config overrides, and the working directory
+`src/owner.rs` - Who a project belongs to: resolves the owner and hands out a `Command` that will
+run podman as them - which means re-pointing *everything* a child inherits that could name the
+wrong user: the XDG directories, the container config overrides, and the working directory. Also
+`repair()` and `explain()`, which run only after something has already failed
 
 `src/dashboard.rs` - The built-in status page. A section per project rather than a row, since a
 project is a script, some services and their sidecars rather than one thing with a type. Each
@@ -71,7 +68,9 @@ counts whether or not it held, and what it let through is the count on the state
 Zero is worth seeing, being a rule in the wrong place. Nesting is shown by the rule down the left
 rather than by shrinking the text. `check_auth`'s secret is never rendered. On the admin page each
 project folds away behind its domain/TLS/how-many-services-are-up/request-count line; a project's
-own page does not fold
+own page does not fold. A project with a service whose image is still being pulled or built says
+`Building` on that line, and `building image` beside that service's state - the one thing a
+project is not ready for the moment it is read
 
 `src/logger.rs` - Daily-rotated logs with configurable retention
 
@@ -207,12 +206,19 @@ can show a project nobody has visited (`server::load_project`). Reading starts n
 request does that - but it does *prepare* images, so a global semaphore (`app_server::image_work`,
 4 permits) keeps sixty projects from pulling sixty images at once on startup.
 
-Reading is delayed by `SETTLE` (2s), because a directory usually appears because a deploy is in
-progress: reading it while its files are still landing would answer from half a project. A request
-arriving first reads it itself, which makes the delayed read a no-op. For the same reason the
-implicit static tail is *not* conditional on `public/` existing at read time - `serve_dir public`
-404s by itself when there is nothing there, and a tail chosen from an empty directory would go on
-404ing after the files arrived.
+Reading a directory that *appears* is delayed by `SETTLE` (2s), because it usually appears because
+a deploy is in progress: reading it while its files are still landing would answer from half a
+project. A request arriving first reads it itself, which makes the delayed read a no-op. For the
+same reason the implicit static tail is *not* conditional on `public/` existing at read time -
+`serve_dir public` 404s by itself when there is nothing there, and a tail chosen from an empty
+directory would go on 404ing after the files arrived.
+
+A directory that was already there when webcentral started is read *at once* instead
+(`WatchEvent::Initial` -> no delay), since nothing is landing in it: a restart has no window in
+which projects exist and nothing is known about them. Reading is quick - a file and a parse - so
+what is left of a restart is image preparation, which happens in the background, four at a time,
+while everything else already serves. A service whose image is not there yet is the only thing a
+request waits for, and the dashboard says which those are (`AppServer::building`).
 
 A change to a project-defining file tears the project down and reads it again straight away
 (`Project::reload` -> `server::reload_project_by_dir`), rather than leaving it for the next
@@ -315,6 +321,32 @@ store has been asked (`locate_base`): podman refuses a short name it cannot plac
 built on the machine has no registry to come from and must keep the name it has - which includes
 the test suite's own base image.
 
+**Nothing about podman is checked before it is used.** A store, subordinate ids, a user namespace
+and a network (rootless podman shells out to `pasta` or `slirp4netns` for that) are all set up by
+`podman run` and by nothing before it, so any check is a guess at another program's requirements -
+one that goes stale with each podman release, can only be made per owner (so not at startup, since
+projects appear at any time), and would have to be repeated in case the host was fixed meanwhile.
+Failure is the check. On one:
+
+- `Owner::repair()` fixes what can be fixed and says so, and the start is retried by leaving the
+  state at Starting. Only one thing qualifies: a project owner with no subordinate id range, added
+  with `usermod` after every existing range so nothing overlaps. It fires at most once, since what
+  it fixes stays fixed, which is what keeps the retry from looping
+- `Owner::explain()` adds what podman's message leaves out, from a short table of phrases it
+  writes (`could not find pasta`, `newuidmap`, `write to uid_map failed`, `no subuid ranges`),
+  falling back to `unreachable()` - which names the directory above the project that the owner
+  cannot traverse, where podman says only `context must be a directory`
+- `AppServer::failed()` puts the result in all three places somebody might look: the project's
+  log, webcentral's output, and `AppServer::problem` - which the dashboard shows as a Problem row
+  beside the service, and which is cleared when the service comes up. What it explains a failure
+  *with* is `said`, the last line the container wrote to stderr (where podman reports its
+  refusals, and where a dying service says its last word), emptied as each start begins. Two
+  fields rather than one because a log streamer drains asynchronously: a farewell line from a
+  service stopped for a reason of ours can land after the stop, and must not become a problem
+
+`AppServer::podman()` runs one short podman subcommand and gives back either its stdout or
+podman's stderr, so every call site says only what it was trying to do.
+
 **Podman** is the only way a service runs; there is no unsandboxed path. Via `get_podman_path()`:
 - A project's own `Dockerfile` is built with the project directory as context, which podman
   confines - `COPY ../x` is refused and symlinks resolve inside it. Its tag is fixed and the build
@@ -344,8 +376,10 @@ would break their `podman`. It also passes `--cgroup-manager=cgroupfs`, because 
 never logged in has no systemd user session: crun would ask the session bus for a scope, be told
 "interactive authentication required", and the container would not start. Podman's own fallback
 warns and then lets the runtime reach for sd-bus anyway. When webcentral already *is* the owner, podman's defaults are right and
-nothing is set. Owners are resolved once and cached per uid, with subuid/subgid and
-`newuidmap`/`newgidmap` checked then - reported to both webcentral's output and the project's log.
+nothing is set. Owners are resolved once and cached per uid; what resolving one can report is only
+what it had to settle anyway - no account for the uid, a non-root webcentral that cannot become
+somebody else, a store directory it could not prepare - reported to both webcentral's output and
+the project's log.
 
 **Container user:** a service's `user` only decides who the container runs as *inside*, defaulting
 (resolved at parse time) to `project` when the project directory is mounted (`app_dir` is not

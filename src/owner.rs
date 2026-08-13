@@ -71,12 +71,6 @@ impl Owner {
             .unwrap_or_else(|| uid.to_string());
         let mut problems = Vec::new();
 
-        // A container of root's own is given a bridge by netavark and needs none of this; every
-        // other case is rootless, whether webcentral becomes the owner or already is them.
-        if uid != 0 {
-            problems.extend(rootless_network_problems());
-        }
-
         // Already this user: podman's own defaults are what we want, and setting an identity we
         // already have would need privileges we do not have.
         if nix::unistd::geteuid().as_raw() == uid {
@@ -101,9 +95,6 @@ impl Owner {
             ));
             return Owner { uid, gid, name, identity: None, problems };
         };
-
-        problems.extend(subid_problems(&user.name));
-        problems.extend(newidmap_problems());
 
         let store = user.dir.join(".local/share/webcentral/storage");
         let runroot = PathBuf::from(format!("/run/webcentral/{}", uid));
@@ -194,11 +185,93 @@ impl Owner {
 }
 
 impl Owner {
+    /// Fix what can be fixed about running podman as this owner, saying what was done - so the
+    /// caller can report it and try the same thing again. `Ok(None)` when there was nothing to do,
+    /// which is the usual answer and the reason this is only asked after something failed.
+    ///
+    /// There is exactly one repairable thing: rootless podman maps a container's users onto a
+    /// subordinate id range, which most distributions hand out at `useradd` time and some do not.
+    /// Only a root webcentral can give one, and only a root webcentral running podman as somebody
+    /// else needs one - which is what `identity` is. Written through `usermod`, which takes the
+    /// locks that `/etc/subuid` wants and refuses a range that overlaps somebody else's.
+    pub fn repair(&self) -> Result<Option<String>, String> {
+        const FILES: [&str; 2] = ["/etc/subuid", "/etc/subgid"];
+        if self.identity.is_none() || FILES.iter().all(|file| self.has_subids(file)) {
+            return Ok(None);
+        }
+        // After every range anybody holds, so nothing can overlap; 100000 is where distributions
+        // start, and each user gets the conventional 65536 ids.
+        let start = FILES
+            .iter()
+            .flat_map(|file| subid_ranges(file))
+            .fold(100_000, |top: u64, (start, count)| top.max(start + count));
+        let range = format!("{}-{}", start, start + 65535);
+
+        let refused = match std::process::Command::new("usermod")
+            .args(["--add-subuids", &range, "--add-subgids", &range, &self.name])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                return Ok(Some(format!(
+                    "{} had no subordinate id range, which rootless podman needs, so it was given \
+                     {}. Trying again.",
+                    self.name, range
+                )))
+            }
+            Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            Err(e) => e.to_string(),
+        };
+        Err(format!(
+            "{} has no subordinate id range and one could not be added ({}). Fix with: usermod \
+             --add-subuids {} --add-subgids {} {}",
+            self.name, refused, range, range, self.name
+        ))
+    }
+
+    fn has_subids(&self, file: &str) -> bool {
+        std::fs::read_to_string(file)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.split(':').next() == Some(self.name.as_str()))
+    }
+
+    /// What podman's own message leaves out, for the failures that name a symptom rather than a
+    /// cause. Asked only of something that already went wrong, so it costs nothing until it is
+    /// wanted - and answers from the host as it is now rather than as it was at startup.
+    pub fn explain(&self, output: &str, dir: &Path) -> Option<String> {
+        // Each is a phrase podman writes and the thing it does not say. `{user}` is this owner.
+        const HINTS: [(&str, &str); 5] = [
+            ("could not find pasta",
+             "Rootless podman gives a container its network with pasta, which this host has not \
+              got. Install your distribution's passt package (Debian and Ubuntu: apt install \
+              passt), or keep using the older helper by putting 'default_rootless_network_cmd = \
+              \"slirp4netns\"' under [network] in /etc/containers/containers.conf."),
+            ("could not find slirp4netns",
+             "Rootless podman gives a container its network with slirp4netns, which this host has \
+              not got. Install your distribution's slirp4netns package, or its passt package and \
+              podman 5, which uses pasta by default."),
+            ("newuidmap",
+             "newuidmap and newgidmap are what rootless podman maps user ids with. Install your \
+              distribution's uidmap package (Fedora and RHEL: shadow-utils)."),
+            ("write to uid_map failed",
+             "The kernel refuses a mapping whose ranges overlap. Check /etc/subuid and \
+              /etc/subgid for more than one line for {user}, and remove all but one."),
+            ("no subuid ranges",
+             "Rootless podman needs a subordinate id range. Fix with: usermod --add-subuids \
+              100000-165535 --add-subgids 100000-165535 {user}"),
+        ];
+        if let Some((_, hint)) = HINTS.iter().find(|(phrase, _)| output.contains(phrase)) {
+            return Some(hint.replace("{user}", &self.name));
+        }
+        self.unreachable(dir)
+    }
+
     /// Whether every directory above `dir` can be entered by this owner, since podman becomes them
-    /// before it so much as stats the project. Checked per project rather than cached with the
-    /// owner, because it is a fact about the path. Podman's own report of this is
-    /// `context must be a directory`, which names neither the directory at fault nor the reason.
-    pub fn unreachable(&self, dir: &Path) -> Option<String> {
+    /// before it so much as stats the project. A fact about the path rather than about the owner,
+    /// and one somebody can change while webcentral runs, so it is worked out when a start fails
+    /// rather than kept. Podman's own report of this is `context must be a directory`, which names
+    /// neither the directory at fault nor the reason.
+    fn unreachable(&self, dir: &Path) -> Option<String> {
         use std::os::unix::fs::MetadataExt;
         use std::os::unix::fs::PermissionsExt;
         let Some(identity) = &self.identity else { return None };
@@ -241,136 +314,16 @@ pub fn ownership(path: &Path) -> (u32, u32) {
     std::fs::metadata(path).ok().map(|m| (m.uid(), m.gid())).unwrap_or((0, 0))
 }
 
-/// Rootless podman needs a range of subordinate ids to map a container's users onto. Without one
-/// it fails at the first `run`, with an error about the range rather than about the project.
-fn subid_problems(name: &str) -> Vec<String> {
-    let mut problems = Vec::new();
-    for file in ["/etc/subuid", "/etc/subgid"] {
-        let content = std::fs::read_to_string(file).unwrap_or_default();
-        // (start, count) for each range this user holds, in file order.
-        let ranges: Vec<(u64, u64)> = content
-            .lines()
-            .filter(|line| line.split(':').next() == Some(name))
-            .filter_map(|line| {
-                let mut fields = line.split(':').skip(1);
-                Some((fields.next()?.trim().parse().ok()?, fields.next()?.trim().parse().ok()?))
-            })
-            .collect();
-
-        if ranges.is_empty() {
-            problems.push(format!(
-                "{} has no range in {}, which rootless podman needs to run containers. Fix with: \
-                 usermod --add-subuids 100000-165535 --add-subgids 100000-165535 {}",
-                name, file, name
-            ));
-            continue;
-        }
-
-        // Podman maps every range the user holds, and the kernel refuses a map whose host ranges
-        // overlap - so a second range added on top of the one `useradd` allocated by itself stops
-        // every container from starting, with nothing but `newuidmap: write to uid_map failed:
-        // Invalid argument` to say why.
-        let mut sorted = ranges.clone();
-        sorted.sort();
-        for pair in sorted.windows(2) {
-            let ((start, count), (next, _)) = (pair[0], pair[1]);
-            if start + count > next {
-                problems.push(format!(
-                    "{} has overlapping ranges in {} ({}+{} runs into {}), which the kernel \
-                     refuses to map. Remove all but one of {}'s lines from {}.",
-                    name, file, start, count, next, name, file
-                ));
-                break;
-            }
-        }
-    }
-    problems
-}
-
-/// The helpers podman calls to apply those ranges. They are privileged either by the setuid bit or
-/// by file capabilities, depending on the distribution, so both count.
-fn newidmap_problems() -> Vec<String> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut problems = Vec::new();
-    for tool in ["newuidmap", "newgidmap"] {
-        let found = std::env::var("PATH").unwrap_or_default().split(':').any(|dir| {
-            std::fs::metadata(PathBuf::from(dir).join(tool))
-                .map(|meta| meta.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
-        });
-        if !found {
-            problems.push(format!(
-                "{} is not installed, and rootless podman needs it to map user ids. Install your \
-                 distribution's shadow-utils package.",
-                tool
-            ));
-        }
-    }
-    problems
-}
-
-/// Rootless podman cannot give a container a network by itself: it shells out to `pasta` or
-/// `slirp4netns`, and podman 5 changed which of the two it reaches for by default. A host with
-/// podman 5 and only slirp4netns installed - the shape a distribution upgrade leaves behind - then
-/// fails every `run` with `could not find pasta`, which names the binary but not the package that
-/// carries it, and says nothing about the alternative.
-fn rootless_network_problems() -> Vec<String> {
-    let (pasta, slirp) = (helper_exists("pasta"), helper_exists("slirp4netns"));
-    if pasta {
-        return Vec::new();
-    }
-    if !slirp {
-        return vec![
-            "Neither pasta nor slirp4netns is installed, and rootless podman needs one of them to \
-             give a container a network. Install your distribution's passt package (Debian and \
-             Ubuntu: apt install passt)."
-                .to_string(),
-        ];
-    }
-    // slirp4netns is there, so this is only a problem if podman would rather have pasta. Asked of
-    // the binary rather than of `podman info`, which would have to be run once per owner against
-    // their store; the version is a fact about the installation.
-    if podman_major() >= 5 {
-        return vec![format!(
-            "podman {} gives a container its network with pasta by default, which is not \
-             installed, so containers will fail to start with 'could not find pasta'. Install \
-             your distribution's passt package (Debian and Ubuntu: apt install passt), or keep \
-             using the slirp4netns you do have by putting 'default_rootless_network_cmd = \
-             \"slirp4netns\"' under [network] in /etc/containers/containers.conf.",
-            podman_major()
-        )];
-    }
-    Vec::new()
-}
-
-/// Whether podman would find `name`. Its helpers are not always on `PATH` - a distribution may put
-/// them in one of podman's own directories instead - so those are searched too.
-fn helper_exists(name: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    let path = std::env::var("PATH").unwrap_or_default();
-    let helpers = "/usr/local/libexec/podman:/usr/local/lib/podman:/usr/libexec/podman:/usr/lib/podman";
-    path.split(':').chain(helpers.split(':')).any(|dir| {
-        std::fs::metadata(PathBuf::from(dir).join(name))
-            .map(|meta| meta.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    })
-}
-
-/// Podman's major version, or 0 when it cannot be read - which reports nothing rather than
-/// guessing. `--version` reads no configuration and opens no store, so it is cheap and needs no
-/// owner to be run as.
-fn podman_major() -> u32 {
-    use std::sync::OnceLock;
-    static MAJOR: OnceLock<u32> = OnceLock::new();
-    *MAJOR.get_or_init(|| {
-        let out = std::process::Command::new(podman_path()).arg("--version").output();
-        let Ok(out) = out else { return 0 };
-        // "podman version 5.8.2"
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .find_map(|word| word.split('.').next()?.parse().ok())
-            .unwrap_or(0)
-    })
+/// The (start, count) of every subordinate id range in `file`, whoever holds it.
+fn subid_ranges(file: &str) -> Vec<(u64, u64)> {
+    std::fs::read_to_string(file)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(':').skip(1);
+            Some((fields.next()?.trim().parse().ok()?, fields.next()?.trim().parse().ok()?))
+        })
+        .collect()
 }
 
 /// Create a directory owned by someone else, which only root can do - and only root gets here.
