@@ -191,10 +191,24 @@ template parser can leave their `$` alone.
 
 Each server uses the `AppState` enum with an explicit state machine in `AppServer::lifecycle_task`:
 
-- **Stopped** - Waiting for a request (triggers startup via the `pending_requests` counter)
+- **Stopped** - Waiting for a request (triggers startup via the `pending_requests` counter). A
+  file change here only makes the next start re-derive a copied image: teardown arrives as
+  Shutdown, never as FileChange - a change is a reason to start from new files, not to die
 - **Starting** - Spawning processes, waiting for port ready, detecting process exit
 - **Running** - Serving, monitoring for stop triggers (file change, inactivity, process exit, shutdown)
-- **Failed** - Startup failed; waiting requests get a 502 and a later file change retries
+- **Failed** - Startup failed; requests get a 502 at once rather than waiting on an attempt already
+  known to be doomed. A file change, or `startup_time` passing, puts it back to Stopped so the next
+  request tries again - what broke a start is as often the machine, the network or a registry as it
+  is the project, and a service that is gone until somebody edits a file is not one that starts on
+  demand. Waiting for as long as an attempt may take bounds retrying at half the wall clock
+
+A stray `StopReason` - a straggler ProcessExit from a request that failed against the previous
+instance's dead pooled connection - is ignored outside Running: it must neither abort a fresh
+start nor reset the Failed retry clock.
+
+The lifecycle task ends only at shutdown, and marks the state Failed as it goes: nothing drives the
+machine afterwards, so a request left waiting for Running would wait for good - which is what an
+outgoing project's in-flight requests would do while it is being replaced.
 
 A project with no servers (static, proxy, redirect, forward) has no lifecycle task at all.
 
@@ -276,11 +290,26 @@ the listener readable). `main` also raises `RLIMIT_NOFILE` to the hard limit at 
 **Per-server:**
 - `watch::channel<AppState>` - State broadcasting, requests wait via `wait_for()`
 - `mpsc::channel<StopReason>` - Stop signals (FileChange, Inactivity, ProcessExit, Shutdown)
-- `AtomicU64` pending_requests - Tracks in-flight requests, triggers startup
-- `AtomicU64` active_upgrades - Tracks active WebSocket/upgraded connections. Inactivity timeout only triggers when count is 0.
-- `Notify` state_changed - Wakes lifecycle_task when pending_requests changes
+- `AtomicU64` pending_requests - In-flight requests; more than none also *asks* for the service,
+  which is what starts a stopped one
+- `AtomicU64` active_upgrades - Open WebSocket/upgraded connections. They hold a running service
+  open but never start one
+- Both are only ever taken and given back through `app_server::Use`, the guard `wait_until_ready`
+  and `hold_upgrade` hand out, because a request is a future somebody else owns: a client that
+  disconnects (or an h2 stream that is reset) drops it wherever it is waiting, and a pair of calls
+  would leak the count. A leaked *request* is permanent and makes the service start again the
+  instant it stops for inactivity - a container a second for as long as webcentral runs. A
+  request's guard rides its response body (`project::HeldBody`), so a download or event stream
+  still flowing counts as in use until its last byte
+- The idle timeout only fires when neither counter is above zero, so an in-flight request or an
+  open WebSocket is never mistaken for an idle service
+- `Notify` state_changed - Wakes lifecycle_task when pending_requests changes; nothing polls for
+  it, since the counter only ever moves through `hold`/`Use::drop` and a permit covers a
+  notification landing between the read and the wait
 - `Mutex<Option<AppConnection>>` - Dynamic port/client per restart cycle
-- `Mutex<Instant>` last_activity - Tracks for inactivity timeout
+- `Mutex<Instant>` last_activity - Set when a request arrives or finishes and when the service comes
+  up. Starting counts, so however long a start took the service cannot come up already overdue and
+  stop again in the same instant
 
 **Server-level:**
 - `DashMap<String, DomainInfo>` - Concurrent domain → project mapping (lock-free reads)

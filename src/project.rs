@@ -6,7 +6,7 @@
 //! servers share: a change to the config replaces the project wholesale, any other watched change
 //! stops the servers so they restart from the new files on the next request.
 
-use crate::app_server::{AppServer, AppState, StopReason};
+use crate::app_server::{AppServer, AppState, StopReason, Use};
 use crate::owner::Owner;
 use crate::config::ProjectConfig;
 use crate::dashboard::ServiceStatus;
@@ -38,6 +38,38 @@ pub fn empty_body() -> StreamBody {
 
 pub fn body_from<T: Into<Bytes>>(data: T) -> StreamBody {
     BoxBody::new(Full::new(data.into()).map_err(|e: std::convert::Infallible| anyhow::anyhow!("{}", e)))
+}
+
+/// A response body carrying the request's `Use` guard, so the service counts as in use until the
+/// body is done - streamed to its end, or dropped along with a client that went away. `send`
+/// returns when the upstream's *headers* arrive; giving the guard back there would let the idle
+/// timeout stop the container under a download or an event stream still flowing.
+struct HeldBody<B> {
+    body: B,
+    _serving: Option<Use>,
+}
+
+impl<B> http_body::Body for HeldBody<B>
+where
+    B: http_body::Body + Unpin,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
 }
 
 /// How to reach a `proxy` target: TLS when it asks for it, plain otherwise.
@@ -335,7 +367,7 @@ impl Project {
                     host_port: server.port(),
                     pending_requests: server.pending_requests(),
                     active_upgrades: server.active_upgrades(),
-                    idle_seconds: server.idle_seconds(),
+                    idle_seconds: Some(server.idle_seconds()),
                     shutdown_time: Some(config.shutdown_time),
                     startup_time: Some(config.startup_time),
                     reload_include: mark_defaults(&config.reload_include, &includes),
@@ -369,11 +401,9 @@ impl Project {
                     let Some(server) = self.server(&name) else {
                         anyhow::bail!("502 no server named '{}'", name);
                     };
-                    server.wait_until_ready().await?;
+                    let _serving = server.wait_until_ready().await?;
                     let connector = server.connector().await?;
-                    let result = self.clone().upgrade(connector, req, Some(server.clone())).await;
-                    server.untrack_request();
-                    result?
+                    self.clone().upgrade(connector, req, Some(server.clone())).await?
                 }
                 Terminal::Forward(target) => {
                     let connector = forward_connector(&target);
@@ -503,11 +533,9 @@ impl Project {
                 let Some(server) = self.server(&name) else {
                     anyhow::bail!("502 no server named '{}'", name);
                 };
-                server.wait_until_ready().await?;
+                let serving = server.wait_until_ready().await?;
                 let client = server.http_client().await?;
-                let result = self.send(client, req, Some(server.clone())).await;
-                server.untrack_request();
-                result
+                self.send(client, req, Some(serving)).await
             }
             Terminal::Forward(target) => {
                 let (_, client) = self.target(&target, || forward_connector(&target));
@@ -550,7 +578,7 @@ impl Project {
         &self,
         client: Client<AnyConnector, StreamBody>,
         req: Request<StreamBody>,
-        server: Option<Arc<AppServer>>,
+        serving: Option<Use>,
     ) -> Result<Response<StreamBody>> {
         let (mut parts, body) = req.into_parts();
 
@@ -575,18 +603,21 @@ impl Project {
                 // dies while a pooled connection is open fails as a closed connection instead, and
                 // treating only the former as fatal left it wedged. ProcessExit (not Shutdown) so
                 // the lifecycle restarts it rather than exiting for good.
-                if let Some(server) = &server {
-                    server.request_stop(StopReason::ProcessExit);
+                if let Some(serving) = &serving {
+                    serving.server().request_stop(StopReason::ProcessExit);
                 }
                 let source = StdError::source(&e).map(|s| s.to_string()).unwrap_or_default();
                 anyhow::bail!("502 upstream request failed: {} {}", e, source);
             }
         };
 
-        // Stream the upstream body through as-is. When the client disconnects the response is
-        // dropped, which drops the body, which closes the upstream connection.
+        // Stream the upstream body through as-is, the request's guard riding along: the service
+        // is in use until the body is done, not merely until its headers arrived. When the client
+        // disconnects the response is dropped, which drops the body, which closes the upstream
+        // connection and gives the guard back.
         let (parts, body) = response.into_parts();
-        Ok(Response::from_parts(parts, BoxBody::new(body.map_err(|e| anyhow::anyhow!("{}", e)))))
+        let body = HeldBody { body: body.map_err(|e| anyhow::anyhow!("{}", e)), _serving: serving };
+        Ok(Response::from_parts(parts, BoxBody::new(body)))
     }
 
     /// Bridge a protocol upgrade (WebSocket and friends) to the backend, which needs raw byte
@@ -597,6 +628,11 @@ impl Project {
         req: Request<StreamBody>,
         server: Option<Arc<AppServer>>,
     ) -> Result<Response<StreamBody>> {
+        // In use as an upgrade from here to the end of the bridging task below, given back by the
+        // guard wherever this ends - an early return on a failed handshake included. It never
+        // starts anything: the caller's request guard is what got the service up.
+        let held = server.map(|server| server.hold_upgrade());
+
         let method = req.method().clone();
         let uri = req.uri().clone();
         let headers = req.headers().clone();
@@ -665,13 +701,9 @@ impl Project {
             }
         }
 
-        // Tracked only from here on: every failure path above returns without ever reaching the
-        // task below, and an increment nothing decrements would hold the server open forever. The
-        // handshake itself is covered by the caller's pending-request count instead.
-        if let Some(server) = &server {
-            server.track_upgrade();
-        }
         tokio::spawn(async move {
+            // Given back when this task ends, whichever way it ends.
+            let _held = held;
             let result = match upgrade_fut.await {
                 Ok(upgraded) => {
                     let mut upgraded = TokioIo::new(upgraded);
@@ -699,11 +731,6 @@ impl Project {
                 ) {
                     logger.write("error", &format!("WebSocket error: {}", e));
                 }
-            }
-
-            if let Some(server) = server {
-                server.touch().await;
-                server.untrack_upgrade();
             }
         });
 

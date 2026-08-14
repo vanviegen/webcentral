@@ -1092,6 +1092,13 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-08-14 (3.0.3):
+  - **A client that goes away mid-request no longer wedges the service.** The abandoned request stayed counted as waiting, so the service restarted the instant it stopped for inactivity - a container a second, until podman gave up and the project 502'd.
+  - **A response still streaming keeps its service alive**, as does an open WebSocket. The idle clock also starts when the service comes up, not when the request that started it arrived.
+  - **A service that failed to start tries again after `startup_time`**, instead of staying failed until somebody edits a file. Requests still get an immediate 502 while the failure stands.
+  - **Editing a file while its service was stopped no longer breaks the project.** It used to end that service's lifecycle, leaving every later request waiting forever.
+  - **A request waiting on a service gets a 502 when its project is replaced under it**, rather than hanging until the client gives up.
+
 2026-08-13 (3.0.2):
   - **Nothing about podman is checked in advance any more.** Webcentral used to look for subordinate id ranges and helper binaries before using them, which was a guess at another program's requirements, went stale with every podman release, and could only be made at a moment when nothing could be done about the answer. A service is simply started; if that fails, **what can be fixed is fixed and the start retried** (a project owner with no subordinate id range is given one), and what cannot is **relayed in podman's own words** - to the project's log, to webcentral's output, and to the dashboard, where it appears as a Problem row beside the service. A hint is added for the messages that name a symptom rather than a cause, such as `could not find pasta`.
   - **Projects that already exist are read the moment webcentral starts**, rather than two seconds later - that delay is for a directory that *appears*, where a deploy is probably still writing into it. What remains of a restart is image preparation, which runs in the background four at a time while every other project already serves; the dashboard says **Building** on a project whose service is still getting its image, and `building image` beside that service.

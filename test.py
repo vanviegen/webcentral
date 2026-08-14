@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1934,9 +1935,9 @@ while True:
 
 @test
 def test_graceful_shutdown_delay(t):
-    """Handle requests during graceful shutdown"""
+    """An application that takes its time over SIGTERM is waited for, and starts again after"""
     # Create a script that catches TERM signal and delays
-    t.write_file('server.py', '''
+    server = '''
 import signal
 import sys
 import time
@@ -1963,7 +1964,8 @@ Handler = http.server.SimpleHTTPRequestHandler
 with socketserver.TCPServer(("", PORT), Handler) as httpd:
     print(f"Server running on port {PORT}", flush=True)
     httpd.serve_forever()
-''')
+'''
+    t.write_file('server.py', server)
 
     t.write_file('webcentral.conf', 'service {\n  command = python3 -u server.py\n}')
     t.write_file('index.html', '<h1>Shutdown Test</h1>')
@@ -1972,11 +1974,14 @@ with socketserver.TCPServer(("", PORT), Handler) as httpd:
     t.assert_http('/', check_body='Shutdown Test')
     t.assert_log('Server running', count=1)
 
-    # Trigger reload to cause shutdown
+    # Trigger reload to cause shutdown. An asset is re-read from disk on every request, so writing
+    # one is deliberately not a reason to restart anything - rewriting the server's own file is.
     t.mark_log_read()
     t.write_file('index.html', '<h1>Shutdown Test v2</h1>')
+    t.write_file('server.py', server)
 
     # Wait for shutdown signal to be received
+    t.await_log('Stopping due to file changes', timeout=5)
     t.await_log('Received TERM signal', timeout=5)
     t.await_log('Shutdown delay complete')
 
@@ -2285,6 +2290,193 @@ service {
 
     # Wait for timeout (1 second + some buffer)
     t.await_log('Stopping due to inactivity', timeout=3)
+
+
+@test
+def test_abandoned_request_is_given_back(t):
+    """A client that vanishes mid-request must not leave the service wanted forever.
+
+    A pending request is what asks the lifecycle to start, so one that is never given back starts
+    the service again the instant it stops for inactivity - a container a second, for as long as
+    webcentral runs, until podman gives up and the project 502s for good.
+    """
+    t.write_file('webcentral.conf',
+                 '''
+service {
+  command = python3 -u -m http.server $PORT
+  shutdown_time = 1
+}
+''')
+    t.write_file('index.html', 'still here')
+
+    # Ask, then vanish while it is still starting: a reset rather than a close, which is what a
+    # client that went away looks like - hyper drops the request future where it stands.
+    sock = socket.create_connection(('localhost', t.port))
+    sock.sendall(f'GET / HTTP/1.1\r\nHost: {t.current_test_domain}\r\n\r\n'.encode())
+    t.await_log('Starting', timeout=5)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+    sock.close()
+
+    # It came up for nobody, so it goes away again - and stays away.
+    t.await_log('Stopped (inactivity)', timeout=15)
+    t.assert_log('Starting', count=1)
+
+    # And the one start it does still owe somebody, it makes.
+    t.assert_http('/', check_body='still here', timeout=20)
+    t.assert_log('Starting', count=2)
+
+
+@test
+def test_failed_service_tries_again_by_itself(t):
+    """A service that failed to start is tried again, without anybody touching a file.
+
+    While the failure stands every request is answered 502 at once, so nobody waits on an attempt
+    already known to be doomed - but it stands for `startup_time` and no longer. What broke a
+    start is as often the machine, the network or a registry as it is the project.
+    """
+    t.write_file('app.py', '''
+import os, sys, http.server, socketserver
+# Refuse to come up until the marker is there. `data/` is a default reload exclude, so writing it
+# is not a file change: nothing but the retry itself can be what starts this the second time.
+if not os.path.exists('data/ready'):
+    sys.exit('nothing to serve yet')
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'up now')
+    def log_message(self, *args): pass
+socketserver.TCPServer(('', int(os.environ['PORT'])), Handler).serve_forever()
+''')
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u app.py
+  startup_time = 2
+}
+''')
+
+    t.assert_http('/', check_code=502, timeout=20)
+    t.await_log('Startup failed', timeout=5)
+    # A second request while the failure stands is refused at once rather than starting anything.
+    t.assert_http('/', check_code=502, timeout=5)
+
+    t.write_file('data/ready', '')
+    t.await_log('Trying again on the next request', timeout=10)
+    t.assert_http('/', check_body='up now', timeout=20)
+
+
+@test
+def test_file_change_reaches_a_stopped_service(t):
+    """A file change arriving while the service is stopped must not break it.
+
+    FileChange on the stop channel means a source edit, never a project teardown (that arrives
+    as Shutdown) - and a stopped service is exactly what gets edited: one that failed and went
+    back to Stopped after its retry window, or one stopped for inactivity. Treating the edit as
+    "this instance is orphaned" ended the lifecycle task, and every request after that waited
+    forever on a service that could no longer start.
+    """
+    app = '''
+import os, http.server, socketserver
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'%s')
+    def log_message(self, *args): pass
+socketserver.TCPServer(('', int(os.environ['PORT'])), Handler).serve_forever()
+'''
+    t.write_file('app.py', "import sys\nsys.exit('broken')\n")
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u app.py
+  startup_time = 2
+  shutdown_time = 1
+}
+''')
+    t.assert_http('/', check_code=502, timeout=20)
+    t.await_log('Trying again on the next request', timeout=10)
+
+    # The fix lands after the retry window, so the lifecycle is already waiting in Stopped.
+    t.mark_log_read()
+    t.write_file('app.py', app % 'v1')
+    t.await_log('Stopping due to file changes', timeout=5)
+    t.assert_http('/', check_body='v1', timeout=20)
+
+    # And again for a service that stopped for inactivity rather than for failing.
+    t.await_log('Stopping due to inactivity', timeout=10)
+    t.mark_log_read()
+    t.write_file('app.py', app % 'v2')
+    t.await_log('Stopping due to file changes', timeout=5)
+    t.assert_http('/', check_body='v2', timeout=20)
+
+
+@test
+def test_streaming_body_holds_service_open(t):
+    """A response still streaming counts as the service being in use, however long it takes.
+
+    The request's guard rides the response body, so the idle timeout must not stop the container
+    under a download that outlasts `shutdown_time` - the count is given back when the body ends,
+    not when its headers arrive.
+    """
+    t.write_file('app.py', '''
+import os, time, http.server, socketserver
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Length', '21')
+        self.end_headers()
+        for _ in range(9):
+            self.wfile.write(b'x,')
+            self.wfile.flush()
+            time.sleep(0.3)
+        self.wfile.write(b'end')
+    def log_message(self, *args): pass
+socketserver.TCPServer(('', int(os.environ['PORT'])), Handler).serve_forever()
+''')
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u app.py
+  shutdown_time = 1
+}
+''')
+    # ~2.7s of body against a 1s idle timeout: only the guard riding the body keeps it alive.
+    t.assert_http('/', check_body='end', timeout=20)
+    t.assert_log('Stopping due to inactivity', count=0)
+    # With the last byte delivered the guard is given back, and now it is idle.
+    t.await_log('Stopping due to inactivity', timeout=10)
+
+
+@test
+def test_waiting_request_is_answered_when_the_project_goes(t):
+    """A request waiting on a start must be answered when its project is torn down under it.
+
+    A configuration change deregisters the project and shuts its services down, and the lifecycle
+    task ends there - nothing sets the state again. A request already waiting for Running would be
+    waiting for something that can no longer come: the client's own timeout, for an answer that was
+    settled the moment the project went.
+    """
+    t.write_file('app.py', 'import time\ntime.sleep(60)\n')
+    t.write_file('webcentral.conf', '''
+service {
+  command = python3 -u app.py
+  startup_time = 60
+}
+''')
+
+    # Ask, and stay on the line: the service will not come up within this test's patience.
+    sock = socket.create_connection(('localhost', t.port))
+    sock.sendall(f'GET / HTTP/1.1\r\nHost: {t.current_test_domain}\r\n\r\n'.encode())
+    t.await_log('Starting', timeout=10)
+
+    t.write_file('webcentral.conf', 'respond 200 replaced')
+    t.await_log('Shutdown during startup', timeout=10)
+
+    sock.settimeout(5)
+    assert b' 502 ' in sock.recv(200), 'the waiting request was not answered'
+    sock.close()
+
+    t.assert_http('/', check_body='replaced')
 
 
 @test

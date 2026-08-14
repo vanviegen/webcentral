@@ -8,7 +8,8 @@
 //! * **Stopped** - nothing running; a waiting request triggers a start
 //! * **Starting** - processes spawned, waiting for the port to answer
 //! * **Running** - serving; watching for a stop trigger (file change, idle, process exit, shutdown)
-//! * **Failed** - startup failed; waiting requests get a 502, and a later file change retries
+//! * **Failed** - startup failed; requests get a 502 at once, and a file change or `startup_time`
+//!   passing puts it back to Stopped so the next request tries again
 
 use crate::config::{ServerConfig, DEFAULT_BASE_IMAGE};
 use crate::logger::Logger;
@@ -121,14 +122,21 @@ pub struct AppServer {
     /// really be gone rather than only for the request to stop them to be sent.
     finished_tx: watch::Sender<bool>,
     finished_rx: watch::Receiver<bool>,
+    /// Requests being served or waiting for the service to come up. More than nothing here also
+    /// *asks* for the service, which is what starts a stopped one.
     pending_requests: AtomicU64,
+    /// Upgraded connections (WebSockets) still open. They hold a running service open but never
+    /// start one: by the time one exists the service is already up, and a stop tears them down.
     active_upgrades: AtomicU64,
     /// Whether an image is being pulled or built for this service right now. Set while the
     /// preparation that follows the service being declared runs, which is the slow part of a
     /// restart and the one worth saying out loud - a service whose image is not there yet cannot
     /// start, however ready everything around it is.
     building: std::sync::atomic::AtomicBool,
-    last_activity: Mutex<Instant>,
+    /// When the service was last used - a request arriving or finishing, or the service coming up.
+    /// Read by the dashboard from outside any runtime and taken by a `Drop`, neither of which can
+    /// await, so a plain mutex rather than tokio's.
+    last_activity: std::sync::Mutex<Instant>,
     state_changed: Notify,
     /// The last thing a container wrote to stderr: where podman reports a refusal to start one,
     /// and where a service that dies says its last word. Emptied as each start begins, so a
@@ -138,6 +146,46 @@ pub struct AppServer {
     /// Why the service is not running: set when something failed, cleared when it comes up. Read
     /// by the dashboard from outside any runtime, so a plain mutex rather than tokio's.
     problem: std::sync::Mutex<Option<String>>,
+}
+
+/// The two ways a service can be in use, and the counter each is kept in.
+#[derive(Debug, Clone, Copy)]
+enum Held {
+    Request,
+    Upgrade,
+}
+
+/// One use of a service, given back when it is dropped.
+///
+/// A guard rather than a pair of calls because a request is a future somebody else owns: a client
+/// that disconnects halfway drops it wherever it happens to be waiting, and every early return
+/// between claiming and releasing would have to remember too. A count left behind that way is
+/// permanent, and a leftover *request* is the worst kind - it tells the lifecycle forever that
+/// somebody is waiting, so the service starts again the instant it stops for inactivity, a
+/// container per second for as long as webcentral runs.
+#[must_use = "the service is in use for as long as this is held, so it has to be bound"]
+pub struct Use {
+    server: Arc<AppServer>,
+    held: Held,
+}
+
+impl Use {
+    /// The server this use is holding.
+    pub fn server(&self) -> &Arc<AppServer> {
+        &self.server
+    }
+}
+
+impl Drop for Use {
+    fn drop(&mut self) {
+        // Finishing is activity too, so the idle clock measures from when the last request ended
+        // rather than from when it started. Touched *before* the count drops, mirroring the idle
+        // check reading the counters before the clock: however the two race, the service is seen
+        // either as still in use or as freshly active - never as long idle.
+        self.server.touch();
+        self.server.counter(self.held).fetch_sub(1, Ordering::SeqCst);
+        self.server.state_changed.notify_one();
+    }
 }
 
 /// Clears the building flag however the preparation task ends, including the early return when
@@ -177,7 +225,7 @@ impl AppServer {
             pending_requests: 0.into(),
             active_upgrades: 0.into(),
             building: false.into(),
-            last_activity: Mutex::new(Instant::now()),
+            last_activity: std::sync::Mutex::new(Instant::now()),
             state_changed: Notify::new(),
             said: Arc::new(std::sync::Mutex::new(None)),
             problem: std::sync::Mutex::new(None),
@@ -292,56 +340,69 @@ impl AppServer {
         self.building.load(Ordering::Relaxed)
     }
 
-    pub fn idle_seconds(&self) -> Option<u64> {
-        self.last_activity.try_lock().ok().map(|t| t.elapsed().as_secs())
+    /// How long ago the service was last used, for the dashboard to describe a moment with.
+    pub fn idle_seconds(&self) -> u64 {
+        self.last_activity.lock().unwrap().elapsed().as_secs()
     }
 
-    pub async fn touch(&self) {
-        *self.last_activity.lock().await = Instant::now();
+    /// How long the service has been idle, or `None` while anything is using it - a request in
+    /// flight (its response body included) or an upgraded connection is idle by the clock's
+    /// measure and very much alive, so either holds the service open however stale the clock is.
+    ///
+    /// The one place that decides this, so the ordering is stated once: the counters are read
+    /// *before* the clock, mirroring `Use::drop` writing the clock before dropping its count.
+    /// However the two race, the service is seen either as still in use or as freshly active,
+    /// never as long idle. SeqCst where the dashboard's accessors are Relaxed, for the same
+    /// reason: this read decides a stop rather than describing a moment. The `Duration` is taken
+    /// by value, so no lock is held across an await.
+    fn idle_time(&self) -> Option<Duration> {
+        let in_use = self.pending_requests.load(Ordering::SeqCst) > 0
+            || self.active_upgrades.load(Ordering::SeqCst) > 0;
+        (!in_use).then(|| self.last_activity.lock().unwrap().elapsed())
     }
 
-    pub fn track_upgrade(&self) {
-        self.active_upgrades.fetch_add(1, Ordering::SeqCst);
+    fn touch(&self) {
+        *self.last_activity.lock().unwrap() = Instant::now();
     }
 
-    pub fn untrack_upgrade(&self) {
-        self.active_upgrades.fetch_sub(1, Ordering::SeqCst);
+    fn counter(&self, held: Held) -> &AtomicU64 {
+        match held {
+            Held::Request => &self.pending_requests,
+            Held::Upgrade => &self.active_upgrades,
+        }
+    }
+
+    fn hold(self: &Arc<Self>, held: Held) -> Use {
+        self.counter(held).fetch_add(1, Ordering::SeqCst);
+        self.touch();
         self.state_changed.notify_one();
+        Use { server: self.clone(), held }
     }
 
-    fn track_request(&self) {
-        self.pending_requests.fetch_add(1, Ordering::SeqCst);
-        self.state_changed.notify_one();
+    /// Count an upgraded connection (a WebSocket) as using the service until the returned guard is
+    /// dropped. Unlike a request it never starts anything: it can only exist on a running service.
+    pub fn hold_upgrade(self: &Arc<Self>) -> Use {
+        self.hold(Held::Upgrade)
     }
 
-    pub fn untrack_request(&self) {
-        self.pending_requests.fetch_sub(1, Ordering::SeqCst);
-        self.state_changed.notify_one();
-    }
-
-    /// Wait until the server is serving, starting it if needed. On success the caller MUST call
-    /// `untrack_request` when done.
+    /// Wait until the server is serving, starting it if needed. The returned guard is what says
+    /// the request is still going on; drop it when the answer is done.
     ///
     /// No timeout here on purpose: the lifecycle always resolves to Running or Failed (it gives up
     /// after `startup_time`), so a slow start is left to finish and the client's own timeout
     /// applies instead of us forcing a premature error.
-    pub async fn wait_until_ready(&self) -> Result<()> {
-        self.track_request();
-        self.touch().await;
-
+    pub async fn wait_until_ready(self: &Arc<Self>) -> Result<Use> {
+        let serving = self.hold(Held::Request);
         let mut rx = self.state_rx.clone();
-        let state = match rx.wait_for(|&s| s == AppState::Running || s == AppState::Failed).await {
-            Ok(state) => *state,
-            Err(_) => {
-                self.untrack_request();
-                anyhow::bail!("Server state channel closed");
-            }
-        };
-        if state == AppState::Failed {
-            self.untrack_request();
-            anyhow::bail!("502 server '{}' failed to start", self.config.name);
+        let ready = rx
+            .wait_for(|&s| s == AppState::Running || s == AppState::Failed)
+            .await
+            .map(|state| *state == AppState::Running);
+        match ready {
+            Ok(true) => Ok(serving),
+            Ok(false) => anyhow::bail!("502 server '{}' failed to start", self.config.name),
+            Err(_) => anyhow::bail!("Server state channel closed"),
         }
-        Ok(())
     }
 
     pub async fn http_client(&self) -> Result<Client<AnyConnector, StreamBody>> {
@@ -388,7 +449,11 @@ impl AppServer {
 
     async fn lifecycle_task(self: Arc<Self>, stop_rx: mpsc::Receiver<StopReason>) {
         self.clone().lifecycle_loop(stop_rx).await;
-        // Every exit from the loop above has already stopped whatever was running.
+        // Every exit from the loop above has already stopped whatever was running - and is a
+        // shutdown, the one way it ends. Nothing drives the state machine after this, so a request
+        // waiting on it has to be told: waiting for a Running that can no longer come is forever,
+        // and the outgoing instance of a project being replaced still has requests inside it.
+        let _ = self.state_tx.send(AppState::Failed);
         let _ = self.finished_tx.send(true);
     }
 
@@ -399,7 +464,12 @@ impl AppServer {
         loop {
             match self.state() {
                 AppState::Stopped => {
-                    // Wait for a request to ask for us.
+                    // Wait for a request to ask for us. Nothing is polled for: `pending_requests`
+                    // is only ever changed by `hold` and `Use::drop`, both of which notify, and
+                    // `Notify` keeps a permit for a notification that lands between the read below
+                    // and the wait - so a request arriving in that window returns from `notified()`
+                    // at once rather than being missed. Waking ten times a second per stopped
+                    // service to re-read a counter nothing changed silently is what that replaces.
                     loop {
                         if self.pending_requests.load(Ordering::SeqCst) > 0 {
                             break;
@@ -410,13 +480,17 @@ impl AppServer {
                                     return;
                                 }
                                 Some(StopReason::FileChange) => {
-                                    // The project is being rebuilt; this instance is orphaned.
-                                    return;
+                                    // A source edit while nothing runs: nothing to stop, and the
+                                    // next start reads the new files by itself - but a service
+                                    // that copies project files into its image must not serve
+                                    // them from an image built from the old ones. Not the end of
+                                    // this instance: a project teardown arrives as Shutdown,
+                                    // never as FileChange.
+                                    self.forget_prepared_if_copying().await;
                                 }
                                 _ => {}
                             },
                             _ = self.state_changed.notified() => {}
-                            _ = sleep(Duration::from_millis(100)) => {}
                         }
                     }
                     let _ = self.state_tx.send(AppState::Starting);
@@ -444,9 +518,9 @@ impl AppServer {
                     let outcome = loop {
                         tokio::select! {
                             reason = stop_rx.recv() => {
-                                self.kill_processes(&mut children).await;
                                 match reason {
                                     Some(StopReason::Shutdown) | None => {
+                                        self.kill_processes(&mut children).await;
                                         self.log("Shutdown during startup");
                                         return;
                                     }
@@ -457,8 +531,16 @@ impl AppServer {
                                     // start ever again - and a change landing during startup is
                                     // ordinary, since a deploy writes the files that triggered
                                     // the project to load in the first place.
-                                    Some(StopReason::FileChange) => break Startup::Aborted,
-                                    _ => break Startup::Failed("it was stopped".to_string()),
+                                    Some(StopReason::FileChange) => {
+                                        self.kill_processes(&mut children).await;
+                                        break Startup::Aborted;
+                                    }
+                                    // A straggler: Inactivity is never sent through the channel,
+                                    // and a ProcessExit here is a request failing against the
+                                    // *previous* instance's dead pooled connection. The process
+                                    // being started now is watched directly below; killing it
+                                    // over old news would fail a start nothing is wrong with.
+                                    _ => {}
                                 }
                             }
                             status = async { children.first_mut().unwrap().wait().await } => {
@@ -504,6 +586,9 @@ impl AppServer {
                     }
 
                     let port = self.port().unwrap_or(0);
+                    // The idle clock starts when the service does, so however long the start took
+                    // it cannot come up already overdue and stop again in the same instant.
+                    self.touch();
                     self.log(&format!("Ready on port {}", port));
                     // It is running, so whatever was wrong with it no longer is.
                     *self.problem.lock().unwrap() = None;
@@ -537,18 +622,37 @@ impl AppServer {
                 }
 
                 AppState::Failed => {
-                    // Stay Failed until the project is rebuilt: pending requests have already been
-                    // answered with a 502, and a rebuild happens on the next request.
-                    match stop_rx.recv().await {
-                        Some(StopReason::FileChange) => {
-                            self.forget_prepared_if_copying().await;
-                            self.log("Retrying after file change");
-                            let _ = self.state_tx.send(AppState::Stopped);
+                    // A failure says the service did not come up, not that it never will: the
+                    // registry was unreachable, the machine was out of memory, podman was wedged.
+                    // Requests are answered 502 while it stands, so nobody waits on an attempt
+                    // already known to be doomed - but it stands for `startup_time` only, after
+                    // which it goes back to Stopped and the next request makes a fresh attempt:
+                    // a service that is gone until somebody edits a file is not one that starts
+                    // on demand. Waiting for as long as an attempt may take bounds retrying at
+                    // half the wall clock. The deadline is fixed on entry, so a straggler on the
+                    // stop channel (see Starting) cannot push the retry out by re-arming it.
+                    let retry_at = tokio::time::Instant::now()
+                        + Duration::from_secs(self.config.startup_time);
+                    loop {
+                        tokio::select! {
+                            reason = stop_rx.recv() => match reason {
+                                Some(StopReason::FileChange) => {
+                                    self.forget_prepared_if_copying().await;
+                                    self.log("Retrying after file change");
+                                    let _ = self.state_tx.send(AppState::Stopped);
+                                    break;
+                                }
+                                Some(StopReason::Shutdown) | None => {
+                                    return;
+                                }
+                                _ => {}
+                            },
+                            _ = tokio::time::sleep_until(retry_at) => {
+                                self.log("Trying again on the next request");
+                                let _ = self.state_tx.send(AppState::Stopped);
+                                break;
+                            }
                         }
-                        Some(StopReason::Shutdown) | None => {
-                            return;
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -595,21 +699,13 @@ impl AppServer {
         idle_timeout: Option<Duration>,
     ) -> StopReason {
         loop {
-            let idle_deadline = match idle_timeout {
-                Some(timeout) => {
-                    let last = *self.last_activity.lock().await;
-                    // An active upgrade holds the server open however stale `last_activity` is,
-                    // so arm the full timeout then - an already-expired deadline would make this
-                    // select spin for as long as the socket stays open.
-                    let since = if self.active_upgrades.load(Ordering::SeqCst) > 0 {
-                        Duration::ZERO
-                    } else {
-                        last.elapsed()
-                    };
-                    Some(tokio::time::Instant::now() + timeout.saturating_sub(since))
-                }
-                None => None,
-            };
+            let idle_deadline = idle_timeout.map(|timeout| {
+                // Something using the server arms the full timeout again rather than an
+                // already-expired deadline, which would make this select spin for as long as it
+                // lasts.
+                let idle = self.idle_time().unwrap_or(Duration::ZERO);
+                tokio::time::Instant::now() + timeout.saturating_sub(idle)
+            });
 
             tokio::select! {
                 reason = stop_rx.recv() => {
@@ -640,18 +736,14 @@ impl AppServer {
                         None => std::future::pending::<()>().await,
                     }
                 } => {
-                    if let Some(timeout) = idle_timeout {
-                        let last = *self.last_activity.lock().await;
-                        // Upgraded connections (WebSockets) are idle by this measure but very much
-                        // alive, so they hold the server open.
-                        if last.elapsed() >= timeout
-                            && self.active_upgrades.load(Ordering::SeqCst) == 0
-                        {
-                            self.log("Stopping due to inactivity");
-                            let _ = self.state_tx.send(AppState::Stopped);
-                            self.kill_processes(&mut children).await;
-                            return StopReason::Inactivity;
-                        }
+                    // Re-asked rather than assumed: the deadline was armed from what was true a
+                    // whole timeout ago, and a request may have arrived and finished since.
+                    let idle = self.idle_time().unwrap_or(Duration::ZERO);
+                    if idle_timeout.is_some_and(|timeout| idle >= timeout) {
+                        self.log("Stopping due to inactivity");
+                        let _ = self.state_tx.send(AppState::Stopped);
+                        self.kill_processes(&mut children).await;
+                        return StopReason::Inactivity;
                     }
                 }
             }
