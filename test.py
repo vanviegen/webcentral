@@ -53,6 +53,71 @@ TEST_BASE_IMAGE = 'webcentral-test-base'
 BUSYBOX_SERVER = "while true; do printf 'HTTP/1.0 200 OK\\r\\n\\r\\nok' | nc -l -p $PORT; done"
 
 
+# The test directory, fixed rather than temporary so a failed run can be looked at afterwards.
+# Everything a test starts lives under it, which is what makes leftover containers recognisable.
+TEST_TMPDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.test-tmp')
+
+
+def podman_stores():
+    """Every podman store a test run's containers can be in.
+
+    Normally just the invoking user's own. A root run also hands projects to other owners, and
+    webcentral keeps a store of its own per owner (see `Owner::podman`) which root's default
+    podman cannot see - the runroot names the uid, so the set is readable from /run/webcentral.
+    """
+    stores = [[]]
+    if os.geteuid() == 0 and os.path.isdir('/run/webcentral'):
+        import pwd
+        for entry in os.listdir('/run/webcentral'):
+            try:
+                home = pwd.getpwuid(int(entry)).pw_dir
+            except (ValueError, KeyError):
+                continue
+            store = os.path.join(home, '.local/share/webcentral/storage')
+            if os.path.isdir(store):
+                stores.append(['--root', store, '--runroot', f'/run/webcentral/{entry}'])
+    return stores
+
+
+def leaked_containers():
+    """Containers still around that belong to a project under the test directory.
+
+    Found by the label webcentral puts on every container it runs, so this can never touch a real
+    project's: nothing outside `.test-tmp` is even looked at.
+    """
+    podman = shutil.which('podman')
+    if not podman:
+        return []
+    found = []
+    for store in podman_stores():
+        result = subprocess.run(
+            [podman] + store + ['ps', '--all', '--filter', 'label=webcentral-project',
+                                '--format', '{{.Names}}\t{{index .Labels "webcentral-project"}}'],
+            capture_output=True, text=True, timeout=60)
+        for line in result.stdout.splitlines():
+            name, _, project = line.partition('\t')
+            if name and (project + os.sep).startswith(TEST_TMPDIR + os.sep):
+                found.append((store, name, project))
+    return found
+
+
+def reap_containers():
+    """Force-remove every container a test run left behind, and say which those were.
+
+    A container outlives the webcentral that started it: `podman run` forwards a signal but the
+    container keeps its own stop timeout, and `--rm` only fires when the container itself exits.
+    So anything that kills webcentral rather than letting it shut down - a crashed run, a
+    ctrl-c, a shutdown that outran its wait - leaves a container (and the server process inside
+    it) running for as long as the machine does.
+    """
+    podman = shutil.which('podman')
+    leaked = leaked_containers()
+    for store, name, _ in leaked:
+        subprocess.run([podman] + store + ['rm', '--force', '--time', '2', name],
+                       capture_output=True, timeout=60)
+    return [name for _, name, _ in leaked]
+
+
 def build_test_base_image():
     """Build the image test services run from. Cheap: one layer on top of alpine, cached after."""
     podman = shutil.which('podman')
@@ -147,9 +212,7 @@ class TestRunner:
 
     def setup(self):
         """Set up test environment and start webcentral"""
-        # Use fixed test directory in current directory
-        cwd = os.path.dirname(os.path.abspath(__file__))
-        self.tmpdir = os.path.join(cwd, '.test-tmp')
+        self.tmpdir = TEST_TMPDIR
         
         # Empty the directory if it exists
         if os.path.exists(self.tmpdir):
@@ -222,15 +285,29 @@ class TestRunner:
         print(f"webcentral started (PID: {self.webcentral_proc.pid})")
         print()
 
+    def stop_webcentral(self):
+        """Shut webcentral down and wait for it to finish stopping its containers.
+
+        The wait has to outlast webcentral's own bound on that (20s in `main`), because a
+        SIGKILL before it is done orphans every container it had started: nothing else ever
+        stops them and `--rm` never fires. That is what left a machine with a thousand stray
+        `python -m http.server` processes.
+        """
+        if not self.webcentral_proc:
+            return
+        self.webcentral_proc.terminate()
+        try:
+            self.webcentral_proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            print(f"{RED}webcentral did not shut down in 30s; killing it{RESET}")
+            self.webcentral_proc.kill()
+            self.webcentral_proc.wait()
+        self.webcentral_proc = None
+
     def teardown(self):
         """Clean up test environment"""
-        if self.webcentral_proc:
-            self.webcentral_proc.terminate()
-            try:
-                self.webcentral_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.webcentral_proc.kill()
-                self.webcentral_proc.wait()
+        self.stop_webcentral()
+        reap_containers()
 
         if hasattr(self, 'stdout_f'):
             self.stdout_f.close()
@@ -496,6 +573,14 @@ class TestRunner:
             print(f"{RED}podman is required to run the tests{RESET}")
             sys.exit(1)
 
+        # A run that was killed (ctrl-c, a crash, a machine that went down) leaves its containers
+        # behind; they answer to names this run will not use again, so nothing else would ever
+        # reclaim them. Cleared here rather than only at the end, which is the moment a killed
+        # run never reaches.
+        stale = reap_containers()
+        if stale:
+            print(f"{YELLOW}Removed {len(stale)} container(s) left by an earlier run{RESET}")
+
         self.setup()
 
         failed = False
@@ -551,13 +636,16 @@ class TestRunner:
                 suffix = f" ({skipped} skipped)" if skipped else ""
                 print(f"\n{GREEN}All {len(tests_to_run) - skipped} tests passed!{RESET}{suffix}")
         finally:
-            if self.webcentral_proc:
-                self.webcentral_proc.terminate()
-                try:
-                    self.webcentral_proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.webcentral_proc.kill()
-                    self.webcentral_proc.wait()
+            self.stop_webcentral()
+
+            # Nothing of ours may outlive the run. A leftover here is a bug - in the shutdown
+            # path, or in a test that started a webcentral of its own and killed it - and is
+            # reported as one rather than being cleaned up quietly.
+            leaked = reap_containers()
+            if leaked:
+                failed = True
+                print(f"\n{RED}Containers were left running and had to be removed:{RESET} "
+                      f"{', '.join(leaked)}")
 
             if hasattr(self, 'stdout_f'):
                 self.stdout_f.close()
@@ -4467,17 +4555,14 @@ def test_shutdown_stops_containers(t):
         stdout=log, stderr=subprocess.STDOUT,
         cwd=os.path.dirname(os.path.abspath(__file__)))
 
+    # Found by the label webcentral puts on every container, which says which project it belongs
+    # to - the name is an opaque hash and a service need not mount anything.
     def running_here():
-        names = subprocess.run([podman, 'ps', '--format', '{{.Names}}'],
-                               capture_output=True, text=True, timeout=30).stdout.split()
-        here = []
-        for name in names:
-            mounts = subprocess.run(
-                [podman, 'inspect', name, '--format', '{{range .Mounts}}{{.Source}} {{end}}'],
-                capture_output=True, text=True, timeout=30).stdout
-            if project in mounts:
-                here.append(name)
-        return here
+        listing = subprocess.run(
+            [podman, 'ps', '--filter', f'label=webcentral-project={project}',
+             '--format', '{{.Names}}'],
+            capture_output=True, text=True, timeout=30).stdout
+        return listing.split()
 
     try:
         for attempt in range(60):
@@ -4507,6 +4592,74 @@ def test_shutdown_stops_containers(t):
         for name in running_here():
             subprocess.run([podman, 'rm', '--force', '--time', '2', name],
                            capture_output=True, timeout=60)
+        log.close()
+
+
+@test
+def test_killed_webcentral_leaves_containers_the_suite_reaps(t):
+    """A webcentral that is killed orphans its containers - the suite must find and remove them.
+
+    This is what filled a machine with stray `python -m http.server` processes: SIGKILL never
+    reaches the shutdown path, `podman run` dying takes the container with it in no way at all,
+    and `--rm` only fires when the container itself exits. Nothing but the project label finds
+    them afterwards, since the container name is an opaque hash.
+    """
+    import signal as sig
+    require_podman()
+    podman = shutil.which('podman')
+
+    # Its own webcentral, since it gets killed. The root has no dot in its name, so the suite's
+    # own project glob never sees it.
+    root = os.path.join(t.tmpdir, 'killed-root')
+    domain = 'killed-webcentral.test'
+    project = os.path.join(root, domain)
+    os.makedirs(project, exist_ok=True)
+    with open(os.path.join(project, 'webcentral.conf'), 'w') as f:
+        f.write('service {\n'
+                f'  base = {TEST_BASE_IMAGE}\n'
+                '  command = python3 -u -m http.server $PORT\n'
+                # Long, so the container cannot go away by itself and confuse the question
+                '  shutdown_time = 300\n'
+                '}\n')
+    with open(os.path.join(project, 'index.html'), 'w') as f:
+        f.write('running')
+
+    port = t.find_free_port()
+    log = open(os.path.join(root, 'out.log'), 'w')
+    proc = subprocess.Popen(
+        ['./webcentral', '--projects', root, '--http', str(port), '--https', '0',
+         '--data-dir', root],
+        stdout=log, stderr=subprocess.STDOUT,
+        cwd=os.path.dirname(os.path.abspath(__file__)))
+    try:
+        deadline = time.time() + 60
+        while True:
+            try:
+                conn = http.client.HTTPConnection('localhost', port, timeout=5)
+                conn.request('GET', '/', headers={'Host': domain})
+                if conn.getresponse().status == 200:
+                    break
+            except Exception:
+                pass
+            assert time.time() < deadline, "the second webcentral never served a request"
+            time.sleep(0.5)
+
+        proc.send_signal(sig.SIGKILL)
+        proc.wait(timeout=30)
+
+        # The premise: killing webcentral does leave the container running
+        mine = [name for _, name, dir in leaked_containers() if dir == project]
+        assert mine, "expected the killed webcentral's container to still be running"
+
+        # And the suite's reaper is what takes it away, at the end of a run and at the start of
+        # the next one - so a killed run costs the machine nothing beyond that run.
+        assert set(mine) <= set(reap_containers())
+        assert not [name for _, name, dir in leaked_containers() if dir == project]
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=30)
+        reap_containers()
         log.close()
 
 

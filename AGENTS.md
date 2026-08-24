@@ -390,6 +390,9 @@ podman's stderr, so every call site says only what it was trying to do.
 - Image tagged `webcentral-<hash of dir + server name>:<hash of Dockerfile + base image ID>`, so an unchanged config
   skips the build while a pulled base update still triggers one; after each build the project's
   stale sibling tags are removed (they are named, so `image prune` would never reclaim them)
+- Labelled `webcentral-project=<dir>` and `webcentral-service=<name>`: the container name is an
+  opaque hash, so a leftover of a webcentral that was *killed* rather than shut down can be found
+  by nothing else
 - Stale container of the same name force-removed before `run` (a container outliving its webcentral
   otherwise wedges the project with a name conflict)
 - Port mapping from internal to host
@@ -484,6 +487,14 @@ still reach the outgoing instance; the next request builds a new one.
 - Automatically tracks log positions per-project for incremental reading
 - Shows log output on test failure, preserves test directory for inspection
 - Supports running individual tests or full suite
+- Waits 30s for webcentral to shut down - longer than webcentral's own 20s bound on stopping
+  containers, because killing it before it is done orphans every container it started: nothing
+  else stops them and `--rm` only fires when the container itself exits
+- Reaps containers labelled with a project under `.test-tmp` (`reap_containers`) both before a run
+  and after it, and *fails* the run when the second one finds any. A run that is killed - ctrl-c,
+  a crash, a test that kills a webcentral of its own - is the case the first one exists for, since
+  the leftovers answer to hashed names no later run will ask for again. This is what left a
+  machine with a thousand stray `python -m http.server` processes
 
 **Test patterns:**
 - Each test auto-creates domain from test name: `test_foo_bar` → `foo-bar.test`

@@ -1520,6 +1520,12 @@ impl AppServer {
         let mut cmd = self.owner.podman();
         cmd.args(["run", "--rm", "--name", &container_name]);
 
+        // Which project a container belongs to, for anything that has to find ours by something
+        // other than the opaque hash in its name - a leftover of a webcentral that was killed
+        // rather than shut down can be found and removed by nothing else.
+        cmd.args(["--label", &format!("webcentral-project={}", self.dir.display())]);
+        cmd.args(["--label", &format!("webcentral-service={}", config.name)]);
+
         self.add_userns_args(&mut cmd, run_uid, run_gid);
 
         // Published on loopback only: webcentral is the sole thing on the host that talks to it,
