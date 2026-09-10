@@ -8,6 +8,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// The ACME account as it is kept on disk. The directory it was created on is stored beside it,
+/// since credentials for one server say nothing on another - staging and production are different
+/// accounts.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredAccount {
+    directory: String,
+    /// The contact the account was registered with, so that a changed `--email` can be noticed
+    #[serde(default)]
+    email: String,
+    credentials: instant_acme::AccountCredentials,
+}
+
 pub struct CertManager {
     config_dir: PathBuf,
     email: String,
@@ -42,6 +54,33 @@ impl CertManager {
         }
     }
 
+    /// Where the ACME account's key is kept between runs.
+    fn account_path(&self) -> PathBuf {
+        self.config_dir.join("account.json")
+    }
+
+    /// The stored account, if there is one for the directory we are ordering from. A file we
+    /// cannot use is reported and then ignored - a new account is one round trip, while refusing
+    /// to serve HTTPS over it would not get anybody their certificate.
+    fn stored_account(&self) -> Option<StoredAccount> {
+        let path = self.account_path();
+        let data = fs::read(&path).ok()?;
+        match serde_json::from_slice::<StoredAccount>(&data) {
+            Ok(stored) if stored.directory == self.acme_url => Some(stored),
+            // Switching between staging and production is a different account, not a broken file
+            Ok(_) => None,
+            Err(e) => {
+                eprintln!("ERROR: ignoring unreadable ACME account in {}: {}", path.display(), e);
+                None
+            }
+        }
+    }
+
+    /// The ACME account, restored from disk or created and saved.
+    ///
+    /// Keeping it matters beyond saving a round trip: a `CAA` record can name the account allowed
+    /// to issue for a domain (`accounturi=`), and Let's Encrypt counts new accounts per IP address
+    /// - both of which a webcentral that made a fresh account on every start would run into.
     async fn get_or_create_account(&self) -> Result<Account> {
         let mut account_lock = self.account.write().await;
 
@@ -49,7 +88,24 @@ impl CertManager {
             return Ok(account.clone());
         }
 
-        // Create new account (or get existing if already created with this email)
+        if let Some(stored) = self.stored_account() {
+            let was = stored.email;
+            match Account::builder()?.from_credentials(stored.credentials).await {
+                Ok(account) => {
+                    println!("Using ACME account {}", account.id());
+                    // The contact is settled when the account is registered, so an account kept
+                    // between runs is the only thing that can be holding a `--email` since changed
+                    if was != self.email {
+                        self.update_contact(&account).await;
+                    }
+                    *account_lock = Some(account.clone());
+                    return Ok(account);
+                }
+                // The key is no longer one the server knows, so there is nothing to keep
+                Err(e) => eprintln!("ERROR: stored ACME account is unusable, making a new one: {}", e),
+            }
+        }
+
         let result = Account::builder()?
             .create(
                 &NewAccount {
@@ -61,16 +117,61 @@ impl CertManager {
                 None,
             )
             .await;
-        
-        let (account, _credentials) = match result {
+
+        let (account, credentials) = match result {
             Ok(acc) => acc,
             Err(e) => {
                 eprintln!("Failed to create ACME account ({}): {:?}", self.email, e);
                 return Err(e.into());
             }
         };
+
+        let stored = StoredAccount {
+            directory: self.acme_url.clone(),
+            email: self.email.clone(),
+            credentials,
+        };
+        if let Err(e) = self.save_account(&stored) {
+            // Worth serving HTTPS with an account we couldn't save, but every restart will make
+            // another one, which is what a `CAA` accounturi and Let's Encrypt's rate limits notice
+            eprintln!("ERROR: could not save the ACME account to {}: {}", self.account_path().display(), e);
+        }
+        println!("Created ACME account {}", account.id());
         *account_lock = Some(account.clone());
         Ok(account)
+    }
+
+    /// Tell the CA about a `--email` that has changed since the account was registered, and
+    /// remember that we did. Not worth failing a certificate over: the contact is where the CA
+    /// writes to about the account, not part of issuing.
+    async fn update_contact(&self, account: &Account) {
+        let contact = format!("mailto:{}", self.email);
+        if let Err(e) = account.update_contacts(&[contact.as_str()]).await {
+            eprintln!("ERROR: could not tell the ACME server the new contact address {}: {}", self.email, e);
+            return;
+        }
+        // Read again rather than keep a copy: the credentials went into the account itself
+        if let Some(mut stored) = self.stored_account() {
+            stored.email = self.email.clone();
+            if let Err(e) = self.save_account(&stored) {
+                eprintln!("ERROR: could not save the ACME account to {}: {}", self.account_path().display(), e);
+            }
+        }
+        println!("ACME account contact is now {}", self.email);
+    }
+
+    /// Write the account key readable only by the user webcentral runs as.
+    fn save_account(&self, stored: &StoredAccount) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(self.account_path())?;
+        file.write_all(&serde_json::to_vec(stored)?)?;
+        Ok(())
     }
 
     /// Register an HTTP-01 challenge response for every identifier in the order and tell the ACME
@@ -102,8 +203,11 @@ impl CertManager {
     /// The order itself carries no reason - a failed challenge's error lives on its authorization,
     /// which has to be read again, since what we read while setting the challenges up was still
     /// pending.
-    async fn validation_problem(order: &mut instant_acme::Order) -> String {
+    async fn validation_problem(order: &mut instant_acme::Order, account: &str) -> String {
         let mut problems = Vec::new();
+        // A refusal that is about the name rather than about reaching it, and so is answered in
+        // DNS rather than by anything webcentral can retry
+        let mut caa = false;
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
             let mut authz = match result {
@@ -123,17 +227,25 @@ impl CertManager {
 
             let name = authz.identifier().to_string();
             match authz.challenges.iter().find_map(|c| c.error.as_ref()) {
-                Some(problem) => problems.push(format!("{} ({})", name, problem)),
+                Some(problem) => {
+                    caa |= problem.r#type.as_deref().is_some_and(|t| t.ends_with(":caa"));
+                    problems.push(format!("{} ({})", name, problem))
+                }
                 // Not valid and blaming no challenge: expired, revoked or deactivated, where the
                 // status is the whole story
                 None => problems.push(format!("{} (authorization is {:?})", name, authz.status)),
             }
         }
 
-        match problems.is_empty() {
+        let mut message = match problems.is_empty() {
             true => "the ACME server refused the order without saying which name failed".to_string(),
             false => format!("the ACME server could not validate {}", problems.join("; ")),
+        };
+        if caa {
+            message.push_str(&format!(". A CAA record says which certificate authority may issue \
+                for the name, and an `accounturi=` on it says which ACME account - this one is {}", account));
         }
+        message
     }
 
     /// Acquire a certificate covering `domains`, saved under the first of them.
@@ -168,7 +280,8 @@ impl CertManager {
         // this, the run would go on to finalize an order the server has already given up on, and
         // fail with the CA complaining about its state rather than about what put it in that state
         if poll_result? != OrderStatus::Ready {
-            anyhow::bail!("Validation failed: {}", Self::validation_problem(&mut order).await);
+            anyhow::bail!("Validation failed: {}",
+                Self::validation_problem(&mut order, account.id()).await);
         }
 
         // Finalize order - this generates the private key and returns it

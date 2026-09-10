@@ -1023,7 +1023,7 @@ log "${method} ${path}"
 | `--version` (`-V`) | Print the version number and exit. |
 | `--email=EMAIL` | Email for Let's Encrypt. Required unless `--https=0`. |
 | `--projects=DIR` | Project directory glob. Default: `/home/*/webcentral-projects` (root) or `$HOME/webcentral-projects` (user). |
-| `--data-dir=DIR` | Certificate and binding storage directory. Default: `/var/lib/webcentral` (root) or `$HOME/.webcentral` (user). |
+| `--data-dir=DIR` | Certificate, ACME account and binding storage directory. Default: `/var/lib/webcentral` (root) or `$HOME/.webcentral` (user). |
 | `--https=PORT` | HTTPS port. Default: `443`. Set to `0` to disable. |
 | `--http=PORT` | HTTP port. Default: `80`. Set to `0` to disable. |
 | `--http3` | Also serve HTTP/3 (QUIC) on the HTTPS port. |
@@ -1091,6 +1091,9 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 ---
 
 ## Changelog
+
+2026-09-11 (3.0.5):
+  - **The Let's Encrypt account is kept**, in `account.json` beside the certificates, instead of a new one being registered on every start. A `CAA` record can name the account allowed to issue for a domain (`accounturi=`), which no account that only lives until the next restart can ever satisfy - and Let's Encrypt counts new accounts per IP address. The account's URI is logged when it is loaded or created, so it can be put in such a record, and a refusal naming `CAA` repeats it. A changed `--email` is sent on to the certificate authority, which registering afresh every time used to take care of by itself.
 
 2026-09-10 (3.0.4):
   - **A certificate that fails to renew now says why.** A rejected order was carried on to finalization, where the only complaint was about the order's state - `Order's status ("invalid") is not acceptable for finalization` - and never a word about the validation that put it in that state. The certificate authority's own reason is now read back and logged, per name.

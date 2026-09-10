@@ -1,0 +1,18 @@
+ready
+Keep the ACME account instead of registering a new one each start
+
+A `CAA` record can name the account allowed to issue for a domain
+(`accounturi=`), which no account that lives only until the next restart can
+ever satisfy - and Let's Encrypt counts new accounts per IP address, so a
+webcentral that restarts a few times in an afternoon can run out of them. The
+credentials were thrown away where they were created; they are now stored in
+`account.json` in the data directory (0600, with the directory URL they were
+made on, since staging and production are different accounts) and restored on
+start. A file that cannot be read, or that the CA no longer knows, is reported
+and replaced.
+
+The account's URI is logged as it is loaded or created, since that is what such
+a record has to name, and a refusal naming CAA repeats it - being answered in
+DNS rather than by anything a retry can change. The contact is settled when the
+account is registered, so a `--email` changed since is sent on at the next
+start: registering afresh every time is what used to take care of that.

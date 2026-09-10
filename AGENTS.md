@@ -290,7 +290,18 @@ An order the CA rejects comes back from `poll_ready` as `OrderStatus::Invalid` r
 error, so the status is checked: going on to `finalize()` reports the order's state instead of the
 validation that put it in that state. The reason lives on the authorizations, which
 `CertManager::validation_problem` re-reads (what was read while setting the challenges up was
-still pending) for the CA's own error per identifier.
+still pending) for the CA's own error per identifier. A refusal naming `CAA` is answered in DNS
+rather than by retrying, so it carries the account's URI, which is what an `accounturi=` on such a
+record names.
+
+The ACME account is stored in `account.json` in the data directory (0600, with the directory URL it
+was made on, since staging and production are different accounts) and restored on start. Not
+merely a saved round trip: an account that lasts until the next restart can never match an
+`accounturi=` CAA record, and Let's Encrypt limits new accounts per IP address. A file that cannot
+be read or that the CA no longer knows is reported and replaced - refusing to serve HTTPS over it
+would get nobody a certificate. The contact is settled when the account is
+registered, so a `--email` that has changed since is sent on the next start and stored beside the
+key - an account nobody keeps is the only reason that used to take care of itself.
 
 Accept loops must never return on an `accept()` error: that drops the `TcpListener` and stops
 listening for the rest of the process lifetime, while the process stays alive so systemd's
