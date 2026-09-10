@@ -279,6 +279,19 @@ is an error, retried hourly. Both names are re-checked on every cycle, including
 certificate is still valid, so a name that starts or stops pointing here is picked up (comparing
 against the stored certificate's SANs) long before renewal.
 
+*Every* address a name resolves to is checked, not just the first one that answers: the CA picks
+one of them (Let's Encrypt prefers IPv6), so a stale AAAA beside a working A record fails
+validation while a check that stopped at the first success would see nothing wrong. An address
+answering with somebody else's content fails the name; one that doesn't answer at all only fails
+when none of them do, since that is the case the CA also retries elsewhere - and a host whose own
+IPv6 is unroutable would otherwise stop renewing a name the CA can reach.
+
+An order the CA rejects comes back from `poll_ready` as `OrderStatus::Invalid` rather than as an
+error, so the status is checked: going on to `finalize()` reports the order's state instead of the
+validation that put it in that state. The reason lives on the authorizations, which
+`CertManager::validation_problem` re-reads (what was read while setting the challenges up was
+still pending) for the CA's own error per identifier.
+
 Accept loops must never return on an `accept()` error: that drops the `TcpListener` and stops
 listening for the rest of the process lifetime, while the process stays alive so systemd's
 `Restart=always` never fires. Errors go to `handle_accept_error`, which retries and backs off

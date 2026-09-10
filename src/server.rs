@@ -82,6 +82,15 @@ static REDIRECT_HTTP_DEFAULT: std::sync::atomic::AtomicBool =
 /// `Server::points_at_us`).
 const SELF_CHECK_PATH: &str = "/.well-known/webcentral-self-check";
 
+/// What one address of a domain answered `SELF_CHECK_PATH` with. `Other` and `Unreachable` are
+/// told apart because only the first is certain to fail the ACME server's challenge too: it
+/// retries an address it cannot connect to on the next one, but not one that answers wrongly.
+enum SelfCheck {
+    Us,
+    Other(String),
+    Unreachable(String),
+}
+
 /// Streaming body adapter for HTTP/3 - wraps h3 RecvStream as an http_body::Body.
 #[cfg(feature = "http3")]
 struct H3RecvBody<S: h3::quic::RecvStream> {
@@ -857,6 +866,11 @@ impl Server {
             let token = &path[28..]; // Skip "/.well-known/acme-challenge/"
             if let Some(cert_manager) = &self.cert_manager {
                 if let Some(key_auth) = cert_manager.get_challenge(token).await {
+                    // Logged because its absence is the answer to half of what goes wrong with a
+                    // certificate: an order that fails without this line was never validated from
+                    // here, whatever the name resolves to from where we are standing
+                    println!("Answered ACME challenge for {} from {}",
+                        req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or("unknown"), addr.ip());
                     return Ok(Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "text/plain")
@@ -1114,17 +1128,12 @@ impl Server {
         load_project(&domain, settle);
     }
 
-    /// Whether `domain` resolves to this very process on port 80, verified by fetching a path
-    /// only we can answer with a token that is new for every run. `Err` describes why it doesn't.
-    ///
-    /// This is the same round trip the ACME server makes for an HTTP-01 challenge, so it tells us
-    /// up front whether an order including this name could succeed - without bothering Let's
-    /// Encrypt (and burning its rate limits) for names that aren't pointed here.
-    async fn points_at_us(&self, domain: &str) -> Result<(), String> {
+    /// Fetch, from one address, the path only we can answer, and say whether the answer was ours.
+    async fn self_check(addr: std::net::SocketAddr, domain: &str) -> SelfCheck {
         let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", SELF_CHECK_PATH, domain);
         let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut stream = tokio::net::TcpStream::connect((domain, 80)).await?;
+            let mut stream = tokio::net::TcpStream::connect(addr).await?;
             stream.write_all(request.as_bytes()).await?;
             let mut response = Vec::new();
             stream.read_to_end(&mut response).await?;
@@ -1134,10 +1143,54 @@ impl Server {
         match response {
             // `contains` rather than an exact body match, so an intermediary that reformats or
             // pads the response doesn't fail a check the ACME server would pass
-            Ok(Ok(response)) if String::from_utf8_lossy(&response).contains(SELF_CHECK_TOKEN.as_str()) => Ok(()),
-            Ok(Ok(_)) => Err("it is served by a different web server".to_string()),
-            Ok(Err(e)) => Err(format!("port 80 is unreachable: {}", e)),
-            Err(_) => Err("port 80 did not respond within 10s".to_string()),
+            Ok(Ok(response)) if String::from_utf8_lossy(&response).contains(SELF_CHECK_TOKEN.as_str()) => SelfCheck::Us,
+            Ok(Ok(_)) => SelfCheck::Other(format!("{} is served by a different web server", addr.ip())),
+            Ok(Err(e)) => SelfCheck::Unreachable(format!("port 80 on {} is unreachable: {}", addr.ip(), e)),
+            Err(_) => SelfCheck::Unreachable(format!("port 80 on {} did not respond within 10s", addr.ip())),
+        }
+    }
+
+    /// Whether `domain` resolves to this very process on port 80, verified by fetching a path
+    /// only we can answer with a token that is new for every run. `Err` describes why it doesn't.
+    ///
+    /// This is the same round trip the ACME server makes for an HTTP-01 challenge, so it tells us
+    /// up front whether an order including this name could succeed - without bothering Let's
+    /// Encrypt (and burning its rate limits) for names that aren't pointed here.
+    ///
+    /// *Every* address the name resolves to is checked, not just the first one that answers: the
+    /// ACME server picks one of them (Let's Encrypt prefers IPv6), so a stale AAAA record beside a
+    /// working A record fails validation while a check that stopped at the first success would see
+    /// nothing wrong. An address that doesn't answer at all is only fatal when none of them do,
+    /// since that is the one case the CA also retries on another address - and a host whose own
+    /// IPv6 is unroutable would otherwise refuse to renew a name the CA can reach perfectly well.
+    async fn points_at_us(&self, domain: &str) -> Result<(), String> {
+        let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host((domain, 80)).await {
+            Ok(addrs) => addrs.collect(),
+            Err(e) => return Err(format!("it does not resolve: {}", e)),
+        };
+        if addrs.is_empty() {
+            return Err("it resolves to no address".to_string());
+        }
+
+        let mut unreachable = Vec::new();
+        let mut reached_us = false;
+        for addr in &addrs {
+            match Self::self_check(*addr, domain).await {
+                SelfCheck::Us => reached_us = true,
+                // A wrong answer is what the CA gets too, should it be the address it picks
+                SelfCheck::Other(reason) => return Err(reason),
+                SelfCheck::Unreachable(reason) => unreachable.push(reason),
+            }
+        }
+
+        match (reached_us, unreachable.is_empty()) {
+            (true, true) => Ok(()),
+            (true, false) => {
+                eprintln!("WARNING: {} also resolves to an address that does not answer, which the \
+                    certificate authority may be the one to try: {}", domain, unreachable.join(", "));
+                Ok(())
+            }
+            (false, _) => Err(unreachable.join(", ")),
         }
     }
 

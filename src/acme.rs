@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use instant_acme::{Account, ChallengeType, Identifier, NewAccount, NewOrder};
+use instant_acme::{
+    Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs;
 use std::path::PathBuf;
@@ -94,6 +96,46 @@ impl CertManager {
         Ok(())
     }
 
+    /// Why the ACME server would not authorize an order: what it recorded against each identifier
+    /// it refused.
+    ///
+    /// The order itself carries no reason - a failed challenge's error lives on its authorization,
+    /// which has to be read again, since what we read while setting the challenges up was still
+    /// pending.
+    async fn validation_problem(order: &mut instant_acme::Order) -> String {
+        let mut problems = Vec::new();
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = match result {
+                Ok(authz) => authz,
+                Err(e) => {
+                    problems.push(format!("could not read an authorization: {}", e));
+                    continue;
+                }
+            };
+            if let Err(e) = authz.refresh().await {
+                problems.push(format!("could not re-read an authorization: {}", e));
+                continue;
+            }
+            if authz.status == AuthorizationStatus::Valid {
+                continue;
+            }
+
+            let name = authz.identifier().to_string();
+            match authz.challenges.iter().find_map(|c| c.error.as_ref()) {
+                Some(problem) => problems.push(format!("{} ({})", name, problem)),
+                // Not valid and blaming no challenge: expired, revoked or deactivated, where the
+                // status is the whole story
+                None => problems.push(format!("{} (authorization is {:?})", name, authz.status)),
+            }
+        }
+
+        match problems.is_empty() {
+            true => "the ACME server refused the order without saying which name failed".to_string(),
+            false => format!("the ACME server could not validate {}", problems.join("; ")),
+        }
+    }
+
     /// Acquire a certificate covering `domains`, saved under the first of them.
     pub async fn acquire_certificate(&self, domains: &[String]) -> Result<()> {
         let primary = &domains[0];
@@ -114,7 +156,7 @@ impl CertManager {
             Ok(()) => order
                 .poll_ready(&RetryPolicy::default())
                 .await
-                .context("Failed to poll order ready - this usually means the HTTP-01 challenge failed. Check that DNS points to this server and port 80 is accessible."),
+                .context("Failed to poll order ready"),
             Err(e) => Err(e),
         };
 
@@ -122,7 +164,12 @@ impl CertManager {
         for token in &tokens {
             self.challenges.write().await.remove(token);
         }
-        poll_result?;
+        // A rejected order is *returned* as `Invalid` rather than reported as an error: without
+        // this, the run would go on to finalize an order the server has already given up on, and
+        // fail with the CA complaining about its state rather than about what put it in that state
+        if poll_result? != OrderStatus::Ready {
+            anyhow::bail!("Validation failed: {}", Self::validation_problem(&mut order).await);
+        }
 
         // Finalize order - this generates the private key and returns it
         let private_key_pem = order

@@ -1,0 +1,23 @@
+# Dev container image for webcentral: a Rust toolchain to build with, python3 to run
+# test.py, and podman - which every service webcentral starts needs. Tests that need
+# podman skip themselves when it turns out not to be usable here (`require_podman`).
+
+FROM docker.io/library/debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git sudo bash procps psmisc ripgrep less nano \
+      openssh-client unzip zip xz-utils build-essential pkg-config \
+      python3 podman uidmap fuse-overlayfs slirp4netns \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -u 1000 -s /bin/bash dev && echo 'dev ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/dev
+USER dev
+WORKDIR /work
+
+ENV RUSTUP_HOME=/home/dev/.rustup CARGO_HOME=/home/dev/.cargo
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
+ENV PATH=/home/dev/.cargo/bin:$PATH
+# Login shells read the profile rather than the image environment
+RUN echo 'export PATH=/home/dev/.cargo/bin:$PATH' >> /home/dev/.bashrc
+
+CMD ["bash", "-lc", "cargo run -- --help"]

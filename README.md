@@ -1092,6 +1092,10 @@ To compile without HTTP/3 (QUIC) support and dependencies, use `cargo build --no
 
 ## Changelog
 
+2026-09-10 (3.0.4):
+  - **A certificate that fails to renew now says why.** A rejected order was carried on to finalization, where the only complaint was about the order's state - `Order's status ("invalid") is not acceptable for finalization` - and never a word about the validation that put it in that state. The certificate authority's own reason is now read back and logged, per name.
+  - **Every address a domain resolves to is checked before ordering**, rather than the first one that answers. Let's Encrypt prefers IPv6, so a stale AAAA record beside a working A record failed validation while webcentral's own check saw nothing wrong.
+
 2026-08-14 (3.0.3):
   - **A client that goes away mid-request no longer wedges the service.** The abandoned request stayed counted as waiting, so the service restarted the instant it stopped for inactivity - a container a second, until podman gave up and the project 502'd.
   - **A response still streaming keeps its service alive**, as does an open WebSocket. The idle clock also starts when the service comes up, not when the request that started it arrived.
